@@ -231,7 +231,7 @@ pub(super) struct RepoCache {
     pub(super) comparison_base: OnceCell<Option<integration::ComparisonBase>>,
     /// Project identifier derived from remote URL
     pub(super) project_identifier: OnceCell<String>,
-    /// Project config (loaded from .config/wt.toml in main worktree)
+    /// Project config selected from effective git config or `.config/wt.toml`.
     pub(super) project_config: OnceCell<Option<ProjectConfig>>,
     /// CI platform from project config (`forge.platform` / `ci.platform`).
     /// `None` when unset or unrecognized; an unrecognized value warns once,

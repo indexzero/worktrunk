@@ -103,31 +103,40 @@ fn handle_config_show_json() -> anyhow::Result<()> {
         None
     };
 
-    let (project_path, project_config, project_identifier) = if let Ok(repo) = Repository::current()
-    {
-        let config = repo.load_project_config()?;
-        let on_disk = repo.project_config_path()?;
-        // When config resolved but not from an existing on-disk file, it came
-        // from the object-store fallback (bare repo, default branch checked out
-        // in no worktree — #3461). Surface that revision spec as the source so
-        // `path`/`exists`/`config` agree, instead of pointing `path` at a
-        // missing file while `config` is populated.
-        let path = match &on_disk {
-            Some(p) if p.exists() => on_disk.clone(),
-            _ if config.is_some() => repo
-                .default_branch_project_config_content()
-                .map(|(_, spec)| spec),
-            _ => on_disk.clone(),
+    let (project_path, project_source, project_config, project_identifier) =
+        if let Ok(repo) = Repository::current() {
+            let config = repo.load_project_config()?;
+            let on_disk = repo.project_config_path()?;
+            let from_git_config = config.as_ref().is_some_and(ProjectConfig::is_git_config);
+            // When config resolved but not from an existing on-disk file, it came
+            // from the object-store fallback (bare repo, default branch checked out
+            // in no worktree — #3461). Surface that revision spec as the source so
+            // `path`/`exists`/`config` agree, instead of pointing `path` at a
+            // missing file while `config` is populated.
+            let path = match (&on_disk, from_git_config) {
+                (_, true) => None,
+                (Some(p), false) if p.exists() => on_disk.clone(),
+                (_, false) if config.is_some() => repo
+                    .default_branch_project_config_content()
+                    .map(|(_, spec)| spec),
+                _ => on_disk.clone(),
+            };
+            let identifier = repo.project_identifier().ok();
+            (
+                path,
+                if from_git_config {
+                    Some("git-config")
+                } else if config.is_some() {
+                    Some("file")
+                } else {
+                    None
+                },
+                config.map(|c| serde_json::to_value(&c)).transpose()?,
+                identifier,
+            )
+        } else {
+            (None, None, None, None)
         };
-        let identifier = repo.project_identifier().ok();
-        (
-            path,
-            config.map(|c| serde_json::to_value(&c)).transpose()?,
-            identifier,
-        )
-    } else {
-        (None, None, None)
-    };
 
     let system_path = system_config_path().or_else(default_system_config_path);
     let system_exists = system_path.as_ref().is_some_and(|p| p.exists());
@@ -139,6 +148,7 @@ fn handle_config_show_json() -> anyhow::Result<()> {
             "config": user_config,
         },
         "project": {
+            "source": project_source,
             "path": project_path,
             // Config source resolved — an on-disk file or the object-store
             // fallback — iff `config` is populated. Keying `exists` off the
@@ -841,44 +851,71 @@ fn render_project_config(out: &mut String) -> anyhow::Result<()> {
         Ok(())
     }
 
-    // Resolve the effective config source, mirroring `ProjectConfig::load`: an
-    // on-disk `.config/wt.toml` when one exists, otherwise the committed
-    // default-branch config read from the object store (bare repo, default
-    // branch checked out in no worktree — #3461). Reading the raw text here
-    // rather than calling `load_project_config` keeps the deprecation and
-    // validation rendering below, which operates on the TOML source. Without
-    // this fallback, `config show` reports "Not found" while the hooks from the
-    // object-store config actually run — the opposite of reality.
+    // Resolve the effective config source, mirroring `ProjectConfig::load`.
+    // Git config wins as a complete source when any `worktrunk.config.*` key
+    // exists. Otherwise an on-disk project file wins, followed by the
+    // committed default-branch fallback for a bare repo whose default branch
+    // is checked out nowhere.
     let on_disk = repo.project_config_path()?;
-    let (config_path, contents) = match &on_disk {
-        Some(path) if path.exists() => {
-            let contents = std::fs::read_to_string(path).context("Failed to read config file")?;
-            let source = format!("@ {}", format_path_for_display(path));
-            write_heading_and_identifier(out, &repo, &source)?;
-            (path.clone(), contents)
+    let git_config = repo.git_project_config_content()?;
+    let (config_path, contents, from_git_config) = if let Some(contents) = git_config {
+        write_heading_and_identifier(out, &repo, "from git config (worktrunk.config.*)")?;
+
+        let superseded = match &on_disk {
+            Some(path) if path.exists() => Some(format_path_for_display(path)),
+            _ => repo
+                .default_branch_project_config_content()
+                .map(|(_, spec)| spec.to_string_lossy().into_owned()),
+        };
+        if let Some(source) = superseded {
+            writeln!(
+                out,
+                "{}",
+                warning_message(cformat!("Project config @ <bold>{source}</> is ignored"))
+            )?;
+            writeln!(
+                out,
+                "{}",
+                hint_message(cformat!(
+                    "To find the active values, run <underline>git config --show-origin --get-regexp '^worktrunk\\.config\\.'</>"
+                ))
+            )?;
         }
-        _ => match repo.default_branch_project_config_content() {
-            Some((object_store_contents, spec)) => {
-                // `spec` is a git revision spec (`<default>:.config/wt.toml`),
-                // not a filesystem path — display it verbatim, tagged as the
-                // object-store source so it isn't mistaken for an on-disk file.
-                let source = format!("@ {} (from object store)", spec.to_string_lossy());
+
+        (PathBuf::from("worktrunk.config.*"), contents, true)
+    } else {
+        let (path, contents) = match &on_disk {
+            Some(path) if path.exists() => {
+                let contents =
+                    std::fs::read_to_string(path).context("Failed to read config file")?;
+                let source = format!("@ {}", format_path_for_display(path));
                 write_heading_and_identifier(out, &repo, &source)?;
-                (spec, object_store_contents)
+                (path.clone(), contents)
             }
-            None => {
-                // Neither an on-disk file nor a committed fallback resolved.
-                let Some(path) = on_disk else {
-                    let heading = format_heading("PROJECT CONFIG", Some("No project config"));
-                    writeln!(out, "{}", cformat!("<dim>{}</>", heading))?;
+            _ => match repo.default_branch_project_config_content() {
+                Some((object_store_contents, spec)) => {
+                    // `spec` is a git revision spec (`<default>:.config/wt.toml`),
+                    // not a filesystem path — display it verbatim, tagged as the
+                    // object-store source so it isn't mistaken for an on-disk file.
+                    let source = format!("@ {} (from object store)", spec.to_string_lossy());
+                    write_heading_and_identifier(out, &repo, &source)?;
+                    (spec, object_store_contents)
+                }
+                None => {
+                    // Neither an on-disk file nor a committed fallback resolved.
+                    let Some(path) = on_disk else {
+                        let heading = format_heading("PROJECT CONFIG", Some("No project config"));
+                        writeln!(out, "{}", cformat!("<dim>{}</>", heading))?;
+                        return Ok(());
+                    };
+                    let source = format!("@ {}", format_path_for_display(&path));
+                    write_heading_and_identifier(out, &repo, &source)?;
+                    writeln!(out, "{}", hint_message("Not found"))?;
                     return Ok(());
-                };
-                let source = format!("@ {}", format_path_for_display(&path));
-                write_heading_and_identifier(out, &repo, &source)?;
-                writeln!(out, "{}", hint_message("Not found"))?;
-                return Ok(());
-            }
-        },
+                }
+            },
+        };
+        (path, contents, false)
     };
 
     if contents.trim().is_empty() {
@@ -894,28 +931,32 @@ fn render_project_config(out: &mut String) -> anyhow::Result<()> {
     // mirrors render_user_config so the two stay interchangeable.
     let is_main_worktree = !repo.current_worktree().is_linked().unwrap_or(true);
     let mut details_shown = false;
-    let skip_dump = match worktrunk::config::check_and_migrate(
-        &config_path,
-        &contents,
-        is_main_worktree,
-        worktrunk::config::ConfigFileKind::Project,
-        Some(&repo),
-        false, // silent mode - we'll format the output ourselves
-    ) {
-        Ok(result) => {
-            if let Some(info) = result.info {
-                out.push_str(&worktrunk::config::format_deprecation_details(
-                    &info, &contents,
-                ));
-                details_shown = true;
-                info.has_deprecated_patterns()
-            } else {
+    let skip_dump = if from_git_config {
+        false
+    } else {
+        match worktrunk::config::check_and_migrate(
+            &config_path,
+            &contents,
+            is_main_worktree,
+            worktrunk::config::ConfigFileKind::Project,
+            Some(&repo),
+            false, // silent mode - we'll format the output ourselves
+        ) {
+            Ok(result) => {
+                if let Some(info) = result.info {
+                    out.push_str(&worktrunk::config::format_deprecation_details(
+                        &info, &contents,
+                    ));
+                    details_shown = true;
+                    info.has_deprecated_patterns()
+                } else {
+                    false
+                }
+            }
+            Err(err) => {
+                writeln!(out, "{}", error_message(err.to_string()))?;
                 false
             }
-        }
-        Err(err) => {
-            writeln!(out, "{}", error_message(err.to_string()))?;
-            false
         }
     };
 

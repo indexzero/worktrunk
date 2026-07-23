@@ -53,6 +53,36 @@ fn test_approval_single_command(repo: TestRepo) {
 }
 
 #[rstest]
+fn test_git_config_hook_still_requires_approval(repo: TestRepo) {
+    repo.run_git(&[
+        "config",
+        "worktrunk.config.pre-start",
+        "echo git-config-hook > git-config-hook.txt",
+    ]);
+
+    let mut cmd = make_snapshot_cmd(&repo, "switch", &["--create", "git-config-approval"], None);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"n\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("needs approval")
+            && stderr.contains("pre-start")
+            && stderr.contains("Cannot prompt for approval"),
+        "git-config hook should enter the project approval path:\n{stderr}"
+    );
+    assert!(
+        !repo.root_path().join("git-config-hook.txt").exists(),
+        "declined git-config hook must not run"
+    );
+}
+
+#[rstest]
 fn test_approval_multiple_commands(repo: TestRepo) {
     repo.write_project_config(
         r#"[pre-start]

@@ -561,6 +561,39 @@ Command templates that run as [2mwt <name>[0m. See the Extending Worktrunk gui
 
 Aliases defined here are shared with teammates. For personal aliases, use the user config [2m[aliases][0m section instead.
 
+[1m[32mPrivate project config [experimental][0m
+
+Git config can hold an uncommitted project configuration. Add the
+[2mworktrunk.config.[0m prefix to the same flattened key path used by
+[2m.config/wt.toml[0m:
+
+[107m [0m [2m[0m[2m[34mgit[0m[2m config worktrunk.config.post-start [0m[2m[32m"npm run dev"[0m
+[107m [0m [2m[0m[2m[34mgit[0m[2m config worktrunk.config.forge.platform github[0m
+[107m [0m [2m[0m[2m[34mgit[0m[2m config worktrunk.config.list.url [0m[2m[32m'http://localhost:{{ branch | hash_port }}'[0m
+
+The values are ordinary Git-config values, not TOML embedded in
+[2m.git/config[0m. For a project field that is a list, repeat the key:
+
+[107m [0m [2m[0m[2m[34mgit[0m[2m config [0m[2m[36m--add[0m[2m worktrunk.config.step.copy-ignored.exclude .cache/[0m
+[107m [0m [2m[0m[2m[34mgit[0m[2m config [0m[2m[36m--add[0m[2m worktrunk.config.step.copy-ignored.exclude .turbo/[0m
+
+Git resolves system, global, local, worktree, and conditional includes before
+Worktrunk reads the keys. A local value therefore overrides the same global
+value. The effective configuration is shared by linked worktrees unless Git's
+per-worktree config overrides it.
+
+This source is all-or-nothing. If any [2mworktrunk.config.*[0m key is present, the
+effective Git configuration becomes the complete project configuration and
+[2m.config/wt.toml[0m is ignored. User configuration still applies normally.
+Worktrunk warns when both project sources exist.
+
+Commands from Git config follow the same approval rules as commands from
+[2m.config/wt.toml[0m.
+
+To find every active value and the file that supplied it:
+
+[107m [0m [2m[0m[2m[34mgit[0m[2m config [0m[2m[36m--show-origin[0m[2m [0m[2m[36m--get-regexp[0m[2m [0m[2m[32m'^worktrunk\.config\.'[0m
+
 [32mSHELL INTEGRATION[0m
 
 Worktrunk needs shell integration to change directories when switching worktrees. Install with:

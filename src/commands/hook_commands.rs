@@ -480,6 +480,11 @@ fn emit_hook_show_json(
 
     // Project hooks
     if let Some(project) = project_config {
+        let source = if project.is_git_config() {
+            "git-config"
+        } else {
+            "project"
+        };
         for hook_type in HookType::iter() {
             if let Some(f) = filter
                 && f != hook_type
@@ -487,7 +492,7 @@ fn emit_hook_show_json(
                 continue;
             }
             if let Some(cfg) = project.hooks.get(hook_type) {
-                emit(hook_type, "project", cfg, Some((approvals, project_id)))?;
+                emit(hook_type, source, cfg, Some((approvals, project_id)))?;
             }
         }
     }
@@ -557,18 +562,19 @@ fn render_project_hooks(
     filter: Option<HookType>,
     ctx: Option<&CommandContext>,
 ) -> anyhow::Result<()> {
-    let config_path = repo
-        .project_config_path()?
-        .context("Cannot determine project config location — no worktree found")?;
+    let source = match project_config {
+        Some(config) if config.is_git_config() => {
+            "from git config (worktrunk.config.*)".to_string()
+        }
+        _ => {
+            let config_path = repo
+                .project_config_path()?
+                .context("Cannot determine project config location — no worktree found")?;
+            format!("@ {}", format_path_for_display(&config_path))
+        }
+    };
 
-    writeln!(
-        out,
-        "{}",
-        format_heading(
-            "PROJECT HOOKS",
-            Some(&format!("@ {}", format_path_for_display(&config_path)))
-        )
-    )?;
+    writeln!(out, "{}", format_heading("PROJECT HOOKS", Some(&source)))?;
 
     let Some(config) = project_config else {
         writeln!(out, "{}", hint_message("(not found)"))?;

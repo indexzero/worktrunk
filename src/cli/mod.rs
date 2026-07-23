@@ -2435,6 +2435,45 @@ url = "echo http://localhost:{{ branch | hash_port }}"
 Aliases defined here are shared with teammates. For personal aliases, use the [user config](@/config.md#aliases) `[aliases]` section instead.
 <!-- PROJECT_CONFIG_END -->
 
+## Private project config [experimental]
+
+Git config can hold an uncommitted project configuration. Add the
+`worktrunk.config.` prefix to the same flattened key path used by
+`.config/wt.toml`:
+
+```console
+$ git config worktrunk.config.post-start "npm run dev"
+$ git config worktrunk.config.forge.platform github
+$ git config worktrunk.config.list.url 'http://localhost:{{ branch | hash_port }}'
+```
+
+The values are ordinary Git-config values, not TOML embedded in
+`.git/config`. For a project field that is a list, repeat the key:
+
+```console
+$ git config --add worktrunk.config.step.copy-ignored.exclude .cache/
+$ git config --add worktrunk.config.step.copy-ignored.exclude .turbo/
+```
+
+Git resolves system, global, local, worktree, and conditional includes before
+Worktrunk reads the keys. A local value therefore overrides the same global
+value. The effective configuration is shared by linked worktrees unless Git's
+per-worktree config overrides it.
+
+This source is all-or-nothing. If any `worktrunk.config.*` key is present, the
+effective Git configuration becomes the complete project configuration and
+`.config/wt.toml` is ignored. User configuration still applies normally.
+Worktrunk warns when both project sources exist.
+
+Commands from Git config follow the same approval rules as commands from
+`.config/wt.toml`.
+
+To find every active value and the file that supplied it:
+
+```console
+$ git config --show-origin --get-regexp '^worktrunk\.config\.'
+```
+
 # Shell Integration
 
 Worktrunk needs shell integration to change directories when switching worktrees. Install with:

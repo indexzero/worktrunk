@@ -1,15 +1,19 @@
 //! Configuration system for worktrunk
 //!
-//! Three configuration sources, loaded in order (later overrides earlier):
+//! Configuration sources:
 //!
 //! 1. **System config** (`/etc/xdg/worktrunk/config.toml` or platform equivalent) -
 //!    Organization-wide defaults, optional
 //! 2. **User config** (`~/.config/worktrunk/config.toml`) - Personal preferences
-//! 3. **Project config** (`.config/wt.toml`) - Lifecycle hooks, checked into git
+//! 3. **Project config** - Lifecycle hooks and repository settings, selected
+//!    all-or-nothing from either effective `worktrunk.config.*` git config
+//!    (experimental) or `.config/wt.toml`
 //!
 //! System and user configs share the same schema and are merged via
 //! `deep_merge_table` (user values override system values at the key level).
-//! Project config is independent — different schema, different purpose.
+//! Project config is independent — different schema, different purpose. Git
+//! config uses that same schema with flattened key paths and takes precedence
+//! over the project file when any matching key exists.
 //!
 //! See `wt config --help` for complete documentation.
 

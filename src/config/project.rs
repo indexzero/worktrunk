@@ -1,6 +1,8 @@
-//! Project-level configuration
+//! Project-level configuration.
 //!
-//! Configuration that is checked into the repository and shared across all developers.
+//! The schema is shared by committed `.config/wt.toml` and the experimental
+//! `worktrunk.config.*` namespace in effective git config. Source selection is
+//! all-or-nothing; values from the two sources never merge.
 
 use std::collections::BTreeMap;
 
@@ -11,6 +13,16 @@ use super::ConfigError;
 use super::commands::CommandConfig;
 use super::is_default;
 use super::{CopyIgnoredConfig, HooksConfig, StepConfig};
+
+/// Where the active project configuration came from.
+///
+/// The origin is runtime metadata, not part of the project-config schema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ProjectConfigOrigin {
+    #[default]
+    File,
+    GitConfig,
+}
 
 /// Project-level configuration for `wt list` output.
 ///
@@ -177,9 +189,9 @@ impl ProjectConfig {
 
 /// Project-specific configuration with hooks.
 ///
-/// This config is stored at `<repo>/.config/wt.toml` within the repository and
-/// IS checked into git. It defines project-specific hooks that run automatically
-/// during worktree operations. All developers working on the project share this config.
+/// This config is normally stored at `<repo>/.config/wt.toml` and checked into
+/// git. The same schema can be expressed as flattened `worktrunk.config.*`
+/// keys in git config.
 ///
 /// # Template Variables
 ///
@@ -205,6 +217,11 @@ impl ProjectConfig {
 /// - `{{ branch | hash_port }}` - Hash string to deterministic port (10000-19999)
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, JsonSchema)]
 pub struct ProjectConfig {
+    /// Runtime source metadata. Never serialized into project TOML.
+    #[serde(skip)]
+    #[schemars(skip)]
+    origin: ProjectConfigOrigin,
+
     /// Project hooks (same keys as user hooks, flattened at top level)
     #[serde(flatten, default)]
     pub hooks: HooksConfig,
@@ -247,14 +264,59 @@ pub struct ProjectConfig {
 }
 
 impl ProjectConfig {
-    /// Load project configuration from .config/wt.toml in the repository root
+    /// Whether this config came from `worktrunk.config.*` in git config.
+    pub fn is_git_config(&self) -> bool {
+        self.origin == ProjectConfigOrigin::GitConfig
+    }
+
+    /// Load the selected project configuration.
     ///
-    /// Set `write_hints` to true for normal usage. Set to false during completion
-    /// to avoid side effects (writing git config hints).
+    /// Effective `worktrunk.config.*` values in git config win as a complete
+    /// source. Without them, load `.config/wt.toml` (or its configured
+    /// override/fallback). Set `write_hints` to true for normal usage. Set to
+    /// false during completion to avoid side effects.
     pub fn load(
         repo: &crate::git::Repository,
         write_hints: bool,
     ) -> Result<Option<Self>, ConfigError> {
+        if let Some(contents) = repo
+            .git_project_config_content()
+            .map_err(|e| ConfigError(format!("Failed to read git config: {e}")))?
+        {
+            if !super::warnings_suppressed() {
+                let superseded = match repo.project_config_path() {
+                    Ok(Some(path)) if path.exists() => {
+                        Some(crate::path::format_path_for_display(&path))
+                    }
+                    _ => repo
+                        .default_branch_project_config_content()
+                        .map(|(_, spec)| spec.to_string_lossy().into_owned()),
+                };
+                if let Some(source) = superseded {
+                    crate::styling::eprintln!(
+                        "{}",
+                        crate::styling::warning_message(color_print::cformat!(
+                            "Git config <bold>worktrunk.config.*</> is active; project config @ <bold>{source}</> is ignored"
+                        ))
+                    );
+                    crate::styling::eprintln!(
+                        "{}",
+                        crate::styling::hint_message(color_print::cformat!(
+                            "To find the active values, run <underline>git config --show-origin --get-regexp '^worktrunk\\.config\\.'</>"
+                        ))
+                    );
+                }
+            }
+
+            let mut config: ProjectConfig = toml::from_str(&contents).map_err(|e| {
+                ConfigError(format!(
+                    "Git config worktrunk.config.* failed to parse as project config:\n{e}"
+                ))
+            })?;
+            config.origin = ProjectConfigOrigin::GitConfig;
+            return Ok(Some(config));
+        }
+
         let (contents, config_path) = match repo
             .project_config_path()
             .map_err(|e| ConfigError(format!("Failed to get config path: {}", e)))?

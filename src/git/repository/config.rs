@@ -11,7 +11,95 @@ use crate::git::CommandError;
 
 use super::{DefaultBranchName, GitError, Repository};
 
+const GIT_PROJECT_CONFIG_PREFIX: &str = "worktrunk.config.";
+
 impl Repository {
+    /// Build project-config TOML from the effective `worktrunk.config.*`
+    /// namespace in git config.
+    ///
+    /// Git owns source precedence and includes. This method reads the existing
+    /// bulk `git config --list -z` cache, takes the last value for each exact
+    /// key, strips `worktrunk.config.`, and uses the remainder as the project
+    /// TOML path. Git values stay ordinary strings. Scalar fields take the
+    /// last effective value; list fields consume the effective multivar.
+    ///
+    /// The namespace is all-or-nothing. Any matching key selects this source;
+    /// callers do not merge it with `.config/wt.toml`.
+    pub fn git_project_config_content(&self) -> anyhow::Result<Option<String>> {
+        let guard = self.all_config()?.read().unwrap();
+        let entries: Vec<_> = guard
+            .iter()
+            .filter_map(|(key, values)| {
+                let path = key.strip_prefix(GIT_PROJECT_CONFIG_PREFIX)?;
+                let value = values.last()?;
+                Some((key.as_str(), path, value.as_str()))
+            })
+            .collect();
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        let mut table = toml::Table::new();
+        for (full_key, path, raw) in entries {
+            let segments: Vec<String> = path.split('.').map(str::to_string).collect();
+            if segments.iter().any(String::is_empty) {
+                anyhow::bail!("Invalid git config key {full_key}: empty project-config path");
+            }
+
+            let scalar = parse_git_project_scalar(raw);
+            let mut scalar_candidate = table.clone();
+            set_git_project_value(&mut scalar_candidate, &segments, scalar, full_key)?;
+            if toml::Value::Table(scalar_candidate.clone())
+                .try_into::<ProjectConfig>()
+                .is_ok()
+            {
+                table = scalar_candidate;
+                continue;
+            }
+
+            // A TOML-looking string remains a string when the destination
+            // expects one. Users never need to quote TOML inside git config.
+            let mut string_candidate = table.clone();
+            set_git_project_value(
+                &mut string_candidate,
+                &segments,
+                toml::Value::String(raw.to_string()),
+                full_key,
+            )?;
+            if toml::Value::Table(string_candidate.clone())
+                .try_into::<ProjectConfig>()
+                .is_ok()
+            {
+                table = string_candidate;
+                continue;
+            }
+
+            let strings_candidate = toml::Value::Array(
+                guard
+                    .get(full_key)
+                    .into_iter()
+                    .flatten()
+                    .map(|value| toml::Value::String(value.clone()))
+                    .collect(),
+            );
+            let mut array_candidate = table.clone();
+            set_git_project_value(&mut array_candidate, &segments, strings_candidate, full_key)?;
+            if toml::Value::Table(array_candidate.clone())
+                .try_into::<ProjectConfig>()
+                .is_ok()
+            {
+                table = array_candidate;
+                continue;
+            }
+
+            // Preserve the ordinary string shape so the final deserialize can
+            // attribute the incompatible value to its exact config path.
+            table = string_candidate;
+        }
+
+        Ok(Some(toml::to_string(&table)?))
+    }
+
     /// Get a git config value. Returns None if the key doesn't exist.
     ///
     /// Reads from the bulk config map populated by the private
@@ -814,10 +902,10 @@ impl Repository {
         }
     }
 
-    /// Load the project configuration (.config/wt.toml) if it exists.
+    /// Load the selected project configuration if it exists.
     ///
     /// Result is cached in the repository's shared cache (same for all clones).
-    /// Returns `None` if not in a worktree or if no config file exists.
+    /// Returns `None` if not in a worktree or neither project source exists.
     ///
     /// Returns an owned clone — use [`project_config`](Self::project_config)
     /// when a borrow suffices, to avoid the clone.
@@ -833,10 +921,9 @@ impl Repository {
     /// pull them through the same borrow-from-cache shape.
     ///
     /// Unlike `user_config`, this does **not** participate in
-    /// [`Repository::prewarm`] — `.config/wt.toml` lives inside the
-    /// worktree, so the read can't fire until git discovery finishes.
-    /// Callers pay a few-tens-of-µs sequential file read on first access,
-    /// and deprecation warnings (if any) emit on that first call.
+    /// [`Repository::prewarm`] because source selection cannot finish until
+    /// git discovery does. The Git-config candidate reuses the bulk config
+    /// cache; the file candidate pays a small sequential read on first access.
     ///
     /// User and project configs are kept distinct rather than merged
     /// because downstream consumers (alias loading, hook resolution,
@@ -850,6 +937,50 @@ impl Repository {
             })
             .map(Option::as_ref)
     }
+}
+
+/// Parse the scalar types git config represents conventionally. Everything
+/// else stays a string; arrays come from repeated keys, not TOML embedded in
+/// a git-config value.
+fn parse_git_project_scalar(raw: &str) -> toml::Value {
+    if raw.eq_ignore_ascii_case("true") {
+        return toml::Value::Boolean(true);
+    }
+    if raw.eq_ignore_ascii_case("false") {
+        return toml::Value::Boolean(false);
+    }
+    if let Ok(value) = raw.parse::<i64>() {
+        return toml::Value::Integer(value);
+    }
+    if let Ok(value) = raw.parse::<f64>() {
+        return toml::Value::Float(value);
+    }
+    toml::Value::String(raw.to_string())
+}
+
+/// Set a nested project-config value without silently crossing a scalar/table
+/// collision.
+fn set_git_project_value(
+    table: &mut toml::Table,
+    path: &[String],
+    value: toml::Value,
+    full_key: &str,
+) -> anyhow::Result<()> {
+    let Some((head, tail)) = path.split_first() else {
+        anyhow::bail!("Invalid git config key {full_key}: empty project-config path");
+    };
+    if tail.is_empty() {
+        table.insert(head.clone(), value);
+        return Ok(());
+    }
+
+    let entry = table
+        .entry(head.clone())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(inner) = entry else {
+        anyhow::bail!("Git config key {full_key} conflicts with worktrunk.config.{head}");
+    };
+    set_git_project_value(inner, tail, value, full_key)
 }
 
 /// Split a `worktrunk.state.<branch>.vars.<key>` config key into `(branch, key)`.
@@ -879,6 +1010,132 @@ fn parse_branch_config_key(config_key: &str) -> Option<(&str, &str)> {
 mod tests {
     use super::*;
     use crate::testing::TestRepo;
+    use path_slash::PathExt;
+
+    #[test]
+    fn test_git_project_config_uses_flattened_project_paths() {
+        let test = TestRepo::with_initial_commit();
+        test.run_git(&["config", "worktrunk.config.post-start", "pnpm install"]);
+        test.run_git(&["config", "worktrunk.config.forge.platform", "github"]);
+        test.run_git(&[
+            "config",
+            "worktrunk.config.list.url",
+            "http://localhost:{{ branch | hash_port }}",
+        ]);
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let contents = repo.git_project_config_content().unwrap().unwrap();
+        let config: ProjectConfig = toml::from_str(&contents).unwrap();
+
+        assert_eq!(
+            config
+                .hooks
+                .post_create
+                .as_ref()
+                .unwrap()
+                .commands()
+                .next()
+                .unwrap()
+                .template,
+            "pnpm install"
+        );
+        assert_eq!(config.forge.platform.as_deref(), Some("github"));
+        assert_eq!(
+            config.list.url.as_deref(),
+            Some("http://localhost:{{ branch | hash_port }}")
+        );
+    }
+
+    #[test]
+    fn test_git_project_config_repeated_key_builds_list() {
+        let test = TestRepo::with_initial_commit();
+        test.run_git(&[
+            "config",
+            "--add",
+            "worktrunk.config.step.copy-ignored.exclude",
+            ".cache/",
+        ]);
+        test.run_git(&[
+            "config",
+            "--add",
+            "worktrunk.config.step.copy-ignored.exclude",
+            ".turbo/",
+        ]);
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let contents = repo.git_project_config_content().unwrap().unwrap();
+        let config: ProjectConfig = toml::from_str(&contents).unwrap();
+
+        assert_eq!(
+            config.step.copy_ignored.unwrap().exclude,
+            vec![".cache/", ".turbo/"]
+        );
+    }
+
+    #[test]
+    fn test_git_project_config_uses_git_precedence_for_scalars() {
+        let test = TestRepo::with_initial_commit();
+        test.run_git(&[
+            "config",
+            "--global",
+            "worktrunk.config.forge.platform",
+            "gitlab",
+        ]);
+        test.run_git(&["config", "worktrunk.config.forge.platform", "github"]);
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let contents = repo.git_project_config_content().unwrap().unwrap();
+        let config: ProjectConfig = toml::from_str(&contents).unwrap();
+
+        assert_eq!(config.forge.platform.as_deref(), Some("github"));
+    }
+
+    #[test]
+    fn test_git_project_config_honors_conditional_includes() {
+        let test = TestRepo::with_initial_commit();
+        let include_path = test.root_path().join("private-worktrunk.gitconfig");
+        std::fs::write(
+            &include_path,
+            "[worktrunk \"config.forge\"]\n\tplatform = gitlab\n",
+        )
+        .unwrap();
+
+        let gitdir_pattern = format!(
+            "includeIf.gitdir:{}/.git/.path",
+            test.root_path().to_slash_lossy()
+        );
+        test.run_git(&["config", &gitdir_pattern, include_path.to_str().unwrap()]);
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let contents = repo.git_project_config_content().unwrap().unwrap();
+        let config: ProjectConfig = toml::from_str(&contents).unwrap();
+
+        assert_eq!(config.forge.platform.as_deref(), Some("gitlab"));
+    }
+
+    #[test]
+    fn test_git_project_config_is_shared_with_linked_worktrees() {
+        let mut test = TestRepo::with_initial_commit();
+        test.run_git(&["config", "worktrunk.config.post-start", "echo shared"]);
+        let linked = test.add_worktree("linked-config");
+
+        let repo = Repository::at(&linked).unwrap();
+        let contents = repo.git_project_config_content().unwrap().unwrap();
+        let config: ProjectConfig = toml::from_str(&contents).unwrap();
+
+        assert_eq!(
+            config
+                .hooks
+                .post_create
+                .as_ref()
+                .unwrap()
+                .commands()
+                .next()
+                .unwrap()
+                .template,
+            "echo shared"
+        );
+    }
 
     #[test]
     fn test_get_config_regexp_no_match_returns_empty() {

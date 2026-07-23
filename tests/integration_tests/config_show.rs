@@ -84,6 +84,81 @@ fn test_config_show_no_project_config(mut repo: TestRepo, temp_home: TempDir) {
     });
 }
 
+#[rstest]
+fn test_git_config_supersedes_project_file(repo: TestRepo, temp_home: TempDir) {
+    repo.write_project_config(r#"post-start = "from project file""#);
+    repo.run_git(&["config", "worktrunk.config.post-start", "from git config"]);
+
+    let mut cmd = repo.wt_command();
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "show", "--format=json"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("config show should emit JSON");
+    assert_eq!(json["project"]["source"], "git-config");
+    assert!(json["project"]["path"].is_null());
+    assert_eq!(json["project"]["config"]["post-start"], "from git config");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("worktrunk.config.*")
+            && stderr.contains("project config")
+            && stderr.contains("git config --show-origin --get-regexp '^worktrunk\\.config\\.'"),
+        "supersession warning should name the effect and diagnostic command:\n{stderr}"
+    );
+}
+
+#[rstest]
+fn test_git_config_uses_effective_git_precedence(repo: TestRepo, temp_home: TempDir) {
+    repo.run_git(&[
+        "config",
+        "--global",
+        "worktrunk.config.forge.platform",
+        "gitlab",
+    ]);
+
+    let mut cmd = repo.wt_command();
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "show", "--format=json"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("config show should emit JSON");
+    assert_eq!(json["project"]["source"], "git-config");
+    assert_eq!(json["project"]["config"]["forge"]["platform"], "gitlab");
+
+    repo.run_git(&["config", "worktrunk.config.forge.platform", "github"]);
+
+    let mut cmd = repo.wt_command();
+    set_xdg_config_path(&mut cmd, temp_home.path());
+    set_temp_home_env(&mut cmd, temp_home.path());
+    cmd.args(["config", "show", "--format=json"]);
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("config show should emit JSON");
+    assert_eq!(json["project"]["config"]["forge"]["platform"], "github");
+}
+
 // ==================== System Config Tests ====================
 
 #[rstest]
