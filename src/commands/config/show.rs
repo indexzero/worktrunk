@@ -169,7 +169,7 @@ fn handle_config_show_json() -> anyhow::Result<()> {
             // key exists it is the whole project config, with no on-disk path.
             // A failed read propagates, matching `config_show_output` and
             // `ProjectConfig::load` — swallowing it would report the file as
-            // active while execution errors on the same read. An unparseable
+            // active while execution errors on the same read. An unparsable
             // source is still tolerated like the file path below: `invalid` is
             // set and the config reported null rather than aborting the report.
             let git_pairs = repo.worktrunk_config_git_pairs()?;
