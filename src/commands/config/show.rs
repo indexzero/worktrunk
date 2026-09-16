@@ -167,9 +167,11 @@ fn handle_config_show_json() -> anyhow::Result<()> {
         if let Some(repo) = repo.as_ref() {
             // Experimental git-config source (#3454): when any `worktrunk.config.*`
             // key exists it is the whole project config, with no on-disk path.
-            // Parse it tolerantly like the file path below — a broken source
-            // sets `invalid` and reports null config rather than aborting the
-            // report — and name it as the active source.
+            // A failed read propagates, matching `config_show_output` and
+            // `ProjectConfig::load` — swallowing it would report the file as
+            // active while execution errors on the same read. An unparseable
+            // source is still tolerated like the file path below: `invalid` is
+            // set and the config reported null rather than aborting the report.
             let git_pairs = repo.worktrunk_config_git_pairs()?;
             if !git_pairs.is_empty() {
                 let config = match worktrunk::config::render_git_source_toml(&git_pairs) {
