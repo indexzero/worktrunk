@@ -117,10 +117,12 @@ pub fn worktree_display_name(
 /// Uses an absolute path (`repo_path`/../) to avoid ambiguity with relative resolution.
 const BARE_REPO_WORKTREE_PATH: &str = "{{ repo_path }}/../{{ branch | sanitize }}";
 
-/// Check whether a template string references `{{ repo }}` or `{{ main_worktree }}`.
+/// Check whether a template string references `{{ repo }}`.
+///
+/// The template comes from the loaded config, so the deprecation layer has
+/// already renamed the retired `main_worktree` to `repo` before it gets here.
 fn template_references_repo_name(template: &str) -> bool {
     worktrunk::config::template_references_var(template, "repo")
-        || worktrunk::config::template_references_var(template, "main_worktree")
 }
 
 /// Offer to set a project-level `worktree-path` for bare repos with hidden directory names.
@@ -210,6 +212,10 @@ pub fn offer_bare_repo_worktree_path_fix(
         ))
     );
 
+    // Separate the prompt from the diagnosis above; prompt_yes_no_preview
+    // emits no leading blank of its own.
+    eprintln!();
+
     let config_path_for_preview = config_path_display.clone();
     let project_id_for_preview = project_id.clone();
     match prompt_yes_no_preview(
@@ -269,53 +275,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_template_references_repo_name_default() {
-        // Default template uses {{ repo }}
-        assert!(template_references_repo_name(
-            "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}"
-        ));
-    }
+    fn test_template_references_repo_name() {
+        let cases = [
+            (
+                "default template",
+                "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}",
+                true,
+            ),
+            ("repo with filter", "{{ repo | sanitize }}", true),
+            (
+                "repo_path is a distinct variable",
+                "{{ repo_path }}/../{{ branch | sanitize }}",
+                false,
+            ),
+            (
+                "no repository variable",
+                "../{{ branch | sanitize }}",
+                false,
+            ),
+            ("expression without spaces", "{{repo}}.{{branch}}", true),
+            (
+                "repo outside an expression",
+                "my-repo-path/{{ branch }}",
+                false,
+            ),
+            ("repo suffix in myrepo", "{{ myrepo }}", false),
+            ("repo suffix in norepo", "{{ norepo }}", false),
+        ];
 
-    #[test]
-    fn test_template_references_repo_name_with_filter() {
-        assert!(template_references_repo_name("{{ repo | sanitize }}"));
-    }
-
-    #[test]
-    fn test_template_references_repo_name_deprecated_alias() {
-        assert!(template_references_repo_name(
-            "{{ main_worktree }}.{{ branch }}"
-        ));
-    }
-
-    #[test]
-    fn test_template_references_repo_name_not_repo_path() {
-        // {{ repo_path }} should NOT match
-        assert!(!template_references_repo_name(
-            "{{ repo_path }}/../{{ branch | sanitize }}"
-        ));
-    }
-
-    #[test]
-    fn test_template_references_repo_name_no_repo() {
-        assert!(!template_references_repo_name("../{{ branch | sanitize }}"));
-    }
-
-    #[test]
-    fn test_template_references_repo_name_no_spaces() {
-        assert!(template_references_repo_name("{{repo}}.{{branch}}"));
-    }
-
-    #[test]
-    fn test_template_references_repo_name_no_braces() {
-        // "repo" outside template expressions should not match
-        assert!(!template_references_repo_name("my-repo-path/{{ branch }}"));
-    }
-
-    #[test]
-    fn test_template_references_repo_name_substring_prefix() {
-        // "myrepo" should NOT match — "repo" is a suffix of a longer identifier
-        assert!(!template_references_repo_name("{{ myrepo }}"));
-        assert!(!template_references_repo_name("{{ norepo }}"));
+        for (name, template, expected) in cases {
+            assert_eq!(
+                template_references_repo_name(template),
+                expected,
+                "{name}: {template}"
+            );
+        }
     }
 }

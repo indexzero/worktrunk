@@ -41,7 +41,7 @@ Aliases are configured under `[aliases]`:
 
 ```toml
 [aliases]
-deploy = "fly deploy --config=fly.{{ env }}.toml --app=myapp-{{ branch }}"
+deploy = "fly deploy --config=fly.{{ env }}.toml --app=myproject-{{ branch }}"
 open = "open http://localhost:{{ branch | hash_port }}"
 since-main = "git log --oneline {{ default_branch }}..HEAD"
 ```
@@ -126,11 +126,11 @@ show-branches = "wt step for-each -- sh -c 'echo {% raw %}{{ branch }}{% endraw 
 
 `wt show-branches` prints each worktree's own branch.
 
-`wt switch --execute` defers the same way, without the extra wrapper: its `--execute '…'` argument is already a single quoted string, so only `{% raw %}` is needed. Here `{{ worktree_path }}` expands against the worktree being created, not the one the alias ran from:
+`wt switch --execute` defers the same way. `-x` names the program and arguments after `--` stay separate, so quote the deferred template as one alias-body token. Here `{{ worktree_path }}` expands against the worktree being created, not the one the alias ran from:
 
 ```toml
 [aliases]
-echo-target = "wt switch {{ args }} --no-cd --execute 'echo {% raw %}{{ worktree_path }}{% endraw %}'"
+echo-target = "wt switch {{ args }} --no-cd --execute echo -- '{% raw %}{{ worktree_path }}{% endraw %}'"
 ```
 
 A repo-level variable like `{{ default_branch }}` needs no deferral: it is identical in every worktree, so a bare `{{ default_branch }}` is already correct everywhere.
@@ -140,16 +140,24 @@ A repo-level variable like `{{ default_branch }}` needs no deferral: it is ident
 ```toml
 [aliases]
 up = '''
-git fetch --all --prune && wt step for-each -- sh -c '
+git fetch --all --prune; wt step for-each -- sh -c '
   git rev-parse --verify -q @{u} >/dev/null || exit 0
   g=$(git rev-parse --git-dir)
-  test -d "$g/rebase-merge" -o -d "$g/rebase-apply" && exit 0
-  git update-index --refresh -q >/dev/null || true
-  git rebase @{u} --no-autostash || git rebase --abort
+  rebasing() { test -d "$g/rebase-merge" || test -d "$g/rebase-apply"; }
+  rebasing && exit 0
+  git diff --quiet HEAD || { git merge --ff-only --no-autostash @{u}; exit 0; }
+  git rebase @{u} --no-autostash || { rebasing || exit 0; git rebase --abort; }
 ''''
 ```
 
-`wt up` fetches all remotes, then iterates every worktree: skip if no upstream, skip if mid-rebase, refresh the index to drop stale stat entries, then rebase and auto-abort on conflict. It rebases onto git-native `@{u}` rather than a `{{ … }}` template, so git resolves each worktree's own upstream and there is nothing to defer.
+`wt up` fetches every remote, then brings each worktree up to date with its upstream: skip if there is no upstream or a rebase is already in progress, fast-forward if a tracked file is modified or staged, otherwise rebase, aborting on conflict. It rebases onto git-native `@{u}` rather than a `{{ … }}` template, so git resolves each worktree's own upstream and there is nothing to defer.
+
+Two details matter when adapting it:
+
+- `;` after the fetch lets the sweep run even when one remote fails to fetch.
+- `--no-autostash` overrides a global `rebase.autostash` or `merge.autostash`, whose conflicting pop would leave markers behind and still exit 0.
+
+The sweep exits non-zero only when it leaves a worktree needing attention, which matters when the alias runs as a hook step: a failing step stops the rest of the pipeline.
 
 ### Recipe: move or copy in-progress changes to a new worktree
 
@@ -160,15 +168,17 @@ git fetch --all --prune && wt step for-each -- sh -c '
 [aliases]
 move-changes = '''
 if git diff --quiet HEAD && test -z "$(git ls-files --others --exclude-standard)"; then
-  wt switch --create {{ to }} --execute="{{ args }}"
+  wt switch --create {{ to }} --execute sh -- -c \
+    'if [ "$#" -gt 0 ]; then exec "$@"; fi' worktrunk-move {{ args }}
 else
   git stash push --include-untracked --quiet
-  wt switch --create {{ to }} --execute="git stash pop --index; {{ args }}"
+  wt switch --create {{ to }} --execute sh -- -c \
+    'git stash pop --index; if [ "$#" -gt 0 ]; then exec "$@"; fi' worktrunk-move {{ args }}
 fi
 '''
 ```
 
-Run with `wt move-changes --to=feature-xyz`. The guard skips the stash when nothing is in flight; otherwise `git stash push` captures everything and `--execute` pops it in the new worktree with the staged/unstaged split intact. Anything after `--` runs in the new worktree after pop. For example, `wt move-changes --to=feature-xyz -- claude` opens Claude there.
+Run with `wt move-changes --to=feature-xyz`. The guard skips the stash when nothing is in flight; otherwise `git stash push` captures everything and the explicit `sh -c` step pops it in the new worktree with the staged/unstaged split intact. Anything after `--` is forwarded as argv and runs in the new worktree after pop. For example, `wt move-changes --to=feature-xyz -- claude` opens Claude there.
 
 To copy instead of move, add `git stash apply --index --quiet` right after the push.
 
@@ -221,7 +231,6 @@ Aside from the differences below, hooks and aliases behave the same.
 | Reach `{{ args }}` from positionals | Must use `--` (`wt hook pre-merge -- extra`) | Any bare positional lands there |
 | Approval skip flag | Post-subcommand `--yes` / `-y` supported (`wt hook pre-merge --yes`) | Only the global form (`wt -y <alias>`); post-alias `--yes` falls through to `{{ args }}` |
 | Source discrimination | `user:` / `project:` / `user:name` / `project:name` filter syntax | Run user first, then project; no filter syntax |
-| Force-bind escape | `--var KEY=VALUE` (deprecated in favor of `--KEY=VALUE`, but still force-binds) | None; smart routing is the only path |
 | `--help` | `wt hook --help` lists hook types; `wt hook <type> --help` shows flags and arguments for that type | The template body is the documentation: `wt <alias> --help` redirects to `wt config alias show` / `dry-run`. `wt --help` and `wt step --help` list configured aliases alongside built-in commands |
 | Inspection | `wt hook show [type] [--expanded]` | `wt config alias show <name>` / `wt config alias dry-run <name>` |
 | Stdin | All template variables as JSON (parse with `json.load(sys.stdin)`) | Inherits parent stdin (pipes pass through; interactive TUIs like `wt switch` keep the tty) |

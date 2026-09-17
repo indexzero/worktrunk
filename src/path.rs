@@ -163,7 +163,28 @@ pub fn expand_tilde(path: &Path) -> Cow<'_, Path> {
 /// For non-existent paths, canonicalizes the longest existing prefix and appends
 /// the remaining components. This handles macOS `/var` -> `/private/var` symlinks
 /// correctly for computed worktree paths that don't exist yet.
-pub(crate) fn canonicalize_with_parents(path: &Path) -> PathBuf {
+///
+/// A `..` is resolved by the filesystem rather than collapsed lexically, which is
+/// load-bearing where [`paths_match`] decides whether two paths name one
+/// directory: crossing a symlink, the two readings name different directories,
+/// and `WorkingTree::ensure_holds_this_worktree` compares a worktree
+/// registration's recorded path against the directory sitting at it to decide
+/// whether removal may delete that directory.
+///
+/// On Windows a drive path's result never carries a `\\?\` prefix — a
+/// `VerbatimUNC` share keeps its own — because every caller compares it against
+/// another result of this function. `dunce` strips that
+/// prefix only from paths of 260 characters or fewer, so a deep path and the
+/// short root containing it come back spelled `\\?\C:\…` and `C:\…` — one
+/// `Prefix::VerbatimDisk` component and one `Prefix::Disk`, which
+/// [`Path::starts_with`] reads as unrelated drives. That split made
+/// `wt step copy-ignored` refuse to copy a deep `node_modules` tree into a
+/// worktree it was squarely inside (#3898).
+pub fn canonicalize_with_parents(path: &Path) -> PathBuf {
+    strip_verbatim_disk_prefix(resolve_with_parents(path))
+}
+
+fn resolve_with_parents(path: &Path) -> PathBuf {
     if let Ok(canonical) = canonicalize(path) {
         return canonical;
     }
@@ -187,6 +208,46 @@ pub(crate) fn canonicalize_with_parents(path: &Path) -> PathBuf {
         result.push(component);
     }
     result
+}
+
+/// Drop the `\\?\` prefix from a canonicalized drive path. A no-op off Windows.
+///
+/// Only a `VerbatimDisk` prefix is stripped: `\\?\UNC\server\share` names a
+/// share, and cutting the same four characters off it would leave the relative
+/// `UNC\server\share`. Unlike `dunce`, nothing about the path's contents keeps
+/// the prefix — not its length, and not the reserved DOS names (`con`, `aux`,
+/// `com1`) or trailing dots and spaces that `dunce`'s `is_safe_to_strip_unc`
+/// also declines to strip. [`canonicalize_with_parents`] feeds comparisons and
+/// messages, not the legacy APIs those rules protect, and `std::fs` re-applies
+/// a verbatim prefix itself for any path it opens. What that trades is confined
+/// to the message case: `registration_worktree_path` shows its result in
+/// `GitError::WorktreePathNotOurs`, and for a path a reserved component makes
+/// unreachable under the legacy spelling, the reported spelling is one the user
+/// can't `cd` into.
+#[cfg(windows)]
+fn strip_verbatim_disk_prefix(path: PathBuf) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+
+    let verbatim_disk = matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+    );
+    if !verbatim_disk {
+        return path;
+    }
+    // Cut the prefix in UTF-16 rather than slicing a `&str`, so a path `to_str`
+    // can't render is spelled like every other result instead of keeping the
+    // split this function exists to close. `\\?\` is four ASCII characters, so
+    // four UTF-16 units.
+    let stripped: Vec<u16> = path.as_os_str().encode_wide().skip(4).collect();
+    PathBuf::from(OsString::from_wide(&stripped))
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_disk_prefix(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// Compare two paths for equality, canonicalizing to handle symlinks and relative paths.
@@ -234,13 +295,74 @@ pub fn sanitize_for_filename(value: &str) -> String {
     result
 }
 
+/// The command name a path to an executable names: its file name with the
+/// platform's executable suffix stripped.
+///
+/// The one place wt turns `argv[0]` into a command name.
+/// `invocation::binary_name` names wt in the shell integration it generates and
+/// in its own hints; [`testing::mock_stub`](crate::testing::mock_stub) selects a
+/// mock's config by it. A name that resolved differently in the two would be a
+/// silent disagreement about what this process is called. The shell-integration
+/// warning is not a third caller: it reports the name as typed, `.exe` and all,
+/// so it can tell a Windows user to drop the suffix.
+///
+/// Stripping [`std::env::consts::EXE_SUFFIX`] rather than taking
+/// [`Path::file_stem`] keeps a dotted name (`wt.old`, `python3.11`) whole.
+/// `file_stem` cuts at the last dot wherever that dot is, so the same name
+/// resolves differently per platform: Unix's `python3.11` becomes `python3`
+/// while the Windows link `python3.11.exe` keeps `python3.11`. The suffix
+/// matches case-insensitively, because Windows resolves `WT.EXE` and `wt.exe`
+/// to the same file.
+///
+/// Non-UTF8 bytes convert lossily rather than failing. The callers that embed
+/// the name in shell syntax validate it first
+/// ([`shell::validate_shell_command_name`](crate::shell::validate_shell_command_name)),
+/// and a name that can't be spelled is better rejected there than silently
+/// replaced by wt's own.
+///
+/// `None` when the path has no file name, or when the file name is nothing but
+/// the suffix — a degenerate `argv[0]`, which a caller treats as "no name"
+/// rather than panicking inside `main()`.
+///
+/// Not [`shell::extract_filename_from_path`](crate::shell::extract_filename_from_path),
+/// which strips `.exe` on every platform: that one names shells from `$SHELL`
+/// and the process tree, where a Unix-form path can still carry a Windows
+/// `.exe` (Git Bash), while `argv[0]` always spells its name the way the
+/// running platform does.
+pub fn executable_name(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
+    let name = strip_suffix_ignoring_case(&name, std::env::consts::EXE_SUFFIX);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Strip `suffix` from the end of `name`, matching it case-insensitively.
+///
+/// The suffix is a parameter because the two callers strip different ones:
+/// [`executable_name`] strips the running platform's
+/// [`std::env::consts::EXE_SUFFIX`], while
+/// [`shell::extract_filename_from_path`](crate::shell::extract_filename_from_path)
+/// strips `.exe` on every platform. It also lets a test on any platform exercise
+/// the Windows answer, which `EXE_SUFFIX` — empty on Unix — cannot.
+///
+/// `str::get` rather than a byte slice, so a name whose trailing bytes fall
+/// mid-character yields the name unchanged instead of panicking. The macOS `ps`
+/// snapshot feeds every process name on the machine through here, so a name
+/// like `日本語` is ordinary input rather than a hypothetical.
+pub(crate) fn strip_suffix_ignoring_case<'a>(name: &'a str, suffix: &str) -> &'a str {
+    let stem_len = name.len().saturating_sub(suffix.len());
+    match name.get(stem_len..) {
+        Some(tail) if tail.eq_ignore_ascii_case(suffix) => &name[..stem_len],
+        _ => name,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
-        canonicalize_with_parents, expand_tilde, format_path_for_display, home_dir, paths_match,
-        sanitize_for_filename, to_posix_path,
+        canonicalize_with_parents, executable_name, expand_tilde, format_path_for_display,
+        home_dir, paths_match, sanitize_for_filename, strip_suffix_ignoring_case, to_posix_path,
     };
 
     /// The tilde form `format_path_for_display` prints is a form wt reads back,
@@ -532,6 +654,52 @@ mod tests {
         );
     }
 
+    /// A path long enough that `dunce` keeps its `\\?\` prefix must still
+    /// compare as a descendant of the short root it sits under — the split that
+    /// made `wt step copy-ignored` refuse a deep `node_modules` tree (#3898).
+    #[test]
+    #[cfg(windows)]
+    fn canonicalize_with_parents_agrees_across_the_verbatim_threshold() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let root = tmp.path();
+
+        // 260 characters is `dunce`'s cutoff for stripping the prefix; overshoot
+        // it so the deep end is unambiguously on the other side.
+        let mut deep = root.to_path_buf();
+        while deep.as_os_str().len() < 320 {
+            deep.push("nested-dependency-directory");
+        }
+        std::fs::create_dir_all(&deep).expect("create deep tree");
+
+        // Pin the mechanism, so a `dunce` that stopped splitting the two
+        // spellings shows up here rather than leaving the assertion below
+        // passing for a reason it was not written for.
+        let verbatim = |p: &Path| {
+            dunce::canonicalize(p)
+                .expect("canonicalize")
+                .to_string_lossy()
+                .starts_with(r"\\?\")
+        };
+        assert!(verbatim(&deep), "expected dunce to keep the prefix here");
+        assert!(!verbatim(root), "expected dunce to strip the prefix here");
+
+        // The path `ensure_path_within_root` actually checks is a destination
+        // directory that has not been created yet, so ask about a child.
+        let canonical_root = canonicalize_with_parents(root);
+        let canonical_deep = canonicalize_with_parents(&deep.join("not-yet-created"));
+        assert!(
+            !canonical_deep.to_string_lossy().starts_with(r"\\?\"),
+            "expected the deep result to drop the verbatim prefix, got {}",
+            canonical_deep.display()
+        );
+        assert!(
+            canonical_deep.starts_with(&canonical_root),
+            "{} should sit under {}",
+            canonical_deep.display(),
+            canonical_root.display()
+        );
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn test_paths_match_macos_var_symlink() {
@@ -570,5 +738,66 @@ mod tests {
         assert!(paths_match(&existing, &canonical));
 
         let _ = std::fs::remove_dir_all(&existing);
+    }
+
+    /// A dot in `argv[0]` is part of the name, not an extension to drop:
+    /// `file_stem` would cut `wt.old` down to `wt` while leaving the Windows
+    /// `wt.old.exe` whole, and both callers need one answer everywhere.
+    #[test]
+    fn executable_name_strips_only_the_executable_suffix() {
+        let cases = [
+            ("wt", Some("wt")),
+            ("./wt", Some("wt")),
+            ("target/debug/wt", Some("wt")),
+            ("/usr/local/bin/git-wt", Some("git-wt")),
+            ("wt.old", Some("wt.old")),
+            ("python3.11", Some("python3.11")),
+            ("", None),
+            ("/", None),
+        ];
+        for (arg0, expected) in cases {
+            assert_eq!(
+                executable_name(Path::new(arg0)).as_deref(),
+                expected,
+                "{arg0}"
+            );
+        }
+
+        // The suffix stripped is the running platform's own: a Unix file
+        // really named `wt.exe` keeps the name it has.
+        let (exe, suffix_only) = if cfg!(windows) {
+            (Some("wt"), None)
+        } else {
+            (Some("wt.exe"), Some(".exe"))
+        };
+        assert_eq!(executable_name(Path::new("wt.exe")).as_deref(), exe);
+        assert_eq!(executable_name(Path::new(".exe")).as_deref(), suffix_only);
+    }
+
+    /// The `.exe` half of that, on whichever platform runs the test: `EXE_SUFFIX`
+    /// is empty on Unix, so `executable_name` alone can never exercise the
+    /// answer Windows gets.
+    #[test]
+    fn strip_suffix_ignoring_case_matches_every_exe_spelling() {
+        let cases = [
+            ("wt.exe", "wt"),
+            // Windows resolves these to one file, so all three name one command.
+            ("WT.EXE", "WT"),
+            ("wt.Exe", "wt"),
+            ("git-wt.exe", "git-wt"),
+            // Only a suffix: `wt.exe.old` is named for its dot, not its middle.
+            ("wt.exe.old", "wt.exe.old"),
+            ("wt", "wt"),
+            ("exe", "exe"),
+            (".exe", ""),
+            // Trailing bytes falling mid-character are not a suffix match.
+            ("€ab", "€ab"),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(strip_suffix_ignoring_case(name, ".exe"), expected, "{name}");
+        }
+
+        // The empty suffix Unix carries strips nothing.
+        assert_eq!(strip_suffix_ignoring_case("wt.exe", ""), "wt.exe");
     }
 }

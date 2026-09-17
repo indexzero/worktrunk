@@ -7,11 +7,11 @@ use std::path::Path;
 use anyhow::Context;
 use worktrunk::HookType;
 use worktrunk::config::UserConfig;
-use worktrunk::git::{BranchDeletionMode, ErrorExt, Repository, ResolvedWorktree};
+use worktrunk::git::{BranchDeletionMode, ErrorExt, GitError, Repository, ResolvedWorktree};
 use worktrunk::styling::{eprintln, info_message};
 
 use crate::cli::{RemoveArgs, SwitchFormat};
-use crate::output::{BackgroundFallbackMode, RemovalExecution, handle_remove_output};
+use crate::output::{BackgroundFallbackMode, RemovalExecution, handle_remove_output, print_json};
 
 use super::hook_plan::{ApprovedHookPlan, HookPlanBuilder};
 use super::hooks::HookAnnouncer;
@@ -70,11 +70,20 @@ fn validate_remove_targets(
     force_delete: bool,
     force: bool,
 ) -> RemovePlans {
-    let current_worktree = repo
-        .current_worktree()
-        .root()
-        .ok()
-        .and_then(|p| dunce::canonicalize(&p).ok());
+    let mut plans = RemovePlans {
+        others: Vec::new(),
+        branch_only: Vec::new(),
+        current: None,
+        errors: Vec::new(),
+    };
+
+    let current_worktree = match repo.current_worktree().root() {
+        Ok(path) => dunce::canonicalize(&path).unwrap_or(path),
+        Err(e) => {
+            plans.record_error(e);
+            return plans;
+        }
+    };
 
     // Dedupe inputs to avoid redundant planning/execution
     let branches: Vec<_> = {
@@ -93,43 +102,32 @@ fn validate_remove_targets(
     // across candidates here. Errors propagate to per-candidate calls, which
     // fall back to capturing internally when None.
     let snapshot = repo.capture_refs().ok();
+    let mut seen_targets = HashSet::new();
 
-    let mut plans = RemovePlans {
-        others: Vec::new(),
-        branch_only: Vec::new(),
-        current: None,
-        errors: Vec::new(),
-    };
-
-    for branch_name in &branches {
-        let resolved = match repo.resolve_worktree(branch_name) {
+    for branch_name in branches {
+        let resolved = match repo.resolve_worktree(&branch_name) {
             Ok(r) => r,
             Err(e) => {
                 plans.record_error(e);
                 continue;
             }
         };
+        // Branch and path spellings are aliases for one registered worktree.
+        // Once resolution has produced the Git model's canonical identity,
+        // plan that target only once regardless of how many aliases were
+        // supplied.
+        if resolved
+            .id()
+            .is_some_and(|id| !seen_targets.insert(id.clone()))
+        {
+            continue;
+        }
 
-        match resolved {
-            ResolvedWorktree::Worktree { path, branch: _ } => {
-                // Use canonical paths to avoid symlink/normalization mismatches
+        let target = match resolved {
+            ResolvedWorktree::Worktree { path, .. } => {
+                // `dunce::canonicalize` keeps the path spelling Git operates
+                // on; `WorktreeId` is only for matching aliases.
                 let path_canonical = dunce::canonicalize(&path).unwrap_or(path);
-                let is_current = current_worktree.as_ref() == Some(&path_canonical);
-
-                if is_current {
-                    match repo.prepare_worktree_removal(
-                        RemoveTarget::Current,
-                        deletion_mode,
-                        force,
-                        None,
-                        worktrees,
-                        snapshot.as_ref(),
-                    ) {
-                        Ok(result) => plans.current = Some(result),
-                        Err(e) => plans.record_error(e),
-                    }
-                    continue;
-                }
 
                 // Remove exactly the resolved worktree by its path. Targeting by
                 // branch name would resolve an ambiguous branch (one checked out
@@ -138,32 +136,41 @@ fn validate_remove_targets(
                 // the path is unambiguous. `prepare_worktree_removal` still
                 // deletes the branch when it's the sole checkout, and retains it
                 // otherwise (see its shared-branch handling).
-                let target = RemoveTarget::Path(&path_canonical);
-                match repo.prepare_worktree_removal(
-                    target,
-                    deletion_mode,
-                    force,
-                    None,
-                    worktrees,
-                    snapshot.as_ref(),
-                ) {
-                    Ok(result) => plans.others.push(result),
-                    Err(e) => plans.record_error(e),
-                }
+                RemoveTarget::WorktreePath(path_canonical)
             }
-            ResolvedWorktree::BranchOnly { branch } => {
-                match repo.prepare_worktree_removal(
-                    RemoveTarget::Branch(&branch),
-                    deletion_mode,
-                    force,
-                    None,
-                    worktrees,
-                    snapshot.as_ref(),
-                ) {
-                    Ok(result) => plans.branch_only.push(result),
-                    Err(e) => plans.record_error(e),
-                }
+            ResolvedWorktree::BranchOnly { branch, .. } => RemoveTarget::BranchOnly(branch),
+            // Resolution tried the argument as a branch and as a worktree path
+            // and matched neither, so a directory sitting there is a leftover
+            // skeleton rather than anything wt can remove. Only a typed
+            // selector reaches this arm — the picker and `wt step prune` call
+            // `prepare_worktree_removal` with a branch read off a row, which is
+            // nobody's path.
+            ResolvedWorktree::NoWorktreeAtPath { path } => {
+                plans.record_error(GitError::WorktreeNotFoundAtPath { path }.into());
+                continue;
             }
+        };
+
+        match repo.prepare_worktree_removal(
+            target,
+            deletion_mode,
+            force,
+            &current_worktree,
+            worktrees,
+            snapshot.as_ref(),
+        ) {
+            // Bucket the validated result, not the pre-validation resolution:
+            // a worktree whose directory disappeared degrades to BranchOnly
+            // during preparation and must run with the other branch-only plans.
+            Ok(result) => match &result {
+                RemovalPlan::Worktree {
+                    changed_directory: true,
+                    ..
+                } => plans.current = Some(result),
+                RemovalPlan::Worktree { .. } => plans.others.push(result),
+                RemovalPlan::BranchOnly { .. } => plans.branch_only.push(result),
+            },
+            Err(e) => plans.record_error(e),
         }
     }
 
@@ -340,12 +347,16 @@ pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> 
 
             if branches.is_empty() {
                 // Single worktree removal: validate FIRST, then approve, then execute
+                let current_path = repo
+                    .current_worktree()
+                    .root()
+                    .context("Failed to remove worktree")?;
                 let result = repo
                     .prepare_worktree_removal(
-                        RemoveTarget::Current,
+                        RemoveTarget::WorktreePath(current_path.clone()),
                         BranchDeletionMode::from_flags(!delete_branch, args.force_delete),
                         args.force,
-                        None,
+                        &current_path,
                         None,
                         None,
                     )
@@ -376,7 +387,7 @@ pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> 
                 announcer.flush()?;
                 if json_mode {
                     let json = serde_json::json!([result.to_json(fate)]);
-                    println!("{}", serde_json::to_string_pretty(&json)?);
+                    print_json(&json)?;
                 }
                 // Fire-and-forget repo-wide internal cleanup (stale trash +
                 // orphaned fsmonitor daemons) — runs after primary output so
@@ -458,7 +469,7 @@ pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> 
                         .zip(fates)
                         .map(|(removal, fate)| removal.to_json(fate))
                         .collect();
-                    println!("{}", serde_json::to_string_pretty(&json_items)?);
+                    print_json(&json_items)?;
                 }
 
                 // Fire-and-forget repo-wide internal cleanup (stale trash +
@@ -473,4 +484,65 @@ pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> 
                 Ok(())
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use worktrunk::testing::TestRepo;
+
+    #[test]
+    fn validation_deduplicates_branch_and_path_aliases() {
+        let mut test = TestRepo::with_initial_commit();
+        let worktree = test.add_worktree("feature");
+        let repo = Repository::at(test.root_path()).unwrap();
+
+        let plans = validate_remove_targets(
+            &repo,
+            vec![
+                "feature".to_string(),
+                worktree.to_string_lossy().into_owned(),
+            ],
+            true,
+            false,
+            false,
+        );
+
+        assert!(plans.errors.is_empty());
+        assert_eq!(plans.others.len(), 1);
+        assert!(plans.branch_only.is_empty());
+        assert!(plans.current.is_none());
+    }
+
+    /// Resolution sees a registered worktree, but preparation discovers its
+    /// directory is gone and degrades the result to BranchOnly. Ordered
+    /// execution must bucket that returned plan with other branch-only plans,
+    /// not preserve the stale pre-validation classification.
+    #[test]
+    fn validation_buckets_missing_worktree_by_returned_plan() {
+        let mut test = TestRepo::with_initial_commit();
+        let missing = test.add_worktree("missing-worktree");
+        test.create_branch("branch-only");
+        std::fs::remove_dir_all(&missing).unwrap();
+        let repo = Repository::at(test.root_path()).unwrap();
+
+        let plans = validate_remove_targets(
+            &repo,
+            vec!["missing-worktree".to_string(), "branch-only".to_string()],
+            false,
+            false,
+            false,
+        );
+
+        assert!(plans.errors.is_empty());
+        assert!(plans.others.is_empty());
+        assert!(plans.current.is_none());
+        assert_eq!(plans.branch_only.len(), 2);
+        assert!(
+            plans
+                .branch_only
+                .iter()
+                .all(|plan| matches!(plan, RemovalPlan::BranchOnly { .. }))
+        );
+    }
 }

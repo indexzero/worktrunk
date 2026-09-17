@@ -36,13 +36,17 @@ metadata:
    cargo release X.Y.Z -p worktrunk -x --no-publish --no-push --no-tag --no-verify --no-confirm && cargo check
    ```
    This bumps `Cargo.toml` and `Cargo.lock`, then auto-commits. We'll reset this commit in step 10 to fold in the CHANGELOG.
-9. **Update CHANGELOG**: Add `## X.Y.Z` section at top with changes (see MANDATORY verification below)
+9. **Update CHANGELOG**: the top section holds this release's changes (see MANDATORY verification below). If it is `## Unreleased`, rename that heading to `## X.Y.Z` and fold the remaining entries into it — inserting a new heading above it ships a stale `## Unreleased` in the release notes. Otherwise the top section is the last shipped version: add a `## X.Y.Z` section above it, never append to it.
 10. **Commit**: Reset the auto-commit from step 8, stage everything, and create the final release commit:
     ```bash
     git reset --soft HEAD~1 && git add -A && git commit -m "Release vX.Y.Z"
     ```
-11. **Merge to main**: `/gpk` — opens a PR, waits for CI, merges via PR (preserves worktree). `main` can advance during the CI wait; step 12 catches anything that lands before the tag.
-12. **Verify the changelog covers `main`, then tag and push**: the tag decides what ships — `release.yaml` builds the binaries and the GitHub release notes from the tree at the tag, so everything reachable from it is in the release. `/gpk` squash-merges onto whatever `main` tip exists at merge time, so a commit that lands during the PR's CI wait is already an ancestor of the release commit and ships whether or not the changelog mentions it (the easy miss is a follow-up that reworks a feature this release already documents). List what reached `main` since the cut-from tip (step 1):
+11. **Merge to main**: push the release branch, open a PR, wait for CI, and merge it. Keep the worktree — the remaining steps run from it. Then move the branch onto the merged tip:
+    ```bash
+    git fetch origin && git reset --keep origin/main
+    ```
+    The PR squash-merges, so the branch is no longer an ancestor of `main` and step 1's `--ff-only` can't advance it; `--keep` moves it across and still fails if anything is uncommitted. `main` can advance during the CI wait; step 12 catches anything that lands before the tag.
+12. **Verify the changelog covers `main`, then tag and push**: the tag decides what ships — `release.yaml` builds the binaries and the GitHub release notes from the tree at the tag, so everything reachable from it is in the release. The merge squashes onto whatever `main` tip exists at merge time, so a commit that lands during the PR's CI wait is already an ancestor of the release commit and ships whether or not the changelog mentions it (the easy miss is a follow-up that reworks a feature this release already documents). List what reached `main` since the cut-from tip (step 1):
     ```bash
     git fetch origin
     git log --oneline <cut-from-commit>..origin/main
@@ -91,7 +95,7 @@ Surface the full adjudicated list and get explicit sign-off before tagging. Do n
 
 ## CHANGELOG Review
 
-Check commits since last release for missing entries:
+Draft entries from the commits since the last release:
 
 ```bash
 git log v<last-version>..HEAD --oneline
@@ -116,13 +120,7 @@ Notable changes to document:
 
 **Section order:** Improved, Fixed, Documentation, Internal. Documentation is for help text, web docs, and terminology improvements. Internal is for selected notable internal changes (not everything).
 
-**Within each section, order by impact:**
-1. Breaking/behavior changes (affect existing users' workflows)
-2. New user-facing features and commands
-3. Performance improvements users will notice
-4. Minor enhancements and display changes
-5. Niche/platform-specific improvements (Nix, Windows-only, etc.)
-6. Developer/internal tooling exposed to users
+**Within each section, order by reader interest.** The section is the first ordering dimension and is fixed; reader interest is the second, and it decides rank inside a section. A change's class does not: a behavior change nobody asked for ranks below a feature people requested, and a fix every user hits ranks above a platform-specific one. Interest combines how many readers a change reaches with how much it obliges each of them to act, and never counts the effort the change took to build — effort and interest diverge most on the change just finished, which is the one being written up. So a breaking change stays near the top of its section: it reaches few readers, but every one of them has to do something about it. (`/writing-prose` calls this "Calibrate prominence to audience fraction"; restated here because that skill is personal config and isn't in this repo.)
 
 **Breaking changes:** Note inline with the entry, not as a separate section:
 
@@ -136,7 +134,16 @@ Skip: internal refactors, test additions (unless user-facing like shell completi
 
 **Combine related bullets.** Several PRs that share a theme — e.g. three perf changes that together account for one user-visible speedup — belong in one bullet, not three. The reader cares about the net change, not the PR boundaries. Cite all the PRs in the trailing `([#a](...), [#b](...), [#c](...))` list.
 
-**Be brief.** Each bullet should communicate the user-visible change in 1–3 sentences. Internal-section bullets in particular should be terse — usually one sentence. Drop the "why we did it this way" details unless they materially affect how the user thinks about the change. Code examples and exhaustive `Cmd::stream` / `OnceCell` / `DashMap`-style internals usually don't belong; they live in the PR description.
+**Be brief — the ceiling is words, not sentences.** A bullet aims at 35 words; a dense one runs to 60, and the two or three headline entries may reach 80; Internal-section bullets get one sentence. Drop the "why we did it this way" details unless they change how the user thinks about the change, and leave code examples and `Cmd::stream` / `OnceCell` / `DashMap`-style internals in the PR description, where the reasoning belongs.
+
+Sentences stretch to fit whatever you want to say; words don't. So measure rather than judge:
+
+```bash
+awk '/^## /{if (f) exit; f=1} f' CHANGELOG.md \
+  | awk '/^- \*\*/ {n=split($0,_," "); t+=n; c++; if (n>60) o++; printf "%4d  %.58s\n", n, $0} END {printf "\n%d entries, %d avg, %d over 60\n", c, c?t/c:0, o}'
+```
+
+**Calibrate against the ceiling, not against the last release.** Length ratchets: each release is drafted beside the previous section, and an abstract rule loses to a concrete neighbouring exemplar every time. Entries grew from 49 to 101 words on average across five releases while this skill said "be brief" throughout. Read the previous section for what it drifted to, then ignore it and write to the ceiling.
 
 **No editorial framing.** Describe what changed, not what was wrong with the previous decision in subjective terms. Avoid words like "sledgehammer", "ugly", "noisy", "wrong" applied to past code. State the prior behavior neutrally and the new behavior plainly.
 
@@ -216,44 +223,65 @@ Link when there's substantial documentation the user would benefit from reading 
 
 ### MANDATORY: Verify Each Changelog Entry
 
-**After drafting changelog entries, you MUST spawn a subagent to verify each bullet point is accurate.** This is non-negotiable — changelog mistakes are a recurring problem.
+**After drafting changelog entries, you MUST spawn a subagent to verify each bullet point is accurate.** The tag publishes this text as the GitHub release body, so a correction afterwards takes a follow-up PR to `CHANGELOG.md` and a hand-edit of the release page, and people have read the wrong line by then. This pass is worth as much time as it takes.
 
-The subagent should:
-1. Take the list of drafted changelog entries
-2. For each entry, find the commit(s) it describes and read the actual diff
-3. Verify the entry accurately describes what changed
-4. Check for missing changes that should be documented
-5. Report any inaccuracies or omissions
+**The gate cuts both ways.** Checking only accuracy pushes every entry longer: "understates" and "not covered" have no counterweight, so each pass adds and none subtracts. That asymmetry is what drove the ratchet above. An entry that is too long, too internal, or ranked above one more readers will notice is reported on the same footing as one that is wrong.
 
 **Subagent prompt template:**
 
 ```
-Verify these changelog entries for version X.Y.Z are accurate.
+Verify these changelog entries for version X.Y.Z are accurate. They publish with
+the tag, and by the time anyone corrects a wrong line, readers have acted on it.
+Spend the time to read a source for each one: reading the entry and finding it
+plausible is not a check, because the entry was written from the same commits you
+are about to read.
 
 Previous version: [e.g., v0.1.9]
 Commits to check: git log v<previous>..HEAD
 
-Entries to verify:
-[paste drafted entries]
+Entries to verify: the top section of CHANGELOG.md as it stands on disk. Read it
+there rather than from a paste:
+awk '/^## /{if (f) exit; f=1} f' CHANGELOG.md
 
-For EACH entry:
+Verify claim by claim, not entry by entry: an entry carries several independent
+claims, and one verdict over the whole entry waves through every claim that is not
+its headline.
+
 1. Find the relevant commit(s) using git log and git show
-2. Read the actual diff, not just the commit message
-3. Confirm the entry accurately describes the user-facing change
-4. Flag if the entry overstates, understates, or misdescribes the change
+2. Read the diff, not the commit message. The diff settles what changed, and
+   nothing else: not what the behavior was before, not what the user sees, not
+   what a file it doesn't touch does. Settle a "previously" / "no longer" / "so X
+   broke" claim by reading the old file (`git show <sha>^:<path>`) and confirming
+   the old behavior there. The new code's handling of the old case is not that
+   confirmation: a case added together with a comment about why it produces
+   nothing reads in a diff exactly like a case that used to produce something.
+   Some claims have no source in the commit at all — a version floor, what a
+   rendered page shows, how another component behaves. Read that source: the
+   rendered output, the other component's own file, the upstream project's own
+   releases
+3. Flag any claim its source does not support, whether it overstates,
+   understates, or misdescribes
+4. Flag if the entry runs over 60 words (80 for one of the two or three headline
+   entries), restates the PR description, or explains mechanism the reader cannot
+   act on — report these as seriously as an inaccuracy, and quote a shorter
+   rewrite that keeps every user-facing claim
 
 Also check:
 - Are there user-facing changes NOT covered by these entries?
 - Verify each "thanks @..." attribution (right person, right role — author vs reporter)
+- Within each section, is any entry ranked above one that more readers will notice?
 
 Report format:
 - Entry: [entry text]
   Status: ✅ Accurate / ⚠️ Needs revision / ❌ Incorrect
-  Evidence: [what you found in the diff]
+  Length: [word count] — ✅ / ⚠️ over ceiling
+  Evidence: [for each claim, the source you read and what it said]
   Suggested fix: [if needed]
 ```
 
-**Do not finalize the changelog until the subagent confirms all entries are accurate.**
+**The pass ends on a clean run, not on the first run's findings.** A rewrite the verifier suggests has no more evidence behind it than one you wrote yourself, and an entry you edit while the pass runs is in the same state — both leave that entry unverified. Re-run over the section as it now stands, and finalize only once a run comes back clean.
+
+`evals/README.md` beside this skill holds four entries from a shipped release, three of them wrong, for scoring a change to this template against what the last wording missed.
 
 **If verification finds problems:** Escalate to the user. Show them the subagent's findings and ask how to proceed. Don't attempt to resolve ambiguous changelog entries autonomously — the user knows the intent behind their changes better than you do.
 

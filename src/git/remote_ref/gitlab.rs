@@ -1,6 +1,4 @@
-//! GitLab MR provider.
-//!
-//! Implements `RemoteRefProvider` for GitLab Merge Requests using the `glab` CLI.
+//! GitLab MR backend using the `glab` CLI.
 //!
 //! # API Differences from GitHub
 //!
@@ -27,33 +25,9 @@ use anyhow::{Context, bail};
 use serde::Deserialize;
 
 use super::{
-    CliApiRequest, PlatformData, RemoteRefInfo, RemoteRefProvider, cli_api_error, cli_config_value,
-    run_cli_api,
+    CliApiRequest, PlatformData, RemoteRefInfo, cli_api_error, cli_config_value, run_cli_api,
 };
-use crate::git::{RefType, Repository};
-
-/// GitLab Merge Request provider.
-#[derive(Debug, Clone, Copy)]
-pub struct GitLabProvider;
-
-impl RemoteRefProvider for GitLabProvider {
-    fn ref_type(&self) -> RefType {
-        RefType::Mr
-    }
-
-    fn platform_label(&self) -> &'static str {
-        "gitlab"
-    }
-
-    fn fetch_info(&self, number: u32, repo: &Repository) -> anyhow::Result<RemoteRefInfo> {
-        let repo_root = repo.repo_path()?;
-        fetch_mr_info(number, repo_root)
-    }
-
-    fn ref_path(&self, number: u32) -> String {
-        format!("merge-requests/{}/head", number)
-    }
-}
+use crate::git::{ForgeKind, Repository};
 
 /// Raw JSON response from `glab api projects/:id/merge_requests/<number>`.
 #[derive(Debug, Deserialize)]
@@ -81,7 +55,8 @@ struct GlabProject {
 }
 
 /// Fetch MR information from GitLab using the `glab` CLI.
-fn fetch_mr_info(mr_number: u32, repo_root: &Path) -> anyhow::Result<RemoteRefInfo> {
+pub(super) fn fetch_mr_info(mr_number: u32, repo: &Repository) -> anyhow::Result<RemoteRefInfo> {
+    let repo_root = repo.repo_path()?;
     let api_path = format!("projects/:id/merge_requests/{}", mr_number);
     let args = ["api", api_path.as_str()];
     let output = run_cli_api(CliApiRequest {
@@ -99,7 +74,7 @@ fn fetch_mr_info(mr_number: u32, repo_root: &Path) -> anyhow::Result<RemoteRefIn
         // matching prose — and there is nothing to say afterwards that glab's own
         // line doesn't already: `glab: 401 Unauthorized (HTTP 401)`. Forward it.
         return Err(cli_api_error(
-            RefType::Mr,
+            ForgeKind::GitLab.ref_type(),
             format!("glab api failed for MR !{}", mr_number),
             &output,
         ));
@@ -137,7 +112,6 @@ fn fetch_mr_info(mr_number: u32, repo_root: &Path) -> anyhow::Result<RemoteRefIn
     // Use fetch_gitlab_project_urls() when URLs are actually needed.
 
     Ok(RemoteRefInfo {
-        ref_type: RefType::Mr,
         number: mr_number,
         title: response.title,
         author: response.author.username,
@@ -187,7 +161,7 @@ pub fn fetch_gitlab_project_urls(
     };
 
     // Fetch source project URLs (for fork push)
-    let (source_ssh, source_http) = fetch_project_urls(*source_project_id, repo_root)
+    let (source_ssh, source_http) = fetch_project_urls(*source_project_id, "source", repo_root)
         .with_context(|| {
             format!(
                 "Failed to fetch source project {} for MR !{}",
@@ -196,7 +170,7 @@ pub fn fetch_gitlab_project_urls(
         })?;
 
     // Fetch target project URLs (where MR refs live)
-    let (target_ssh, target_http) = fetch_project_urls(*target_project_id, repo_root)
+    let (target_ssh, target_http) = fetch_project_urls(*target_project_id, "target", repo_root)
         .with_context(|| {
             format!(
                 "Failed to fetch target project {} for MR !{}",
@@ -224,8 +198,16 @@ pub fn fetch_gitlab_project_urls(
 }
 
 /// Fetch project URLs from GitLab API.
+///
+/// `role` is the caller's word for which of the two projects this is ("source"
+/// or "target"). It belongs in the CLI-failure message rather than in the
+/// caller's `with_context`, because that context is inert there: `cli_api_error`
+/// returns a `GitError`, and `format_command_error` renders only the first
+/// `Diagnostic` in the chain. A numeric project ID alone can't tell a user which
+/// of the two repos they're locked out of.
 fn fetch_project_urls(
     project_id: u64,
+    role: &str,
     repo_root: &Path,
 ) -> anyhow::Result<(Option<String>, Option<String>)> {
     let api_path = format!("projects/{}", project_id);
@@ -240,10 +222,23 @@ fn fetch_project_urls(
     })?;
 
     if !output.status.success() {
-        bail!("Failed to fetch project {}", project_id);
+        // Forward glab's own verdict, same as `fetch_mr_info` above — a bare
+        // "Failed to fetch project 456" hides whether the call was a 401, a
+        // 404, or a network failure.
+        return Err(cli_api_error(
+            ForgeKind::GitLab.ref_type(),
+            format!("glab api failed for {} project {}", role, project_id),
+            &output,
+        ));
     }
 
-    let response: GlabProject = serde_json::from_slice(&output.stdout)?;
+    let response: GlabProject = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "Failed to parse GitLab API response for project {}. \
+             This may indicate a GitLab API change.",
+            project_id
+        )
+    })?;
     Ok((response.ssh_url_to_repo, response.http_url_to_repo))
 }
 
@@ -269,19 +264,6 @@ mod tests {
     use crate::git::remote_ref::RemoteRefInfo;
 
     #[test]
-    fn test_ref_path() {
-        let provider = GitLabProvider;
-        assert_eq!(provider.ref_path(42), "merge-requests/42/head");
-        assert_eq!(provider.tracking_ref(42), "refs/merge-requests/42/head");
-    }
-
-    #[test]
-    fn test_ref_type() {
-        let provider = GitLabProvider;
-        assert_eq!(provider.ref_type(), RefType::Mr);
-    }
-
-    #[test]
     fn test_fork_remote_url_formats() {
         // Protocol depends on `glab config get git_protocol`, so just check format
         let url = fork_remote_url("gitlab.com", "contributor", "repo");
@@ -302,7 +284,6 @@ mod tests {
     #[test]
     fn test_fetch_gitlab_project_urls_rejects_github_ref() {
         let github_info = RemoteRefInfo {
-            ref_type: RefType::Pr,
             number: 123,
             title: "Test PR".to_string(),
             author: "user".to_string(),

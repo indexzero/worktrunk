@@ -33,12 +33,6 @@ pub enum SwitchResult {
         base_worktree_path: Option<String>,
         /// Remote tracking branch if auto-created from remote (e.g., "origin/feature")
         from_remote: Option<String>,
-        /// PR/MR number when created via `pr:N` / `mr:N` (carried into post-* hook
-        /// templates as `pr_number`).
-        pr_number: Option<u32>,
-        /// PR/MR web URL when created via `pr:N` / `mr:N` (carried into post-* hook
-        /// templates as `pr_url`).
-        pr_url: Option<String>,
     },
 }
 
@@ -72,11 +66,11 @@ pub enum CreationMethod {
         /// When `--base pr:N` / `--base mr:N` (same-repo) is paired with `--create`,
         /// the user's intent is "create a new branch tracking the PR/MR's source
         /// branch on the remote", so `git push` from the new worktree pushes back
-        /// to that PR/MR. `git worktree add -b new <bare-name>` doesn't set up
-        /// tracking on its own (only `<remote>/<branch>` triggers DWIM, and even
-        /// then we'd unset it via the issue-#713 safety check), so we capture the
-        /// (remote, branch) pair here and configure tracking explicitly after
-        /// `git worktree add` succeeds. `None` for any other base resolution.
+        /// to that PR/MR. That branch may carry any name, and
+        /// `branch.autoSetupMerge = simple` sets an upstream only where the new
+        /// branch shares it, so we capture the (remote, branch) pair here and
+        /// configure tracking explicitly after `git worktree add` succeeds.
+        /// `None` for any other base resolution.
         base_pr_upstream: Option<(String, String)>,
     },
     /// Fork PR/MR: fetch from refs/pull/N/head or refs/merge-requests/N/head,
@@ -94,11 +88,26 @@ pub enum CreationMethod {
         /// URL to push to (the fork's URL). `None` when using a prefixed branch
         /// name (e.g., `contributor/main`) because push won't work.
         fork_push_url: Option<String>,
-        /// Web URL for the PR/MR.
-        ref_url: String,
         /// Resolved remote name where PR/MR refs live (e.g., "origin", "upstream").
         remote: String,
     },
+}
+
+/// Identity of the PR/MR a `pr:N` / `mr:N` argument resolved to.
+///
+/// Resolved once, before `pre-switch` hooks run, then held by whoever needs it:
+/// the `ResolvedTarget` `pre-switch` reads, the plan `pre-start` reads, and the
+/// pipeline's own clone behind the post-* hooks — an `Existing` switch builds no
+/// `SwitchPlan::Create` at all. So `pr_number` / `pr_url` reach every switch
+/// hook whether the PR came from this repo or a fork. Reading it back off
+/// [`CreationMethod::ForkRef`] used to be the only source, which silently left
+/// same-repo PRs (the common case) with both variables unset.
+#[derive(Debug, Clone)]
+pub struct RefIdentity {
+    /// The PR/MR number the user typed.
+    pub number: u32,
+    /// Web URL of the PR/MR.
+    pub url: String,
 }
 
 /// Validated plan for a switch operation.
@@ -122,6 +131,10 @@ pub enum SwitchPlan {
         worktree_path: PathBuf,
         /// How to create the worktree
         method: CreationMethod,
+        /// The PR/MR this switch resolved from, when the argument was
+        /// `pr:N` / `mr:N`. Source of the `pr_number` / `pr_url` hook
+        /// variables.
+        ref_identity: Option<RefIdentity>,
         /// True when a stale path occupies `worktree_path` and `--clobber` was
         /// given — `execute_switch` backs it up before creating the worktree.
         needs_clobber_backup: bool,
@@ -188,10 +201,8 @@ pub enum BranchFate {
     NotAttempted,
     /// The deletion ran and the branch is gone.
     Deleted,
-    /// The deletion ran and the branch survives: SafeDelete declined an
-    /// unmerged branch, the CAS refused a moved ref, or the delete command
-    /// itself failed (already narrated at the site that observed it).
-    Retained,
+    /// The deletion ran and the branch survives, for the carried reason.
+    Retained(RetainedReason),
     /// The deletion was handed to a detached background process (the legacy
     /// `git worktree remove` fallback) whose outcome this process never sees.
     ///
@@ -202,21 +213,53 @@ pub enum BranchFate {
     Deferred,
 }
 
+/// Why a deletion attempt left the branch in place.
+///
+/// The distinctions matter to whoever is told about them: `Raced` is the one
+/// an automated caller retries (re-read the ref and try again), `Unmerged` the
+/// one a user resolves with `-D`, and the other two report state that has to
+/// change elsewhere first. Collapsing them loses the retry signal: the
+/// fail-closed compare-and-swap in `delete_branch_if_safe` detects a moved ref
+/// precisely so the caller can act on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedReason {
+    /// Not integrated into the target, and deletion wasn't forced.
+    Unmerged,
+    /// The final topology read found a live worktree with it checked out.
+    CheckedOut,
+    /// The compare-and-swap was refused: the ref moved between the integration
+    /// check and the delete.
+    Raced,
+    /// The delete command itself failed (already narrated at the site that
+    /// observed it).
+    Failed,
+}
+
 impl BranchFate {
     /// Map a synchronous deletion attempt's result. `None` means no attempt
     /// was made.
     pub fn from_result(result: Option<&anyhow::Result<BranchDeletionResult>>) -> Self {
         match result {
             None => Self::NotAttempted,
-            Some(Ok(r)) => match r.outcome {
-                BranchDeletionOutcome::Integrated(_) | BranchDeletionOutcome::ForceDeleted => {
-                    Self::Deleted
-                }
-                BranchDeletionOutcome::NotDeleted | BranchDeletionOutcome::RetainedRaced => {
-                    Self::Retained
-                }
-            },
-            Some(Err(_)) => Self::Retained,
+            Some(Ok(r)) => Self::from_outcome(&r.outcome),
+            Some(Err(_)) => Self::Retained(RetainedReason::Failed),
+        }
+    }
+
+    /// Map a completed deletion's outcome. The one place the mapping lives, so
+    /// the paths that hold an outcome without a `Result` around it
+    /// (the background fast path's post-execution read) can't classify it
+    /// differently from [`from_result`](Self::from_result).
+    pub fn from_outcome(outcome: &BranchDeletionOutcome) -> Self {
+        match outcome {
+            BranchDeletionOutcome::Integrated(_) | BranchDeletionOutcome::ForceDeleted => {
+                Self::Deleted
+            }
+            BranchDeletionOutcome::NotDeleted => Self::Retained(RetainedReason::Unmerged),
+            BranchDeletionOutcome::RetainedCheckedOut { .. } => {
+                Self::Retained(RetainedReason::CheckedOut)
+            }
+            BranchDeletionOutcome::RetainedRaced => Self::Retained(RetainedReason::Raced),
         }
     }
 
@@ -226,6 +269,23 @@ impl BranchFate {
     pub fn deleted(&self) -> bool {
         matches!(self, Self::Deleted | Self::Deferred)
     }
+
+    /// The `branch_outcome` value in `--format=json`.
+    ///
+    /// Names the observed outcome rather than summarising it as a boolean, so
+    /// a caller can tell a race it should retry from a retention it asked for,
+    /// and can tell a detached deletion nobody watched from a confirmed one.
+    pub fn json_outcome(&self) -> &'static str {
+        match self {
+            Self::NotAttempted => "not_attempted",
+            Self::Deleted => "deleted",
+            Self::Deferred => "deferred",
+            Self::Retained(RetainedReason::Unmerged) => "retained_unmerged",
+            Self::Retained(RetainedReason::CheckedOut) => "retained_checked_out",
+            Self::Retained(RetainedReason::Raced) => "retained_raced",
+            Self::Retained(RetainedReason::Failed) => "retained_failed",
+        }
+    }
 }
 
 /// A validated, planned removal — what `prepare_worktree_removal` decided to
@@ -233,8 +293,8 @@ impl BranchFate {
 ///
 /// Produced by the planner, executed by `output::handle_remove_output`. The
 /// deletion-relevant fields are intent, not fact: `deletion_mode` says what the
-/// executor should attempt, and the actual deletion re-decides against fresh
-/// refs (`delete_branch_if_safe`'s CAS).
+/// executor should attempt, and the actual safe deletion rechecks both worktree
+/// topology and fresh refs (`delete_branch_if_safe`'s guard + CAS).
 pub enum RemovalPlan {
     /// Remove a worktree, changing directory away from it first if it's current.
     Worktree {
@@ -265,22 +325,26 @@ pub enum RemovalPlan {
         /// [`SharedBranchCheckout`].
         branch_checked_out_at: Option<SharedBranchCheckout>,
     },
-    /// Branch exists but has no worktree - attempt branch deletion only.
-    ///
-    /// `pruned` indicates whether the worktree was pruned (directory was missing).
-    /// When true, shows an info message instead of a warning.
+    /// Branch exists but has no worktree directory - attempt branch deletion
+    /// only, unregistering the stale worktree entry first when one remains.
     BranchOnly {
         branch_name: String,
         deletion_mode: BranchDeletionMode,
-        /// True if a stale worktree entry was pruned during planning.
-        pruned: bool,
+        /// Stale worktree entry to unregister, recorded when the plan fell
+        /// back from a worktree whose directory was missing. Planning never
+        /// mutates — execution performs the prune (`git worktree remove`,
+        /// which validates before touching anything, so a directory that
+        /// reappears at this path between planning and execution is handled
+        /// by git: a clean reconnected worktree is removed, a dirty or
+        /// foreign one refuses loudly). `None` when the branch has no
+        /// worktree entry at all.
+        prune_entry: Option<PathBuf>,
         /// Integration target for display. May be the effective target (e.g.,
         /// `origin/main` when upstream is ahead) or the local default branch.
         /// `None` when no default branch is configured.
         target_branch: Option<String>,
-        /// Pre-computed integration reason. Branch-only removal has no
-        /// worktree-local `pre-remove` hook, so the integration decision can
-        /// be made during preparation.
+        /// Integration reason computed during preparation for display. The
+        /// executor still rechecks topology and ref state before safe deletion.
         integration_reason: Option<worktrunk::git::IntegrationReason>,
         /// A surviving checkout of `branch_name`, when one exists. Only reachable
         /// on a pruned removal — the target's directory was gone, but a sibling
@@ -303,8 +367,8 @@ impl RemovalPlan {
         }
     }
 
-    /// Branch name of the removed worktree, if known. `None` for detached-HEAD
-    /// worktrees and (structurally) for branch-only deletions.
+    /// Branch named by this plan. `None` only for a detached-HEAD worktree;
+    /// branch-only plans always return their branch.
     ///
     /// Only the `--reap` label needs this, which is Unix-only; gated to avoid a
     /// dead-code warning on Windows where nothing consumes it.
@@ -349,11 +413,14 @@ impl RemovalPlan {
 
     /// Convert to a JSON value for structured output.
     ///
-    /// `fate` is what execution reported back; `branch_deleted` is derived
-    /// from it (via [`BranchFate::deleted`]) so the payload states what
-    /// happened, not what the plan hoped.
+    /// `fate` is what execution reported back, and `branch_outcome` names it
+    /// directly (via [`BranchFate::json_outcome`]) so the payload states what
+    /// happened rather than what the plan hoped. It replaced a
+    /// `branch_deleted` boolean, which could not distinguish a CAS the ref
+    /// moved under from a retention the caller asked for, and reported a
+    /// detached deletion nobody watched as an accomplished one.
     pub fn to_json(&self, fate: BranchFate) -> serde_json::Value {
-        let branch_deleted = fate.deleted();
+        let branch_outcome = fate.json_outcome();
         match self {
             RemovalPlan::Worktree {
                 worktree_path,
@@ -364,19 +431,19 @@ impl RemovalPlan {
                 "kind": "worktree",
                 "branch": branch_name,
                 "path": worktree_path,
-                "branch_deleted": branch_deleted,
+                "branch_outcome": branch_outcome,
                 "branch_checked_out_at": branch_checked_out_at.as_ref().map(|c| &c.path),
             }),
             RemovalPlan::BranchOnly {
                 branch_name,
-                pruned,
+                prune_entry,
                 branch_checked_out_at,
                 ..
             } => serde_json::json!({
                 "kind": "branch_only",
                 "branch": branch_name,
-                "pruned": pruned,
-                "branch_deleted": branch_deleted,
+                "pruned": prune_entry.is_some(),
+                "branch_outcome": branch_outcome,
                 "branch_checked_out_at": branch_checked_out_at.as_ref().map(|c| &c.path),
             }),
         }
@@ -386,13 +453,6 @@ impl RemovalPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_switch_result_path_already_at() {
-        let path = PathBuf::from("/test/path");
-        let result = SwitchResult::AlreadyAt(path.clone());
-        assert_eq!(result.path(), &path);
-    }
 
     #[cfg(unix)]
     #[test]
@@ -414,7 +474,7 @@ mod tests {
         let branch_only = RemovalPlan::BranchOnly {
             branch_name: "solo".to_string(),
             deletion_mode: BranchDeletionMode::default(),
-            pruned: false,
+            prune_entry: None,
             target_branch: None,
             integration_reason: None,
             branch_checked_out_at: None,
@@ -432,7 +492,7 @@ mod tests {
         let cases = [
             (BranchFate::Deleted, true),
             (BranchFate::Deferred, true),
-            (BranchFate::Retained, false),
+            (BranchFate::Retained(RetainedReason::Raced), false),
             (BranchFate::NotAttempted, false),
         ];
         for (fate, deleted) in cases {
@@ -440,8 +500,43 @@ mod tests {
         }
     }
 
-    /// Synchronous deletion results map onto fates: deletions count, refusals
-    /// and errors read as the branch surviving, absence as never attempted.
+    /// The `--format=json` vocabulary, which external callers branch on. Every
+    /// fate gets its own value: a race the caller should retry never reads as
+    /// a retention it asked for, and a detached deletion nobody watched never
+    /// reads as a confirmed one.
+    #[test]
+    fn branch_fate_json_outcome_is_distinct_per_fate() {
+        let cases = [
+            (BranchFate::NotAttempted, "not_attempted"),
+            (BranchFate::Deleted, "deleted"),
+            (BranchFate::Deferred, "deferred"),
+            (
+                BranchFate::Retained(RetainedReason::Unmerged),
+                "retained_unmerged",
+            ),
+            (
+                BranchFate::Retained(RetainedReason::CheckedOut),
+                "retained_checked_out",
+            ),
+            (
+                BranchFate::Retained(RetainedReason::Raced),
+                "retained_raced",
+            ),
+            (
+                BranchFate::Retained(RetainedReason::Failed),
+                "retained_failed",
+            ),
+        ];
+        for (fate, expected) in cases {
+            assert_eq!(fate.json_outcome(), expected, "{fate:?}");
+        }
+        let names: std::collections::BTreeSet<_> = cases.iter().map(|(_, name)| *name).collect();
+        assert_eq!(names.len(), cases.len(), "outcome names must be distinct");
+    }
+
+    /// Synchronous deletion results map onto fates: deletions count, each
+    /// refusal keeps the reason that distinguishes it, an error reads as the
+    /// delete having failed, and absence as never attempted.
     #[test]
     fn branch_fate_from_result_mapping() {
         use worktrunk::git::IntegrationReason;
@@ -464,54 +559,67 @@ mod tests {
         );
         assert_eq!(
             fate(BranchDeletionOutcome::NotDeleted),
-            BranchFate::Retained
+            BranchFate::Retained(RetainedReason::Unmerged)
+        );
+        assert_eq!(
+            fate(BranchDeletionOutcome::RetainedCheckedOut {
+                path: PathBuf::from("/tmp/feature"),
+            }),
+            BranchFate::Retained(RetainedReason::CheckedOut)
         );
         assert_eq!(
             fate(BranchDeletionOutcome::RetainedRaced),
-            BranchFate::Retained
+            BranchFate::Retained(RetainedReason::Raced)
         );
         assert_eq!(
             BranchFate::from_result(Some(&Err(anyhow::anyhow!("boom")))),
-            BranchFate::Retained
+            BranchFate::Retained(RetainedReason::Failed)
         );
         assert_eq!(BranchFate::from_result(None), BranchFate::NotAttempted);
     }
 
     #[test]
-    fn test_switch_result_path_existing() {
-        let path = PathBuf::from("/test/existing");
-        let result = SwitchResult::Existing { path: path.clone() };
-        assert_eq!(result.path(), &path);
-    }
+    fn test_switch_result_path() {
+        let cases = [
+            (
+                "already at worktree",
+                SwitchResult::AlreadyAt(PathBuf::from("/test/path")),
+                PathBuf::from("/test/path"),
+            ),
+            (
+                "existing worktree",
+                SwitchResult::Existing {
+                    path: PathBuf::from("/test/existing"),
+                },
+                PathBuf::from("/test/existing"),
+            ),
+            (
+                "created branch",
+                SwitchResult::Created {
+                    path: PathBuf::from("/test/created"),
+                    created_branch: true,
+                    base_branch: Some("main".to_string()),
+                    base_worktree_path: Some("/test/main".to_string()),
+                    from_remote: None,
+                },
+                PathBuf::from("/test/created"),
+            ),
+            (
+                "created from remote",
+                SwitchResult::Created {
+                    path: PathBuf::from("/test/remote"),
+                    created_branch: false,
+                    base_branch: None,
+                    base_worktree_path: None,
+                    from_remote: Some("origin/feature".to_string()),
+                },
+                PathBuf::from("/test/remote"),
+            ),
+        ];
 
-    #[test]
-    fn test_switch_result_path_created() {
-        let path = PathBuf::from("/test/created");
-        let result = SwitchResult::Created {
-            path: path.clone(),
-            created_branch: true,
-            base_branch: Some("main".to_string()),
-            base_worktree_path: Some("/test/main".to_string()),
-            from_remote: None,
-            pr_number: None,
-            pr_url: None,
-        };
-        assert_eq!(result.path(), &path);
-    }
-
-    #[test]
-    fn test_switch_result_created_with_remote() {
-        let path = PathBuf::from("/test/remote");
-        let result = SwitchResult::Created {
-            path: path.clone(),
-            created_branch: false,
-            base_branch: None,
-            base_worktree_path: None,
-            from_remote: Some("origin/feature".to_string()),
-            pr_number: None,
-            pr_url: None,
-        };
-        assert_eq!(result.path(), &path);
+        for (name, result, expected) in cases {
+            assert_eq!(result.path(), &expected, "{name}");
+        }
     }
 
     #[test]
@@ -561,7 +669,7 @@ mod tests {
         let result = RemovalPlan::BranchOnly {
             branch_name: "stale-branch".to_string(),
             deletion_mode: BranchDeletionMode::Keep,
-            pruned: false,
+            prune_entry: None,
             target_branch: None,
             integration_reason: None,
             branch_checked_out_at: None,
@@ -570,7 +678,7 @@ mod tests {
             RemovalPlan::BranchOnly {
                 branch_name,
                 deletion_mode,
-                pruned,
+                prune_entry,
                 target_branch,
                 integration_reason,
                 branch_checked_out_at,
@@ -578,7 +686,7 @@ mod tests {
                 assert_eq!(branch_name, "stale-branch");
                 assert!(deletion_mode.should_keep());
                 assert!(!deletion_mode.is_force());
-                assert!(!pruned);
+                assert!(prune_entry.is_none());
                 assert!(target_branch.is_none());
                 assert!(integration_reason.is_none());
                 assert!(branch_checked_out_at.is_none());
@@ -592,7 +700,7 @@ mod tests {
         let result = RemovalPlan::BranchOnly {
             branch_name: "pruned-branch".to_string(),
             deletion_mode: BranchDeletionMode::SafeDelete,
-            pruned: true,
+            prune_entry: Some(PathBuf::from("/stale")),
             target_branch: Some("main".to_string()),
             integration_reason: None,
             branch_checked_out_at: None,
@@ -601,14 +709,14 @@ mod tests {
             RemovalPlan::BranchOnly {
                 branch_name,
                 deletion_mode,
-                pruned,
+                prune_entry,
                 target_branch,
                 integration_reason,
                 branch_checked_out_at,
             } => {
                 assert_eq!(branch_name, "pruned-branch");
                 assert!(!deletion_mode.should_keep());
-                assert!(pruned);
+                assert_eq!(prune_entry.as_deref(), Some(Path::new("/stale")));
                 assert_eq!(target_branch.as_deref(), Some("main"));
                 assert!(integration_reason.is_none());
                 assert!(branch_checked_out_at.is_none());

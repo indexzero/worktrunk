@@ -8,6 +8,7 @@
 //!
 //! | Condition | Warning | Hint |
 //! |-----------|---------|------|
+//! | Outdated wrapper | `Worktree for X @ path, but cannot change directory — shell wrapper is out of date` | `To update the shell wrapper, run wt config shell install` |
 //! | Not installed | `Worktree for X @ path, but cannot change directory — shell integration not installed` | `To enable automatic cd, run wt config shell install` |
 //! | Installed, not active | `Worktree for X @ path, but cannot change directory — shell integration installed but not active` | `A shell restart usually activates shell integration; if it doesn't, ask an agent to debug with the docs @ https://worktrunk.dev/llms.txt` |
 //! | Explicit path | `Worktree for X @ path, but cannot change directory — ran ./wt; shell integration wraps wt` | `To change directory, run wt switch X` |
@@ -20,18 +21,27 @@
 //! | Condition | Success | Warning | Hint |
 //! |-----------|---------|---------|------|
 //! | Shell active | `Created new worktree for X from base @ path` | (none) | (none) |
+//! | Outdated wrapper | `Created new worktree for X from base @ path` | `Cannot change directory — shell wrapper is out of date` | `To update the shell wrapper, run wt config shell install` |
 //! | Not installed | `Created new worktree for X from base @ path` | `Cannot change directory — shell integration not installed` | `To enable automatic cd, run wt config shell install` |
 //! | Explicit path | `Created new worktree for X from base @ path` | `Cannot change directory — ran ./wt; shell integration wraps wt` | `To change directory, run wt switch X` |
 //! | Git subcommand | `Created new worktree for X from base @ path` | `Cannot change directory — ran git wt; running through git prevents cd` | `For automatic cd, invoke directly (with the -): git-wt` |
 //!
 //! ## After Merge/Remove (switching to main worktree)
 //!
+//! The warning names the destination, as the switch-to-existing case does.
+//! Both the `--create` success line and the switch-to-existing warning already
+//! print a path; a removal prints one only where a post-merge / post-remove
+//! hook announcement names its working directory, and it has just deleted the
+//! directory the caller is standing in — so without the path a caller without
+//! shell integration has nowhere to `cd`.
+//!
 //! | Condition | Warning | Hint |
 //! |-----------|---------|------|
 //! | Shell active | (info) `Switched to worktree for main @ path` | (none) |
-//! | Git subcommand | `Cannot change directory — ran git wt; running through git prevents cd` | `For automatic cd, invoke directly (with the -): git-wt` |
-//! | Explicit path | `Cannot change directory — ran ./wt; shell integration wraps wt` | `To change directory, run wt switch main` |
-//! | Other | `Cannot change directory — {reason}` | `To enable automatic cd, run wt config shell install` |
+//! | Outdated wrapper | `Worktree for main @ path, but cannot change directory — shell wrapper is out of date` | `To update the shell wrapper, run wt config shell install` |
+//! | Git subcommand | `Worktree for main @ path, but cannot change directory — ran git wt; running through git prevents cd` | `For automatic cd, invoke directly (with the -): git-wt` |
+//! | Explicit path | `Worktree for main @ path, but cannot change directory — ran ./wt; shell integration wraps wt` | `To change directory, run wt switch main` |
+//! | Other | `Worktree for main @ path, but cannot change directory — {reason}` | `To enable automatic cd, run wt config shell install` |
 //!
 //! ## Prompt Decision Flow
 //!
@@ -40,6 +50,7 @@
 //! | Condition | Action |
 //! |-----------|--------|
 //! | Git subcommand | Return early (warning already shown) |
+//! | Outdated wrapper | Return early (targeted reinstall hint already shown) |
 //! | Unsupported shell | Hint: `Shell integration not yet supported for <shell>` |
 //! | No shell detected | Hint: `To enable automatic cd, run wt config shell install` |
 //! | Current shell already installed | Hint: `A shell restart usually activates shell integration; …` |
@@ -52,6 +63,7 @@
 //!
 //! | Reason | Meaning |
 //! |--------|---------|
+//! | `shell wrapper is out of date` | Only the retired single-file directive env var is set |
 //! | `shell integration not installed` | Shell config doesn't have the `eval` line |
 //! | `shell integration installed but not active` | Shell config has `eval` line but wrapper not active |
 //! | `ran X; shell integration wraps Y` | Invoked with explicit path (e.g., `./target/debug/wt`) |
@@ -70,8 +82,8 @@ use worktrunk::styling::{
 };
 
 use crate::commands::configure_shell::{
-    ConfigAction, UninstallScanResult, format_matched_lines, handle_configure_shell,
-    prompt_for_install, scan_shell_configs,
+    ConfigAction, UninstallScanResult, apply_confirmed_shell_config, collect_legacy_cleanups,
+    format_matched_lines, prompt_for_install, scan_shell_configs,
 };
 
 /// Git config key tracking how many times the shell-integration install hint
@@ -109,8 +121,9 @@ pub(crate) fn print_shell_integration_hint(repo: &Repository) {
     let _ = repo.mark_hint_shown(SHELL_INTEGRATION_HINT);
 }
 
-/// Hint shown right after installing: the wrapper cannot be active yet, so
-/// the restart advice is unconditional.
+/// Hint shown right after installing for the current shell, when the wrapper
+/// isn't already intercepting — the shell it was installed into has to reload
+/// before the function exists.
 pub(crate) fn shell_restart_hint() -> &'static str {
     "Restart shell to activate shell integration"
 }
@@ -165,6 +178,10 @@ pub(crate) fn should_show_explicit_path_hint() -> bool {
 /// any shell. This prevents misleading "restart" advice when e.g. bash has
 /// integration but the user is running fish.
 pub(crate) fn compute_shell_warning_reason() -> String {
+    if super::retired_shell_wrapper_active() {
+        return "shell wrapper is out of date".to_string();
+    }
+
     // Check if the CURRENT shell has integration configured, not just ANY shell
     let is_configured = current_shell()
         .and_then(|shell| shell.is_shell_configured(&crate::binary_name()).ok())
@@ -376,7 +393,13 @@ pub fn print_shell_install_result(scan_result: &crate::commands::configure_shell
     // Restart hint for current shell. Compare Shell values, not display
     // names — the detected name can be "pwsh" or "zsh-5.9", which would
     // never equal the canonical "powershell"/"zsh" strings.
-    if shells_configured_count > 0 {
+    //
+    // Skipped when the wrapper already intercepted this invocation: the hint
+    // says integration needs activating, and it plainly doesn't. That case is
+    // reached by reinstalling from inside a wrapped shell — a version bump, or
+    // the fish conf.d → functions relocation, which writes a new file for a
+    // wrapper the running shell already has.
+    if shells_configured_count > 0 && !crate::output::is_shell_integration_active() {
         let current_shell_configured = current_shell().is_some_and(|shell| {
             scan_result
                 .configured
@@ -410,6 +433,11 @@ pub fn prompt_shell_integration(
     // (running through git prevents cd, so the shell wrapper won't intercept)
     // The git subcommand warning is already shown by the caller
     if crate::is_git_subcommand() {
+        return Ok(false);
+    }
+    // The caller already showed the targeted outdated-wrapper warning and
+    // reinstall hint. Do not follow it with the generic first-run prompt.
+    if super::retired_shell_wrapper_active() {
         return Ok(false);
     }
 
@@ -468,13 +496,19 @@ pub fn prompt_shell_integration(
 
     // TTY + first time: Show interactive prompt
     // Accepting installs for all shells with config files (same as `wt config shell install`)
-    // This first-run offer installs but resolves no legacy cleanups of its own;
-    // the subsequent handle_configure_shell reports any deprecated-file removal
-    // after the fact, as before.
+    // Detect (without removing) the legacy files the confirmed plan will delete,
+    // so this offer names them before the user consents — the removal is destructive
+    // and must not happen unpreviewed, exactly as `wt config shell install` previews it
+    // (issue #3644).
+    let legacy_preview = collect_legacy_cleanups(&scan.configured, binary_name, true);
+    // Separate the offer from the switch output above; prompt_yes_no_preview
+    // emits no leading blank of its own, so `wt config shell install` — where
+    // the same prompt is the first line — starts flush.
+    eprintln!();
     let confirmed = prompt_for_install(
         &scan.configured,
         &scan.completion_results,
-        &[],
+        &legacy_preview,
         binary_name,
         "Install shell integration?",
     )
@@ -488,8 +522,9 @@ pub fn prompt_shell_integration(
         return Ok(false);
     }
 
-    // Install for all shells with config files (same as `wt config shell install`)
-    let install_result = handle_configure_shell(None, true, false, binary_name.to_string())
+    // Apply the exact plan confirmed above; deriving another preview here would
+    // authorize filesystem changes made while the prompt was waiting.
+    let install_result = apply_confirmed_shell_config(scan, None, binary_name)
         .map_err(|e| anyhow::anyhow!("Failed to configure shell integration: {e}"))?;
 
     print_shell_install_result(&install_result);
@@ -520,8 +555,7 @@ pub fn print_shell_uninstall_result(scan_result: &UninstallScanResult, explicit_
         eprintln!(
             "{}{}",
             success_message(cformat!(
-                "{} {what} for <bold>{shell}</> @ <bold>{path}</>",
-                result.action.description(),
+                "Removed {what} for <bold>{shell}</> @ <bold>{path}</>",
             )),
             format_matched_lines(&result.matched_lines),
         );
@@ -535,8 +569,7 @@ pub fn print_shell_uninstall_result(scan_result: &UninstallScanResult, explicit_
         eprintln!(
             "{}",
             success_message(cformat!(
-                "{} completions for <bold>{shell}</> @ <bold>{path}</>",
-                result.action.description(),
+                "Removed completions for <bold>{shell}</> @ <bold>{path}</>",
             ))
         );
     }

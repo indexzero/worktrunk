@@ -90,15 +90,7 @@ fn setup_timestamped_worktrees(repo: &mut TestRepo) -> std::path::PathBuf {
 }
 
 #[rstest]
-fn test_list_single_worktree(repo: TestRepo) {
-    assert_cmd_snapshot!(list_snapshots::command(&repo, repo.root_path()));
-}
-
-#[rstest]
-fn test_list_multiple_worktrees(mut repo: TestRepo) {
-    repo.add_worktree("feature-a");
-    repo.add_worktree("feature-b");
-
+fn test_list_multiple_worktrees(repo: TestRepo) {
     assert_cmd_snapshot!(list_snapshots::command(&repo, repo.root_path()));
 }
 
@@ -147,6 +139,75 @@ fn test_list_detached_head_in_worktree(mut repo: TestRepo) {
     repo.detach_head_in_worktree("feature");
 
     assert_cmd_snapshot!(list_snapshots::command(&repo, repo.root_path()));
+}
+
+/// One commit, one rendering. The table's Commit cell and a detached row's
+/// Branch cell both print git's `%h`, so they follow `core.abbrev` and agree
+/// with the `short_sha` that `--format=json` carries. Sliced to a fixed width
+/// instead, the table disagreed with its own JSON about the same commit and
+/// ignored the setting entirely.
+#[rstest]
+fn test_list_abbreviated_sha_follows_git(mut repo: TestRepo) {
+    use ansi_str::AnsiStr;
+
+    repo.write_test_config("[list]\njson-schema = 1\n");
+    repo.add_worktree("feature");
+    repo.detach_head_in_worktree("feature");
+
+    let run = |args: &[&str]| {
+        let output = repo
+            .wt_command()
+            .args(args)
+            .current_dir(repo.root_path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "wt {args:?} should succeed");
+        output.stdout
+    };
+
+    // Git's default first, then a width nothing but `core.abbrev` explains —
+    // one anchor plus one single-factor neighbor.
+    for abbrev in [None, Some("12")] {
+        if let Some(value) = abbrev {
+            repo.run_git(&["config", "core.abbrev", value]);
+        }
+
+        let json: Vec<serde_json::Value> =
+            serde_json::from_slice(&run(&["list", "--format=json"])).unwrap();
+        let table = String::from_utf8_lossy(&run(&["list"]))
+            .ansi_strip()
+            .into_owned();
+
+        assert!(
+            json.iter().any(|item| item["branch"].is_null()),
+            "the detached worktree should be listed: {json:?}"
+        );
+        for item in &json {
+            let sha = item["commit"]["sha"].as_str().expect("full sha");
+            let short = item["commit"]["short_sha"].as_str().expect("short sha");
+
+            assert!(
+                table.contains(short),
+                "table should print the {short:?} that JSON reports \
+                 (core.abbrev={abbrev:?}):\n{table}"
+            );
+            // `contains` alone passes on a longer prefix — precisely the fixed
+            // 8-character slice this replaced — so rule that out as well.
+            assert!(
+                !table.contains(&sha[..short.len() + 1]),
+                "table should stop abbreviating where git does \
+                 (core.abbrev={abbrev:?}):\n{table}"
+            );
+
+            if item["branch"].is_null() {
+                assert!(
+                    table.lines().any(|line| line.matches(short).count() == 2),
+                    "a detached row has no branch name, so one line carries {short:?} \
+                     in both Branch and Commit (core.abbrev={abbrev:?}):\n{table}"
+                );
+            }
+        }
+    }
 }
 
 /// Adds a second worktree on `branch` via `git worktree add --force`, which
@@ -245,8 +306,6 @@ fn test_list_locked_no_reason(mut repo: TestRepo) {
     assert_cmd_snapshot!(list_snapshots::command(&repo, repo.root_path()));
 }
 
-// Removed: test_list_long_branch_name - covered by spacing_edge_cases.rs
-
 #[rstest]
 fn test_list_long_commit_message(mut repo: TestRepo) {
     // Create commit with very long message
@@ -257,8 +316,6 @@ fn test_list_long_commit_message(mut repo: TestRepo) {
 
     assert_cmd_snapshot!(list_snapshots::command(&repo, repo.root_path()));
 }
-
-// Removed: test_list_unicode_branch_name - covered by spacing_edge_cases.rs
 
 #[rstest]
 fn test_list_unicode_commit_message(mut repo: TestRepo) {
@@ -291,6 +348,8 @@ fn test_list_many_worktrees_with_varied_stats(mut repo: TestRepo) {
 
 #[rstest]
 fn test_list_json_with_metadata(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
+
     // Create worktree with detached head
     repo.add_worktree("feature-detached");
 
@@ -305,13 +364,11 @@ fn test_list_json_with_metadata(mut repo: TestRepo) {
     });
 }
 
-/// Schema 2 (`[list] json-schema = 2`): envelope with repo facts and
-/// per-item orthogonal facts. Pins the full shape, including the absence
-/// rule (locked reason present, integration null vs absent).
+/// Schema 2 is the default: an envelope with repo facts and per-item
+/// orthogonal facts. Pins the full shape, including the absence rule (locked
+/// reason present, integration null vs absent).
 #[rstest]
 fn test_list_json_schema_2_envelope(mut repo: TestRepo) {
-    repo.write_test_config("[list]\njson-schema = 2\n");
-
     repo.add_worktree("feature-detached");
     repo.add_worktree("locked-feature");
     repo.lock_worktree("locked-feature", Some("Testing"));
@@ -323,47 +380,28 @@ fn test_list_json_schema_2_envelope(mut repo: TestRepo) {
     });
 }
 
-/// `[list] json-schema` selects the output schema: unset emits schema 1
-/// plus a one-time nag, an explicit value is silent, and anything except
-/// 1 or 2 is an error.
+/// `[list] json-schema` selects the output schema: unset emits schema 2,
+/// explicit schema 1 preserves the bare array, and invalid values warn before
+/// falling back to schema 2.
 #[rstest]
 fn test_list_json_schema_selection(repo: TestRepo) {
-    // Unset with no user config file → nag names both settings to write by
-    // hand; there is no file for `wt config update` to rewrite.
+    // Unset → schema 2 with no migration warning.
     let output = repo
         .wt_command()
         .args(["list", "--format=json"])
         .output()
         .unwrap();
     assert!(output.status.success());
-    let json: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(!json.is_empty(), "schema 1 root is a bare array");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schema"], 2);
+    assert!(json["items"].as_array().is_some_and(|i| !i.is_empty()));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("json-schema = 1") && stderr.contains("json-schema = 2"),
-        "unset key should nag with the manual settings: {stderr}"
-    );
-    assert!(
-        !stderr.contains("config update"),
-        "no update hint without a config file to update: {stderr}"
+        !stderr.contains("json-schema"),
+        "the default should not warn: {stderr}"
     );
 
-    // Unset with a user config file present → the hint offers wt config
-    // update, which writes json-schema = 2.
-    repo.write_test_config("");
-    let output = repo
-        .wt_command()
-        .args(["list", "--format=json"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("wt config update"),
-        "unset key with a config file should offer the update command: {stderr}"
-    );
-
-    // Explicit 1 → schema 1, no nag.
+    // Explicit 1 → schema 1, no warning.
     repo.write_test_config("[list]\njson-schema = 1\n");
     let output = repo
         .wt_command()
@@ -376,10 +414,10 @@ fn test_list_json_schema_selection(repo: TestRepo) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("json-schema"),
-        "explicit value should not nag: {stderr}"
+        "explicit value should not warn: {stderr}"
     );
 
-    // Explicit 2 → envelope, no nag.
+    // Explicit 2 → envelope, no warning.
     repo.write_test_config("[list]\njson-schema = 2\n");
     let output = repo
         .wt_command()
@@ -392,9 +430,12 @@ fn test_list_json_schema_selection(repo: TestRepo) {
     assert_eq!(json["repo"]["default_branch"], "main");
     assert!(json["items"].as_array().is_some_and(|i| !i.is_empty()));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("json-schema"), "no nag with a value set");
+    assert!(
+        !stderr.contains("json-schema"),
+        "no warning with a valid value"
+    );
 
-    // Invalid value → warn and degrade to schema 1, like a config type
+    // Invalid value → warn and degrade to schema 2, like a config type
     // error (config problems never brick a command).
     repo.write_test_config("[list]\njson-schema = 3\n");
     let output = repo
@@ -403,8 +444,8 @@ fn test_list_json_schema_selection(repo: TestRepo) {
         .output()
         .unwrap();
     assert!(output.status.success(), "invalid value must not fail");
-    let json: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(!json.is_empty(), "degrades to schema 1");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schema"], 2, "degrades to schema 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("expected 1 or 2"),
@@ -416,6 +457,7 @@ fn test_list_json_schema_selection(repo: TestRepo) {
 /// remote to its HTTPS web URL without shelling out to a forge.
 #[rstest]
 fn test_list_json_repo_url_from_ssh_remote(repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
     // A real forge SSH remote. The local-path remote the fixture configures
     // doesn't parse as a remote URL, so `repo_url` would be absent for it.
     repo.run_git(&[
@@ -454,8 +496,55 @@ fn test_list_json_repo_url_from_ssh_remote(repo: TestRepo) {
     );
 }
 
+/// A self-hosted instance names its forge however it likes — its own label, a
+/// hyphenated one, inside a word, or a single-label SSH alias — and the
+/// provider follows the name with no config. The statusline stays silent.
+#[rstest]
+fn test_list_json_provider_reads_branded_self_hosted_hosts(repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
+    for (remote, host, provider) in [
+        (
+            "https://github-enterprise.acme.com/owner/repo.git",
+            "github-enterprise.acme.com",
+            "github",
+        ),
+        (
+            "https://gitlab-internal.company.com/owner/repo.git",
+            "gitlab-internal.company.com",
+            "gitlab",
+        ),
+        (
+            "https://mygithub.com/owner/repo.git",
+            "mygithub.com",
+            "github",
+        ),
+        (
+            "git@github-personal:owner/repo.git",
+            "github-personal",
+            "github",
+        ),
+    ] {
+        repo.run_git(&["remote", "set-url", "origin", remote]);
+        let output = repo
+            .wt_command()
+            .args(["list", "--format=json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "wt list should succeed for {remote}"
+        );
+
+        let json: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+        let row = json.first().expect("at least one row");
+        assert_eq!(row["repo"]["provider"].as_str(), Some(provider), "{remote}");
+        assert_eq!(row["repo"]["host"].as_str(), Some(host), "{remote}");
+    }
+}
+
 #[rstest]
 fn test_list_json_configured_azure_generic_remote_is_unknown(repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
     repo.run_git(&[
         "remote",
         "set-url",
@@ -743,6 +832,8 @@ fn test_list_with_orphaned_remote_ref(#[from(repo_with_remote)] repo: TestRepo) 
 fn test_list_remote_row_not_shadowed_by_same_named_local_branch(
     #[from(repo_with_remote)] repo: TestRepo,
 ) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
+
     // Remote `foo` = one commit ahead of main.
     repo.create_branch("foo");
     repo.run_git(&["checkout", "foo"]);
@@ -908,6 +999,8 @@ fn test_list_with_upstream_tracking(mut repo: TestRepo) {
 /// branch reads as ahead by every commit the local default is missing.
 #[rstest]
 fn test_list_branch_stats_use_upstream_when_local_default_lags(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
+
     repo.commit("c0");
     repo.setup_remote("main");
     // Persist the default branch so detection is deterministic.
@@ -969,6 +1062,8 @@ fn test_list_branch_stats_use_upstream_when_local_default_lags(mut repo: TestRep
 /// superset selection rather than naively preferring the upstream ref.
 #[rstest]
 fn test_list_branch_stats_stay_local_when_default_ahead_of_upstream(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
+
     repo.commit("c0");
     repo.setup_remote("main");
     repo.run_git(&["config", "worktrunk.default-branch", "main"]);
@@ -1024,34 +1119,9 @@ fn test_list_primary_on_different_branch(mut repo: TestRepo) {
     assert_cmd_snapshot!(list_snapshots::command(&repo, repo.root_path()));
 }
 
-/// NOTE: This test is used for doc generation (claude-code.md). It removes fixture
-/// worktrees to produce clean output.
-/// TODO: Consider extracting fixture cleanup into a helper function shared with
-/// setup_readme_example_repo.
-#[rstest]
-fn test_list_with_user_marker(mut repo: TestRepo) {
-    // Remove fixture worktrees for clean doc output (used by claude-code.md)
-    for branch in &["feature-a", "feature-b", "feature-c"] {
-        let worktree_path = repo
-            .root_path()
-            .parent()
-            .unwrap()
-            .join(format!("repo.{}", branch));
-        if worktree_path.exists() {
-            let _ = repo
-                .git_command()
-                .args([
-                    "worktree",
-                    "remove",
-                    "--force",
-                    worktree_path.to_str().unwrap(),
-                ])
-                .run();
-        }
-        // Delete the branch after removing the worktree
-        let _ = repo.git_command().args(["branch", "-D", branch]).run();
-    }
-
+/// Set up the clean worktree state shared by the user-marker documentation snapshots.
+fn setup_user_marker_example(repo: &mut TestRepo) {
+    repo.remove_fixture_worktrees();
     repo.commit_with_age("Initial commit", DAY);
 
     // Branch ahead of main with commits and user marker 🤖
@@ -1079,12 +1149,17 @@ fn test_list_with_user_marker(mut repo: TestRepo) {
     // Branch with uncommitted changes only (no user marker)
     let wip_wt = repo.add_worktree("wip-docs");
     std::fs::write(wip_wt.join("README.md"), "# Documentation").unwrap();
+}
 
-    assert_cmd_snapshot!(list_snapshots::command(&repo, repo.root_path()));
+#[rstest]
+fn test_list_with_user_marker(mut repo: TestRepo) {
+    setup_user_marker_example(&mut repo);
+    assert_cmd_snapshot!(list_snapshots::command_readme(&repo, repo.root_path()));
 }
 
 #[rstest]
 fn test_list_json_with_user_marker(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
     repo.commit_with_age("Initial commit", DAY);
 
     // Worktree with user marker (emoji only)
@@ -1094,6 +1169,25 @@ fn test_list_json_with_user_marker(mut repo: TestRepo) {
     repo.set_marker("with-status", "🔧");
 
     // Worktree without user marker
+    repo.add_worktree("without-status");
+
+    assert_cmd_snapshot!({
+        let mut cmd = list_snapshots::command(&repo, repo.root_path());
+        cmd.arg("--format=json");
+        cmd
+    });
+}
+
+/// Schema 2 reports the branch marker as its own `marker` field, and folds
+/// it into `display.symbols` the way the table folds it into the Status
+/// column. A branch with no marker set omits the field entirely.
+#[rstest]
+fn test_list_json_schema_2_with_user_marker(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 2\n");
+    repo.commit_with_age("Initial commit", DAY);
+
+    repo.add_worktree("with-status");
+    repo.set_marker("with-status", "🔧");
     repo.add_worktree("without-status");
 
     assert_cmd_snapshot!({
@@ -1216,32 +1310,6 @@ fn test_list_user_marker_with_special_characters(mut repo: TestRepo) {
 // These functions create minimal repos for Quick Start documentation.
 // The examples show the simplest workflow: create → list → merge.
 
-/// Remove fixture worktrees to start with a clean main-only repo.
-///
-/// The standard TestRepo fixture includes feature-a, feature-b, feature-c.
-/// Doc examples need clean output without these.
-fn remove_fixture_worktrees(repo: &mut TestRepo) {
-    for branch in &["feature-a", "feature-b", "feature-c"] {
-        let worktree_path = repo
-            .root_path()
-            .parent()
-            .unwrap()
-            .join(format!("repo.{}", branch));
-        if worktree_path.exists() {
-            let _ = repo
-                .git_command()
-                .args([
-                    "worktree",
-                    "remove",
-                    "--force",
-                    worktree_path.to_str().unwrap(),
-                ])
-                .run();
-        }
-        let _ = repo.git_command().args(["branch", "-D", branch]).run();
-    }
-}
-
 /// Set up a minimal repo with just main branch.
 ///
 /// Creates a simple codebase:
@@ -1251,7 +1319,7 @@ fn remove_fixture_worktrees(repo: &mut TestRepo) {
 ///
 /// Used as base for both Quick Start and full README examples.
 fn setup_quickstart_base(repo: &mut TestRepo) {
-    remove_fixture_worktrees(repo);
+    repo.remove_fixture_worktrees();
 
     // Suppress the "customize worktree locations" hint for clean snapshots
     repo.run_git(&["config", "worktrunk.hints.worktree-path", "true"]);
@@ -1485,7 +1553,7 @@ pub fn init() -> bool {
 /// use a different setup function.
 fn setup_readme_example_repo(repo: &mut TestRepo) -> std::path::PathBuf {
     // Start with clean base (removes fixture worktrees)
-    remove_fixture_worktrees(repo);
+    repo.remove_fixture_worktrees();
 
     // === Set up main branch with initial codebase ===
     // Main has a working API with security issues that fix-auth will harden
@@ -2364,6 +2432,7 @@ fn mock_summary_cache(
     summary: &str,
 ) {
     use sha2::{Digest, Sha256};
+    use worktrunk::git::PlumbingDiff;
 
     // Compute combined diff (matching compute_combined_diff in summary.rs)
     let mut diff = String::new();
@@ -2377,8 +2446,15 @@ fn mock_summary_cache(
     let head = String::from_utf8_lossy(&head_output.stdout)
         .trim()
         .to_string();
-    let merge_base = format!("main...{}", head);
-    if let Ok(output) = repo.git_command().args(["diff", &merge_base]).run() {
+    let merge_base = repo.git_output(&["merge-base", "main", &head]);
+    let patch_args = ["--find-renames", "--textconv", "--patch"];
+    if let Ok(output) = repo
+        .git_command()
+        .args(PlumbingDiff::Tree.args(&["-r"]))
+        .args(patch_args)
+        .args([merge_base.as_str(), head.as_str()])
+        .run()
+    {
         let branch_diff = String::from_utf8_lossy(&output.stdout);
         diff.push_str(&branch_diff);
     }
@@ -2388,7 +2464,10 @@ fn mock_summary_cache(
         let wt_str = wt_path.display().to_string();
         if let Ok(output) = repo
             .git_command()
-            .args(["-C", &wt_str, "diff", "HEAD"])
+            .args(["-C", &wt_str])
+            .args(PlumbingDiff::Index.args(&[]))
+            .args(patch_args)
+            .arg("HEAD")
             .run()
         {
             let wt_diff = String::from_utf8_lossy(&output.stdout);
@@ -2608,7 +2687,7 @@ fn test_readme_example_list(mut repo: TestRepo) {
 /// Generate README example: `wt list --full` output
 ///
 /// Shows additional columns: main…± (line diffs), CI status, and LLM summaries.
-/// Uses wider terminal (134 cols) than the base example to fit the Summary column.
+/// Uses the documentation width (98 cols) so the sample fits the site content column.
 /// Output: tests/snapshots/integration__integration_tests__list__readme_example_list_full.snap
 #[rstest]
 fn test_readme_example_list_full(mut repo: TestRepo) {
@@ -2616,7 +2695,6 @@ fn test_readme_example_list_full(mut repo: TestRepo) {
     assert_cmd_snapshot!("readme_example_list_full", {
         let mut cmd = list_snapshots::command_readme(&repo, &feature_api);
         cmd.arg("--full");
-        cmd.env("COLUMNS", "134");
         cmd
     });
 }
@@ -2624,7 +2702,7 @@ fn test_readme_example_list_full(mut repo: TestRepo) {
 /// Generate README example: `wt list --branches --full` output
 ///
 /// Shows branches without worktrees (⎇ symbol) alongside worktrees, plus CI status.
-/// Uses wider terminal (134 cols) than the base example to fit the Summary column.
+/// Uses the documentation width (98 cols) so the sample fits the site content column.
 /// Output: tests/snapshots/integration__integration_tests__list__readme_example_list_branches.snap
 #[rstest]
 fn test_readme_example_list_branches(mut repo: TestRepo) {
@@ -2632,7 +2710,6 @@ fn test_readme_example_list_branches(mut repo: TestRepo) {
     assert_cmd_snapshot!("readme_example_list_branches", {
         let mut cmd = list_snapshots::command_readme(&repo, &feature_api);
         cmd.args(["--branches", "--full"]);
-        cmd.env("COLUMNS", "134");
         cmd
     });
 }
@@ -2644,32 +2721,7 @@ fn test_readme_example_list_branches(mut repo: TestRepo) {
 /// Output: tests/snapshots/integration__integration_tests__list__readme_example_list_marker.snap
 #[rstest]
 fn test_readme_example_list_marker(mut repo: TestRepo) {
-    remove_fixture_worktrees(&mut repo);
-
-    repo.commit_with_age("Initial commit", DAY);
-
-    // Branch ahead of main with commits and user marker 🤖
-    let _feature_wt = repo.add_worktree_with_commit(
-        "feature-api",
-        "api.rs",
-        "// API implementation",
-        "Add REST API endpoints",
-    );
-    repo.set_marker("feature-api", "🤖");
-
-    // Branch with uncommitted changes and user marker 💬
-    let review_wt = repo.add_worktree_with_commit(
-        "review-ui",
-        "component.tsx",
-        "// UI component",
-        "Add dashboard component",
-    );
-    std::fs::write(review_wt.join("styles.css"), "/* pending styles */").unwrap();
-    repo.set_marker("review-ui", "💬");
-
-    // Branch with uncommitted changes only (no user marker)
-    let wip_wt = repo.add_worktree("wip-docs");
-    std::fs::write(wip_wt.join("README.md"), "# Documentation").unwrap();
+    setup_user_marker_example(&mut repo);
 
     assert_cmd_snapshot!(
         "readme_example_list_marker",
@@ -2701,20 +2753,6 @@ url = "http://localhost:{{ branch | hash_port }}"
         "tips_dev_server_workflow",
         list_snapshots::command_readme(&repo, repo.root_path())
     );
-}
-
-#[rstest]
-fn test_list_progressive_flag(mut repo: TestRepo) {
-    repo.add_worktree("feature-a");
-    repo.add_worktree("feature-b");
-
-    // Force progressive mode even in non-TTY test environment
-    // Output should be identical to buffered mode (only process differs)
-    assert_cmd_snapshot!({
-        let mut cmd = list_snapshots::command(&repo, repo.root_path());
-        cmd.arg("--progressive");
-        cmd
-    });
 }
 
 #[rstest]
@@ -2775,28 +2813,6 @@ fn test_list_first_output_writes_buffered_stdout(mut repo: TestRepo) {
 // ============================================================================
 // Task DAG Mode Tests
 // ============================================================================
-
-#[rstest]
-fn test_list_task_dag_single_worktree(repo: TestRepo) {
-    assert_cmd_snapshot!({
-        let mut cmd = list_snapshots::command(&repo, repo.root_path());
-        cmd.arg("--progressive");
-        cmd
-    });
-}
-
-#[rstest]
-fn test_list_task_dag_multiple_worktrees(mut repo: TestRepo) {
-    repo.add_worktree("feature-a");
-    repo.add_worktree("feature-b");
-    repo.add_worktree("feature-c");
-
-    assert_cmd_snapshot!({
-        let mut cmd = list_snapshots::command(&repo, repo.root_path());
-        cmd.arg("--progressive");
-        cmd
-    });
-}
 
 #[rstest]
 fn test_list_task_dag_full_with_diffs(mut repo: TestRepo) {
@@ -3336,7 +3352,7 @@ fn test_list_maximum_status_symbols(mut repo: TestRepo) {
 
 ///
 /// This specifically tests the WorkingTreeConflicts task which:
-/// 1. Uses `git write-tree` to snapshot the index (with temp index for unstaged/untracked)
+/// 1. Uses a temp index plus `git write-tree` to snapshot tracked changes
 /// 2. Runs merge-tree against the default branch to detect conflicts
 ///
 /// Both kinds of conflicts are checked in both `wt list` and `wt list --full`:
@@ -3374,6 +3390,293 @@ fn test_list_working_tree_conflicts(mut repo: TestRepo) {
         cmd.arg("--full");
         cmd
     });
+}
+
+/// A tracked file modified outside the sparse-checkout definition must still
+/// participate in the working-tree conflict result.
+#[rstest]
+fn test_list_working_tree_conflicts_cross_sparse_checkout_boundary(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 2\n");
+
+    std::fs::create_dir_all(repo.root_path().join("visible")).unwrap();
+    std::fs::create_dir_all(repo.root_path().join("hidden")).unwrap();
+    std::fs::write(repo.root_path().join("visible/shared.txt"), "base\n").unwrap();
+    std::fs::write(repo.root_path().join("hidden/tracked.txt"), "base\n").unwrap();
+    repo.run_git(&["add", "."]);
+    repo.commit("Add sparse fixture");
+
+    let feature = repo.add_worktree("feature");
+    std::fs::write(repo.root_path().join("hidden/tracked.txt"), "main\n").unwrap();
+    repo.commit("Change hidden file on main");
+
+    repo.run_git_in(&feature, &["sparse-checkout", "init", "--cone"]);
+    repo.run_git_in(&feature, &["sparse-checkout", "set", "visible"]);
+    std::fs::create_dir_all(feature.join("hidden")).unwrap();
+    std::fs::write(feature.join("hidden/tracked.txt"), "feature\n").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["list", "--format=json"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wt list should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let feature = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["branch"] == "feature")
+        .expect("feature row");
+    assert_eq!(feature["default_branch"]["merge_conflicts"], true);
+}
+
+/// A staged deletion can leave the temporary index empty. The conflict probe
+/// must still write that empty tree and detect a modify/delete conflict.
+#[rstest]
+fn test_list_working_tree_conflicts_with_staged_deletion_of_all_files(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 2\n");
+    std::fs::write(repo.root_path().join("shared.txt"), "base\n").unwrap();
+    repo.commit("Initial commit");
+    let feature_path = repo.add_worktree("feature");
+
+    repo.run_git_in(&feature_path, &["rm", "shared.txt"]);
+    std::fs::write(repo.root_path().join("shared.txt"), "main\n").unwrap();
+    repo.commit("Change on main");
+
+    let output = repo
+        .wt_command()
+        .args(["list", "--format=json"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wt list should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let feature = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["branch"] == "feature")
+        .expect("feature row");
+    assert_eq!(feature["default_branch"]["merge_conflicts"], true);
+}
+
+/// Untracked paths stay visible as changes but do not participate in the
+/// advisory merge-conflict estimate.
+#[rstest]
+fn test_list_ignores_untracked_paths_for_conflict_estimate(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 2\n");
+    repo.commit("Initial commit");
+    let feature_path = repo.add_worktree("feature");
+
+    std::fs::write(repo.root_path().join("collision.txt"), "main\n").unwrap();
+    repo.run_git(&["add", "collision.txt"]);
+    repo.run_git(&["commit", "-m", "Add collision path"]);
+    std::fs::write(feature_path.join("collision.txt"), "untracked\n").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["list", "--format=json"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wt list should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let feature = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["branch"] == "feature")
+        .expect("feature row");
+    assert_eq!(feature["worktree"]["changes"]["untracked"], true);
+    assert_eq!(feature["default_branch"]["merge_conflicts"], false);
+}
+
+/// `HEAD±` describes the whole working tree in every list mode. A move whose
+/// destination is still untracked changes no lines, while an unrelated new file
+/// contributes its added lines.
+#[rstest]
+fn test_list_counts_untracked_files_and_move_deltas_by_default(repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 2\n");
+    let source = (1..=100)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(repo.root_path().join("source.txt"), format!("{source}\n")).unwrap();
+    repo.run_git(&["add", "source.txt"]);
+    repo.run_git(&["commit", "-m", "Add source"]);
+
+    std::fs::create_dir(repo.root_path().join("moved")).unwrap();
+    std::fs::rename(
+        repo.root_path().join("source.txt"),
+        repo.root_path().join("moved/source.txt"),
+    )
+    .unwrap();
+    std::fs::write(repo.root_path().join("new.txt"), "one\ntwo\n").unwrap();
+
+    for args in [
+        &["list", "--format=json"][..],
+        &["list", "--full", "--format=json"][..],
+    ] {
+        let output = repo
+            .wt_command()
+            .args(args)
+            .current_dir(repo.root_path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} should succeed; stderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let main = json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["branch"] == "main")
+            .expect("main row");
+        assert_eq!(
+            main["worktree"]["changes"]["diff"],
+            serde_json::json!({ "added": 2, "deleted": 0 }),
+            "entry: {main}"
+        );
+    }
+}
+
+/// Ignoring untracked paths must still fall back to the committed conflict
+/// probe rather than treating an untracked-only worktree as conflict-free.
+#[rstest]
+fn test_list_untracked_only_preserves_committed_conflict(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 2\n");
+    std::fs::write(repo.root_path().join("shared.txt"), "base\n").unwrap();
+    repo.commit("Initial commit");
+    let feature_path = repo.add_worktree("feature");
+
+    std::fs::write(feature_path.join("shared.txt"), "feature\n").unwrap();
+    repo.run_git_in(&feature_path, &["add", "shared.txt"]);
+    repo.run_git_in(&feature_path, &["commit", "-m", "Change on feature"]);
+    std::fs::write(repo.root_path().join("shared.txt"), "main\n").unwrap();
+    repo.commit("Change on main");
+    std::fs::write(feature_path.join("artifact.bin"), "untracked\n").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["list", "--format=json"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wt list should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let feature = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["branch"] == "feature")
+        .expect("feature row");
+    assert_eq!(feature["worktree"]["changes"]["untracked"], true);
+    assert_eq!(feature["default_branch"]["merge_conflicts"], true);
+}
+
+/// Every object produced by an observational merge probe is process-scoped,
+/// including blobs and trees for changing tracked worktree content.
+#[rstest]
+fn test_list_does_not_persist_observation_objects(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 2\n");
+    repo.commit("Initial commit");
+    let feature_path = repo.add_worktree("feature");
+    repo.commit("Main diverges");
+
+    let before = repo.git_output(&["count-objects", "-v"]);
+    std::fs::write(feature_path.join("file.txt"), "feature\n").unwrap();
+    std::fs::write(feature_path.join("artifact.bin"), "untracked\n").unwrap();
+
+    for args in [
+        &["list", "--format=json"][..],
+        &["list", "statusline", "--format=json"][..],
+    ] {
+        let output = repo
+            .wt_command()
+            .args(args)
+            .current_dir(&feature_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} should succeed; stderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    assert_eq!(
+        repo.git_output(&["count-objects", "-v"]),
+        before,
+        "observational probes must leave the real object database unchanged"
+    );
+}
+
+/// A broken system temporary-directory setting must not prevent either list
+/// entry point from rendering. Probe objects fall back to a temporary directory
+/// in Git's metadata and still disappear when the command exits.
+#[cfg(unix)]
+#[rstest]
+fn test_list_survives_unavailable_system_temp_directory(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 2\n");
+    repo.commit("Initial commit");
+    let feature_path = repo.add_worktree("feature");
+    repo.commit("Main diverges");
+    std::fs::write(feature_path.join("file.txt"), "feature\n").unwrap();
+
+    let before = repo.git_output(&["count-objects", "-v"]);
+    let missing_temp = repo.root_path().join("missing-temp");
+    assert!(!missing_temp.exists());
+    for args in [
+        &["list", "--format=json"][..],
+        &["list", "statusline", "--format=json"][..],
+    ] {
+        let output = repo
+            .wt_command()
+            .args(args)
+            .current_dir(&feature_path)
+            .env("TMPDIR", &missing_temp)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} should fall back from an unavailable TMPDIR; stderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    assert_eq!(
+        repo.git_output(&["count-objects", "-v"]),
+        before,
+        "fallback probe objects must not enter the real object database"
+    );
 }
 
 ///
@@ -3590,6 +3893,46 @@ fn test_list_branches_with_nonexistent_default_branch(repo: TestRepo) {
     });
 }
 
+/// A repo whose branch inventory is empty still drops an unresolvable default
+/// branch, even though it raises no warning about it.
+///
+/// The two are separate decisions. `wt list` stays quiet here because an empty
+/// inventory is as likely to be a repo with no commits — nothing was deleted,
+/// and `wt config state default-branch clear` would only be re-inferred on the
+/// next run. But the persisted value still names no branch, so the tasks that
+/// resolve against it (ahead/behind, branch diff, merge-conflict check) must
+/// not be handed it: each would fail with `fatal: Needed a single revision`,
+/// and the run would end in a "3 tasks failed" block.
+///
+/// Detaching HEAD and deleting the only branch is the shape that reaches this
+/// with a row still on the table; the bare-no-commits repo has no rows, so
+/// nothing downstream fires there.
+#[rstest]
+fn test_list_detached_with_no_branches_drops_stale_default() {
+    let repo = TestRepo::with_initial_commit();
+    repo.run_git(&["config", "worktrunk.default-branch", "main"]);
+    repo.run_git(&["checkout", "--detach"]);
+    repo.run_git(&["branch", "-D", "main"]);
+
+    let output = list_snapshots::command(&repo, repo.root_path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "wt list should succeed; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("tasks failed"),
+        "the dropped default must keep every task off the missing branch; got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("does not exist locally"),
+        "an empty branch inventory reports nothing; got: {stderr:?}"
+    );
+}
+
 /// Tests that the current worktree indicator (@) is correct for nested worktrees.
 ///
 /// When worktrees are placed inside other worktrees (e.g., `.worktrees/` layout),
@@ -3613,6 +3956,8 @@ fn test_list_nested_worktree_current_indicator(mut repo: TestRepo) {
 /// Tests JSON output for nested worktrees shows is_current on the correct worktree.
 #[rstest]
 fn test_list_nested_worktree_json_is_current(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
+
     // Create a worktree nested inside the main repo
     let nested_path = repo.root_path().join(".worktrees").join("feature");
     let nested_worktree = repo.add_worktree_at_path("feature", &nested_path);
@@ -3662,6 +4007,7 @@ fn test_list_empty_repo() {
 #[test]
 fn test_list_empty_repo_json() {
     let repo = TestRepo::empty();
+    repo.write_test_config("[list]\njson-schema = 1\n");
     let output = repo
         .wt_command()
         .args(["list", "--format=json"])
@@ -3711,8 +4057,7 @@ fn test_list_unborn_worktree_no_task_failures(repo: TestRepo) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    // Untracked content forces WorkingTreeConflictsTask to run merge-tree
-    // against the null OID rather than short-circuiting on a clean tree.
+    // Untracked content forces the working-tree diff task to inspect the unborn tree.
     std::fs::write(orphan_path.join("untracked.txt"), "content\n").unwrap();
 
     let output = repo
@@ -3755,6 +4100,8 @@ fn test_list_unborn_worktree_no_task_failures(repo: TestRepo) {
 fn test_list_integrated_when_merged_locally_with_upstream_diverged(
     #[from(repo_with_remote)] mut repo: TestRepo,
 ) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
+
     let remote_path = repo.remote_path().unwrap().to_path_buf();
 
     // Advance origin/main with a remote-only commit so local and upstream diverge.
@@ -3849,6 +4196,8 @@ fn test_list_integrated_when_merged_locally_with_upstream_diverged(
 fn test_list_integrated_when_squash_merged_on_remote_with_local_diverged(
     #[from(repo_with_remote)] repo: TestRepo,
 ) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
+
     let remote_path = repo.remote_path().unwrap().to_path_buf();
 
     // Build, push, and remote-squash-merge a feature branch.
@@ -3928,7 +4277,7 @@ fn test_list_tolerates_missing_index(mut repo: TestRepo) {
 
     let feature = repo.add_worktree("feature");
 
-    // Dirty the worktree so WorkingTreeConflictsTask exercises the temp-index path.
+    // Dirty the worktree so the working-tree conflict task exercises the temp-index path.
     std::fs::write(feature.join("shared.txt"), "feature changes").unwrap();
     std::fs::write(feature.join("untracked.txt"), "extra\n").unwrap();
 
@@ -3972,6 +4321,89 @@ fn test_list_tolerates_missing_index(mut repo: TestRepo) {
         !feature_index.exists(),
         "wt list must not resurrect the real index"
     );
+}
+
+#[rstest]
+#[case::relative(false)]
+#[case::absolute(true)]
+fn test_list_preserves_inherited_object_directory(
+    mut repo: TestRepo,
+    #[case] use_absolute_path: bool,
+) {
+    repo.write_test_config("[list]\njson-schema = 2\n");
+    repo.commit("Initial commit");
+    repo.add_worktree("feature");
+    let feature_sha = repo.git_output(&["rev-parse", "feature"]);
+
+    let objects = repo.root_path().join(".git/objects");
+    let external_objects = repo.root_path().join(".git/external-objects");
+    std::fs::rename(&objects, &external_objects).unwrap();
+    std::fs::create_dir_all(objects.join("info")).unwrap();
+    std::fs::create_dir_all(objects.join("pack")).unwrap();
+
+    let object_directory = if use_absolute_path {
+        external_objects.to_string_lossy().into_owned()
+    } else {
+        ".git/external-objects".to_owned()
+    };
+
+    let output = repo
+        .wt_command()
+        .env("GIT_OBJECT_DIRECTORY", object_directory)
+        .args(["list", "--format=json"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wt list should preserve GIT_OBJECT_DIRECTORY; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let feature = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["branch"] == "feature")
+        .expect("feature row");
+    assert_eq!(feature["head"]["sha"], feature_sha);
+}
+
+#[rstest]
+fn test_list_preserves_inherited_object_alternates(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 2\n");
+    repo.commit("Initial commit");
+    repo.add_worktree_with_commit("feature", "feature.txt", "feature\n", "Add feature");
+
+    let feature_sha = repo.git_output(&["rev-parse", "feature"]);
+    let object_path = std::path::Path::new(&feature_sha[..2]).join(&feature_sha[2..]);
+    let objects = repo.root_path().join(".git/objects");
+    let alternate = repo.home_path().join("alternate-objects");
+    std::fs::create_dir_all(alternate.join(object_path.parent().unwrap())).unwrap();
+    std::fs::rename(objects.join(&object_path), alternate.join(&object_path)).unwrap();
+
+    let output = repo
+        .wt_command()
+        .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &alternate)
+        .args(["list", "--format=json"])
+        .current_dir(repo.root_path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wt list should preserve inherited alternates; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let feature = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["branch"] == "feature")
+        .expect("feature row");
+    assert_eq!(feature["head"]["sha"], feature_sha);
 }
 
 /// Recursively strips write permission from a repository's object database and
@@ -4029,13 +4461,13 @@ impl Drop for ReadOnlyObjectDirectory {
 /// read-only (a managed sandbox). Its merge and conflict probes write
 /// ephemeral objects — `merge-tree --write-tree` for the integration diff and
 /// `write-tree` against a temp index for the dirty-worktree conflict check —
-/// which `Repository::redirect_objects_if_read_only` reroutes into a temporary
+/// which `Repository::redirect_objects_for_observation` reroutes into a temporary
 /// object database. The analysis stays complete instead of erroring with
 /// "insufficient permission for adding an object".
 #[cfg(unix)]
 #[rstest]
 fn test_list_full_survives_read_only_object_database(mut repo: TestRepo) {
-    // Explicit schema keeps stderr free of the unset-schema nag.
+    // Keep this regression on the schema-1 field vocabulary it asserts below.
     repo.write_test_config("[list]\njson-schema = 1\n");
 
     // Diverged, cleanly-mergeable topology: `feature` adds one file, `main`

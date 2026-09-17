@@ -11,11 +11,12 @@
 //! only the presentation varies.
 #![cfg(not(windows))]
 
-use crate::common::{add_standard_env_redactions, wt_command};
+use crate::common::{add_standard_env_redactions, configure_cli_command, wt_bin, wt_command};
 use ansi_str::AnsiStr as _;
 use insta::Settings;
 use insta_cmd::assert_cmd_snapshot;
 use rstest::rstest;
+use std::process::Command;
 
 /// Insta settings shared by every help / version / usage snapshot: the
 /// standard env redactions plus the snapshot path. Routing all of them through
@@ -102,11 +103,36 @@ fn test_merge_help_describes_exact_shape_no_rebase() {
 #[case("help_config_shell", "config shell --help")]
 #[case("help_config_create", "config create --help")]
 #[case("help_config_show", "config show --help")]
+#[case("help_config_update", "config update --help")]
 #[case("help_config_plugins", "config plugins --help")]
 #[case("help_config_plugins_codex", "config plugins codex --help")]
 #[case(
     "help_config_plugins_codex_install",
     "config plugins codex install --help"
+)]
+// The uninstall pages describe when each command skips, which depends on what
+// the harness's config still holds. Snapshot them so that text cannot drift
+// away from the handlers the way it did when the marketplace removal became
+// reachable with the plugin already gone.
+#[case(
+    "help_config_plugins_claude_uninstall",
+    "config plugins claude uninstall --help"
+)]
+#[case(
+    "help_config_plugins_codex_uninstall",
+    "config plugins codex uninstall --help"
+)]
+#[case("help_config_plugins_pi", "config plugins pi --help")]
+#[case("help_config_plugins_pi_install", "config plugins pi install --help")]
+#[case(
+    "help_config_plugins_pi_uninstall",
+    "config plugins pi uninstall --help"
+)]
+#[case("help_config_plugins_omp", "config plugins omp --help")]
+#[case("help_config_plugins_omp_install", "config plugins omp install --help")]
+#[case(
+    "help_config_plugins_omp_uninstall",
+    "config plugins omp uninstall --help"
 )]
 #[case("help_config_state", "config state --help")]
 #[case("help_config_state_cache", "config state cache --help")]
@@ -357,4 +383,74 @@ fn test_nested_subcommand_suggestion(
         // Snapshot the full error output
         assert_cmd_snapshot!(test_name, cmd);
     });
+}
+
+/// `--print-schema` names one command's `--format=json` payload, so an
+/// unrecognized or missing command is a usage error rather than a silent
+/// empty document. `test_docs_are_in_sync` treats a non-zero exit as a sync
+/// failure, which is what keeps a renamed command from quietly publishing
+/// nothing.
+#[test]
+fn test_print_schema_rejects_unknown_command() {
+    for args in [&["--print-schema"][..], &["merge", "--print-schema"][..]] {
+        let output = wt_command()
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run wt {args:?}: {e}"));
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "wt {args:?} should exit 2; stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "wt {args:?} should print no schema, but stdout was: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+/// The doc-generation entry points take their command from the early clap
+/// parse, so neither the binary's name nor a global option carrying a value
+/// reaches the answer.
+///
+/// A hand-rolled argv scan recognized the binary by the shape of its path,
+/// which made `wt.exe list --print-schema` — the name every Windows install
+/// ships — a request for a command named after the binary, and read the
+/// `<path>` in `wt -C <path> list --print-schema` as the command. The name is
+/// exercised through a symlink because this module is Unix-only.
+#[test]
+fn test_dev_entry_points_take_command_from_clap() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let renamed = dir.path().join("wt.exe");
+    std::os::unix::fs::symlink(wt_bin(), &renamed).expect("symlink wt binary");
+
+    for args in [
+        &["list", "--print-schema"][..],
+        &["merge", "--help-page"][..],
+        &["merge", "--help-description"][..],
+        &["-C", ".", "list", "--print-schema"][..],
+    ] {
+        let mut cmd = Command::new(&renamed);
+        configure_cli_command(&mut cmd);
+        cmd.current_dir(dir.path());
+        let output = cmd
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run wt.exe {args:?}: {e}"));
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "wt.exe {args:?} should succeed; stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "wt.exe {args:?} printed nothing; stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

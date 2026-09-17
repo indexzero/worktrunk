@@ -7,6 +7,8 @@ use worktrunk::config::{MergeConfig, UserConfig};
 use worktrunk::git::Repository;
 use worktrunk::styling::{eprintln, info_message};
 
+use crate::output::print_json;
+
 use super::command_approval::approve_commit_template_append;
 use super::command_executor::FailureStrategy;
 use super::commit::{CommitOptions, HookGate};
@@ -258,7 +260,7 @@ pub fn handle_merge(opts: MergeOptions<'_>) -> anyhow::Result<()> {
     }
 
     // Worktree for target is optional: if present we use it for safety checks and as destination.
-    let target_worktree_path = repo.worktree_for_branch(&target_branch)?;
+    let target_worktree_path = repo.usable_worktree_for_branch(&target_branch)?;
     // Where `post-merge` / `post-remove` / `post-switch` run: the target
     // branch's worktree if it exists, else the primary worktree. Mirrors
     // `finish_after_merge`'s destination resolution. (Config is resolved from
@@ -320,6 +322,20 @@ pub fn handle_merge(opts: MergeOptions<'_>) -> anyhow::Result<()> {
     // (from auto-commit or squash), post-remove + post-switch (from worktree
     // removal), and post-merge share a single `◎ Running …` line flushed at
     // the end.
+    //
+    // Every background hook runs in the worktree it is anchored on, and only
+    // post-commit is anchored on the feature worktree (the other three anchor
+    // on the destination). A merge that removes that worktree therefore
+    // reaches the flush with post-commit's anchor gone, so the removal reports
+    // it via `HookAnnouncer::mark_worktree_removed` and the flush drops that
+    // pipeline rather than spawning it into a path whose git discovery would
+    // walk up to the primary worktree.
+    //
+    // There is no earlier moment to spawn it. Between the commit and the
+    // removal the worktree is rebased and runs `pre-merge`, and a background
+    // pipeline there would race both. post-commit still runs where the
+    // worktree survives — `--no-remove`, merging on the target branch, merging
+    // from the primary worktree — and on `wt step commit` / `wt step squash`.
     let mut announcer = HookAnnouncer::new(repo, false);
 
     // The project commit-append is gated independently of hook approval:
@@ -429,10 +445,10 @@ pub fn handle_merge(opts: MergeOptions<'_>) -> anyhow::Result<()> {
     });
     if !ff {
         // Create a merge commit on the target branch via commit-tree + update-ref
-        let _ = handle_no_ff_merge(Some(&target_branch), operations, &current_branch)?;
+        handle_no_ff_merge(Some(&target_branch), operations, &current_branch)?;
     } else {
         // Fast-forward push to target branch
-        let _ = handle_push(Some(&target_branch), PushKind::MergeFastForward, operations)?;
+        handle_push(Some(&target_branch), PushKind::MergeFastForward, operations)?;
     }
 
     let removed = finish_after_merge(
@@ -462,7 +478,7 @@ pub fn handle_merge(opts: MergeOptions<'_>) -> anyhow::Result<()> {
             "rebased": rebased,
             "removed": removed,
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        print_json(&output)?;
     }
 
     Ok(())

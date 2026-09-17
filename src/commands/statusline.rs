@@ -20,17 +20,17 @@ use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Component, Path, PathBuf};
 
-use dunce::canonicalize;
-
 use ansi_str::AnsiStr;
 use anyhow::{Context, Result};
-use worktrunk::git::{Repository, WorkingTree};
+use worktrunk::git::{Repository, WorkingTree, WorktreeId};
 use worktrunk::styling::{
-    fix_dim_after_color_reset, terminal_width_for_statusline, truncate_visible,
+    ColorChoice, fix_dim_after_color_reset, println, terminal_width_for_statusline,
+    truncate_visible,
 };
 
 use super::list::{self, CollectOptions, StatuslineSegment, json_output};
 use crate::cli::StatuslineFormat;
+use crate::output::print_json;
 
 /// Claude Code context parsed from stdin JSON
 struct ClaudeCodeContext {
@@ -722,12 +722,21 @@ fn format_context_gauge(percentage: f64) -> String {
 
 /// Run the statusline command.
 ///
-/// Output uses `println!` for raw stdout (bypasses anstream color detection).
-/// Shell prompts (PS1) and Claude Code always expect ANSI codes.
+/// Output goes through anstream like every other stdout surface, with the
+/// process-global [`ColorChoice`] set to `Always` so the escapes survive:
+/// shell prompts (PS1) and Claude Code always expect ANSI codes, and neither
+/// is a tty from this process's point of view.
 pub fn run(format: StatuslineFormat) -> Result<()> {
     // Statusline runs on every prompt redraw — deprecation warnings on stderr
     // would appear above each prompt.
     worktrunk::config::suppress_warnings();
+
+    // A shell prompt or Claude Code captures this line and re-renders it, so
+    // the escapes are part of the answer rather than presentation this process
+    // chose. `Always` is the conventional `--color=always` semantic and
+    // overrides `NO_COLOR` by design — an explicit request for color wins
+    // (no-color.org).
+    ColorChoice::Always.write_global();
 
     // JSON format: output current worktree as JSON
     if matches!(format, StatuslineFormat::Json) {
@@ -865,10 +874,6 @@ fn statusline_options(repo: &Repository) -> CollectOptions {
     };
     CollectOptions {
         url_template,
-        // Match `wt list --full`: include untracked files in the working
-        // diff (`HEAD±`) so the segment counts the same lines `wt step
-        // diff` would show, consistent with the rest of the statusline data.
-        include_untracked_in_working_diff: true,
         ..CollectOptions::for_columns(list::columns::all_columns(), &gates)
     }
 }
@@ -882,26 +887,20 @@ fn statusline_options(repo: &Repository) -> CollectOptions {
 fn current_worktree_item(worktree: &WorkingTree) -> Result<Option<list::model::ListItem>> {
     let repo = worktree.repo();
 
-    // Use git rev-parse --show-toplevel (via WorkingTree::root()) to correctly identify
-    // the worktree containing that directory, rather than prefix matching which fails for
-    // nested worktrees.
-    let worktree_root = worktree.root()?;
-    let Some(wt) = repo.list_worktrees()?.iter().find(|wt| {
-        canonicalize(&wt.path)
-            .map(|p| p == worktree_root)
-            .unwrap_or(false)
-    }) else {
+    // `WorkingTree::root()` identifies the checkout containing a nested
+    // directory. Convert it once to the same canonical identity every
+    // inventory and primary-worktree comparison uses.
+    let current_id = WorktreeId::new(worktree.root()?);
+    let worktrees = repo.list_worktrees()?;
+    let Some(wt) = worktrees.iter().find(|wt| wt.id() == current_id) else {
         return Ok(None);
     };
 
     // Determine if this is the primary worktree
     // - Normal repos: the main worktree (repo root)
     // - Bare repos: the default branch's worktree
-    let is_home = repo
-        .primary_worktree()
-        .ok()
-        .flatten()
-        .is_some_and(|p| wt.path == p);
+    let primary_id = repo.primary_worktree().ok().flatten().map(WorktreeId::new);
+    let is_home = primary_id.as_ref() == Some(&current_id);
 
     Ok(Some(list::build_worktree_item(wt, is_home, true, false)))
 }
@@ -912,9 +911,8 @@ fn current_worktree_item(worktree: &WorkingTree) -> Result<Option<list::model::L
 fn run_json() -> Result<()> {
     let repo = Repository::current().context("Not in a git repository")?;
 
-    // Warnings are suppressed on this surface, so an unset (or invalid) key
-    // resolves to schema 1 silently; the nag reaches the same user on their
-    // next interactive `wt list --format=json`.
+    // Warnings are suppressed on this surface, so an invalid key falls back
+    // to the default schema without corrupting the prompt.
     let json_schema = list::resolve_json_schema(&repo);
 
     let options = statusline_options(&repo);
@@ -932,10 +930,9 @@ fn run_json() -> Result<()> {
             // report, and resolving it here could reach the network on a
             // fresh clone — this path runs on every prompt redraw.
             let envelope = list::json_v2::envelope_with_items(&repo, None, collected, vec![]);
-            list::print_json(&envelope)
+            print_json(&envelope)
         } else {
-            println!("[]");
-            Ok(())
+            print_json(&serde_json::json!([]))
         }
     };
 
@@ -956,15 +953,15 @@ fn run_json() -> Result<()> {
 
     // Convert to JSON format — single-branch lookup (not all_vars_entries)
     let mut all_vars = HashMap::new();
-    if let Some(branch) = &item.branch {
+    if let Some(branch) = item.branch() {
         let entries = repo.vars_entries(branch);
         if !entries.is_empty() {
-            all_vars.insert(branch.clone(), entries);
+            all_vars.insert(branch.to_string(), entries);
         }
     }
     // No custom columns: the statusline path never expands `[list.custom-columns]`
     // (prompt hot path; its compact format has no column grid).
-    let ci_provider_override = repo.forge_platform_override();
+    let ci_provider_override = repo.configured_forge_platform();
 
     // Output follows `wt list --format=json`: schema 1 is a bare
     // single-item array, schema 2 a single-item envelope.
@@ -982,7 +979,7 @@ fn run_json() -> Result<()> {
         );
         let envelope =
             list::json_v2::envelope_with_items(&repo, default_branch, collected, vec![json_item]);
-        list::print_json(&envelope)
+        print_json(&envelope)
     } else {
         let repo_metadata = repo.repo_info();
         let json_item = json_output::JsonItem::from_list_item(
@@ -992,7 +989,7 @@ fn run_json() -> Result<()> {
             ci_provider_override.as_deref(),
             &[],
         );
-        list::print_json(&[json_item])
+        print_json(&[json_item])
     }
 }
 
@@ -1042,7 +1039,7 @@ fn git_status_segments(worktree: &WorkingTree) -> Result<Vec<StatuslineSegment>>
     // If we can't determine the default branch, just show current branch
     if repo.default_branch().is_none() {
         return Ok(vec![StatuslineSegment::from_column(
-            item.branch.as_deref().unwrap_or("HEAD").to_string(),
+            item.branch().unwrap_or("HEAD").to_string(),
             ColumnKind::Branch,
         )]);
     }

@@ -8,6 +8,7 @@ pub use worktrunk::testing::mock_commands;
 pub use worktrunk::testing::*;
 
 pub mod list_snapshots;
+pub mod source_scan;
 // Progressive output tests use PTY and are Unix-only for now
 #[cfg(unix)]
 pub mod progressive_output;
@@ -150,7 +151,7 @@ pub fn repo() -> TestRepo {
 /// ```
 #[rstest::fixture]
 pub fn temp_home() -> TempDir {
-    TempDir::new().unwrap()
+    test_tempdir()
 }
 
 /// Canonicalize a `temp_home` for use as a base when building paths that
@@ -414,7 +415,11 @@ pub fn open_pty_with_size(rows: u16, cols: u16) -> portable_pty::PtyPair {
 ///    the Windows equivalents)
 /// 3. Applies the `STATIC_TEST_ENV_VARS` and `PTY_TEST_ENV_VARS` determinism
 ///    baselines
-/// 4. Passes through LLVM coverage profiling vars so subprocess coverage works
+/// 4. Applies the hermetic git floor (`HERMETIC_TEST_GIT_ENV`) — a PTY child
+///    never passes through the `Cmd` latch, and `HOME` here is the real one,
+///    so without the floor every git a PTY script runs would resolve the
+///    developer's `~/.gitconfig`
+/// 5. Passes through LLVM coverage profiling vars so subprocess coverage works
 ///
 /// It supplies no fixture paths, having no fixture to read them from; a caller
 /// with one adds `TestRepo::test_env_vars()` on top, which carries the
@@ -435,6 +440,14 @@ pub fn configure_pty_command(cmd: &mut portable_pty::CommandBuilder) {
         "WORKTRUNK_TEST_EPOCH",
         worktrunk::testing::TEST_EPOCH.to_string(),
     );
+
+    // The hermetic git floor, by hand: a PTY child is `env_clear`ed and never
+    // passes through the `Cmd` latch, and HOME below is the developer's real
+    // one — without the floor, every git a PTY script runs would resolve the
+    // real `~/.gitconfig`.
+    for (key, value) in worktrunk::shell_exec::HERMETIC_TEST_GIT_ENV {
+        cmd.env(key, value);
+    }
 
     // Minimal environment for shells/binaries to function
     let home_dir = home::home_dir().unwrap().to_string_lossy().to_string();
@@ -481,6 +494,16 @@ pub fn configure_pty_command(cmd: &mut portable_pty::CommandBuilder) {
     // Pass through LLVM coverage profiling environment for subprocess coverage.
     // Without this, spawned binaries can't write coverage data.
     pass_coverage_env_to_pty_cmd(cmd);
+}
+
+/// Build a minimal PATH that keeps the test process's Git while excluding
+/// user-installed tools such as `wt`, `claude`, and `codex`.
+#[cfg(unix)]
+pub fn setup_minimal_path_with_git(bin_dir: &Path) -> String {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let git = which::which("git").expect("git must be installed to run tests");
+    std::os::unix::fs::symlink(git, bin_dir.join("git")).unwrap();
+    format!("{}:/usr/bin:/bin", bin_dir.display())
 }
 
 /// Pass through LLVM coverage profiling environment to a portable_pty::CommandBuilder.
@@ -569,7 +592,6 @@ pub fn shell_command(
 /// These redact volatile metadata captured by insta-cmd in the `info` block.
 /// Called by all snapshot settings helpers for consistency.
 pub fn add_standard_env_redactions(settings: &mut insta::Settings) {
-    settings.add_redaction(".env.GIT_CONFIG_GLOBAL", "[TEST_GIT_CONFIG]");
     settings.add_redaction(".env.WORKTRUNK_CONFIG_PATH", "[TEST_CONFIG]");
     settings.add_redaction(".env.WORKTRUNK_SYSTEM_CONFIG_PATH", "[TEST_SYSTEM_CONFIG]");
     settings.add_redaction(
@@ -825,10 +847,6 @@ fn add_temp_path_placeholder_filters(settings: &mut insta::Settings) {
         &format!(r"{TEST_PATH_PREFIX}test-approvals\.toml'?"),
         "[TEST_APPROVALS]",
     );
-    settings.add_filter(
-        r"(?:[A-Z]:)?/[^\s]+/\.tmp[^/]+/test-gitconfig",
-        "[TEST_GIT_CONFIG]",
-    );
 }
 
 /// Strip ANSI codes immediately wrapping a path-redaction placeholder so a
@@ -844,7 +862,7 @@ fn add_temp_path_placeholder_filters(settings: &mut insta::Settings) {
 /// they must consume ANSI inline via [`add_path_placeholder_filter`].
 fn add_placeholder_ansi_strip_filter(settings: &mut insta::Settings) {
     settings.add_filter(
-        r"(?:\x1b\[\d+m)+(\[(?:TEST_(?:CONFIG(?:_NEW)?|APPROVALS|GIT_CONFIG)|PROJECT_ID|TEMP(?:_HOME)?)\])(?:\x1b\[\d+m)+",
+        r"(?:\x1b\[\d+m)+(\[(?:TEST_(?:CONFIG(?:_NEW)?|APPROVALS)|PROJECT_ID|TEMP(?:_HOME)?)\])(?:\x1b\[\d+m)+",
         "$1",
     );
 }
@@ -924,38 +942,38 @@ fn add_temp_home_filters(settings: &mut insta::Settings, temp_home: &Path) {
     );
 }
 
-/// Catch tempfile::tempdir() paths under non-standard OS temp directories.
+/// Catch temp paths under whichever roots the suite actually creates them in.
 ///
-/// `add_project_id_filters` has hardcoded patterns for standard temp locations
-/// (/tmp, /var/folders, C:/Users/.../AppData/Local/Temp). CI may use a different
-/// TEMP (e.g., D:\tmp for faster I/O on Windows). This filter uses the runtime
-/// temp directory to catch those paths.
+/// Two roots are live: the fixtures use [`test_temp_root`], and a test that
+/// reaches for `tempfile` directly lands in the OS temp dir — which CI may
+/// point somewhere non-standard (e.g. D:\tmp for faster I/O on Windows).
+/// Deriving both at runtime covers them without another hardcoded platform
+/// path; `add_project_id_filters` keeps the hardcoded set for paths that
+/// arrive from a subprocess whose temp dir isn't ours.
 fn add_os_temp_dir_filter(settings: &mut insta::Settings) {
-    let temp_dir = std::env::temp_dir();
-    let temp_dir_str = temp_dir.to_string_lossy().replace('\\', "/");
-    let temp_dir_str = temp_dir_str.trim_end_matches('/');
+    for root in [std::env::temp_dir(), test_temp_root().to_path_buf()] {
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        let root_str = root_str.trim_end_matches('/').to_string();
 
-    let canonical = canonicalize(&temp_dir).unwrap_or_else(|_| temp_dir.clone());
-    let canonical_str = canonical.to_string_lossy().replace('\\', "/");
-    let canonical_str = canonical_str.trim_end_matches('/');
+        let canonical = canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let canonical_str = canonical.to_string_lossy().replace('\\', "/");
+        let canonical_str = canonical_str.trim_end_matches('/').to_string();
 
-    // Canonical (longer) path first so it matches before the shorter one
-    // (e.g., /private/var/folders/... before /var/folders/... on macOS).
-    settings.add_filter(
-        &format!(
-            r"'?{}/\.tmp[^/']+/[^)'\s\x1b]+'?",
-            regex::escape(canonical_str)
-        ),
-        "[PROJECT_ID]",
-    );
-    if canonical_str != temp_dir_str {
+        // Canonical (longer) path first so it matches before the shorter one
+        // (e.g., /private/var/folders/... before /var/folders/... on macOS).
         settings.add_filter(
             &format!(
                 r"'?{}/\.tmp[^/']+/[^)'\s\x1b]+'?",
-                regex::escape(temp_dir_str)
+                regex::escape(&canonical_str)
             ),
             "[PROJECT_ID]",
         );
+        if canonical_str != root_str {
+            settings.add_filter(
+                &format!(r"'?{}/\.tmp[^/']+/[^)'\s\x1b]+'?", regex::escape(&root_str)),
+                "[PROJECT_ID]",
+            );
+        }
     }
 }
 
@@ -1121,8 +1139,14 @@ fn setup_snapshot_settings_for_paths_with_home(
     // debug builds and crane/release builds (notably the nightly nix-flake
     // sandbox). The pattern is anchored on `/target/.../wt` so it matches
     // the bin path in "Invoked as:" / "Binary invoked as:" / diagnostic
-    // hint output without touching unrelated `target/` paths.
-    settings.add_filter(r"/target/(debug|release)/wt", "/target/[BUILD_MODE]/wt");
+    // hint output without touching unrelated `target/` paths. The optional
+    // segment collapses the pinned spawn path (`testing::pin_test_binary`'s
+    // `wt-test-bin/<mtime>-<len>/wt`), whose key would otherwise leak a
+    // build-specific value into snapshots.
+    settings.add_filter(
+        r"/target/(?:debug|release)/(?:wt-test-bin/[0-9a-f]+-[0-9a-f]+/)?wt",
+        "/target/[BUILD_MODE]/wt",
+    );
 
     // Normalize shell probe binary paths
     // Shell probe reports the actual binary location which varies by system
@@ -1262,9 +1286,9 @@ pub fn setup_temp_snapshot_settings(temp_path: &std::path::Path) -> insta::Setti
 /// total is sensitive to the temp-dir prefix (macOS `/var/folders/...` vs
 /// Linux `/tmp/...` vs Windows). The literal `(...files · X UNIT)` shape is
 /// unique enough to leave the deterministic copy-ignored summary
-/// (`Copied N files · X B` — no surrounding parens) untouched, so the regex
-/// doesn't depend on ANSI styling and works in both colored and `NO_COLOR`
-/// test environments.
+/// (`Copied N files · X B`, whose own parenthetical carries the reflink split
+/// rather than a byte count) untouched, so the regex doesn't depend on ANSI
+/// styling and works in both colored and `NO_COLOR` test environments.
 fn add_remove_stats_byte_filter(settings: &mut insta::Settings) {
     settings.add_filter(
         r"(\(\d+ files? · )\d+(?:\.\d+)? (B|KiB|MiB|GiB|TiB)",
@@ -1301,6 +1325,31 @@ pub fn add_pty_filters(settings: &mut insta::Settings) {
     // macOS PTYs emit ^D (literal caret-D) followed by backspaces (0x08)
     // when EOF is signaled. Linux PTYs don't. Strip these for consistency.
     settings.add_filter(r"\^D\x08+", "");
+
+    // An interactive shell puts each child it forks into its own process
+    // group, and reports a failed `setpgid` on its own stderr:
+    //
+    //     bash: child setpgid (42242 to 42242): Operation not permitted
+    //
+    // Whether that call loses its race with the child's own `setpgid`/exec is
+    // up to host scheduling, so the line appears in a handful of runs and in
+    // none of the others (observed once on macOS CI, actions/runs/35065804093).
+    // It is the shell describing its own job-control bookkeeping, not anything
+    // `wt` wrote, and the bash arm of the wrapper harness folds stderr into
+    // stdout (`exec 2>&1`) so that leaked job-control *notifications* are
+    // visible to tests — those stay visible, since `assert_no_job_control_messages`
+    // matches the `[1] 12345` / `[1]+ Done` shape this filter does not touch.
+    //
+    // The shell writes the line whenever the race resolves, so it need not
+    // start a line: it has also landed straight after the capture's trailing
+    // `\x1b[0m`, with no newline between (macOS CI, actions/runs/35132033122).
+    // The pattern therefore starts at a line start or right after an SGR
+    // escape, and keeps the escape. A bare unanchored `\w+` would instead eat
+    // the tail of whatever word preceded the shell's name.
+    settings.add_filter(
+        r"(?m)(^|\x1b\[[0-9;]*m)\w+: child setpgid \(\d+ to \d+\): [^\n]*\n?",
+        "$1",
+    );
 }
 
 /// Add filters for binary paths (target/debug/wt) in PTY output.
@@ -1315,9 +1364,11 @@ pub fn add_pty_binary_path_filters(settings: &mut insta::Settings) {
     //
     // Include the literal `[BUILD_MODE]` placeholder so this filter still
     // collapses to `[BIN]` when the prelude's `target/(debug|release)/wt`
-    // → `target/[BUILD_MODE]/wt` rewrite has already run.
+    // → `target/[BUILD_MODE]/wt` rewrite has already run. The optional
+    // segment covers the pinned spawn path (`testing::pin_test_binary`'s
+    // `wt-test-bin/<mtime>-<len>/wt`).
     settings.add_filter(
-        r"[^\s]+/target/(?:[^/\s]+/)*(?:debug|release|\[BUILD_MODE\])/wt",
+        r"[^\s]+/target/(?:[^/\s]+/)*(?:debug|release|\[BUILD_MODE\])/(?:wt-test-bin/[0-9a-f]+-[0-9a-f]+/)?wt",
         "[BIN]",
     );
 }
@@ -1326,11 +1377,172 @@ pub fn add_pty_binary_path_filters(settings: &mut insta::Settings) {
 // Tests
 // =============================================================================
 
+/// PTY capture carrying a shell's failed-`setpgid` diagnostic alongside the
+/// job-control notifications the wrapper tests assert on — once at a line
+/// start, and once appended to the capture's trailing SGR reset.
+#[cfg(test)]
+const SETPGID_NOISE_SAMPLE: &str = "bash: child setpgid (42242 to 42242): Operation not permitted
+[1] 42243
+Switched to worktree for feature-api
+[1]+ Done                    wt hook post-start
+\x1b[0mbash: child setpgid (64019 to 64019): Operation not permitted
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use insta::assert_snapshot;
     use rstest::rstest;
+
+    /// A shell's own failed-`setpgid` diagnostic is host scheduling noise that
+    /// lands in the middle of a PTY snapshot, while the job-control
+    /// *notifications* the wrapper tests watch for must survive the filters.
+    #[test]
+    fn pty_filters_drop_the_setpgid_diagnostic_but_keep_job_control_notices() {
+        let mut settings = insta::Settings::clone_current();
+        add_pty_filters(&mut settings);
+        // Runs after the PTY filters, so it shows the reset they must keep.
+        settings.add_filter(r"\x1b\[0m", "[RESET]");
+        settings.bind(|| {
+            assert_snapshot!(SETPGID_NOISE_SAMPLE, @r"
+            [1] 42243
+            Switched to worktree for feature-api
+            [1]+ Done                    wt hook post-start
+            [RESET]
+            ");
+        });
+    }
+
+    /// The uplifted `target/debug/wt` is removed and recreated by any
+    /// concurrent `cargo build`, so the suite spawns a pinned hardlink
+    /// instead (`testing::pin_test_binary`). The pin must keep serving the
+    /// observed binary through that unlink, converge across processes
+    /// observing the same binary, and track a rebuild as a new entry.
+    #[test]
+    fn pin_test_binary_tracks_generations_and_survives_unlink() {
+        let dir = worktrunk::testing::test_tempdir();
+        let src = dir.path().join("wt");
+        std::fs::write(&src, "generation A").unwrap();
+
+        let pinned_a = worktrunk::testing::pin_test_binary(&src);
+        assert_ne!(pinned_a, src);
+        assert_eq!(worktrunk::testing::pin_test_binary(&src), pinned_a);
+
+        // The uplift: the observed path vanishes; the pin doesn't.
+        std::fs::remove_file(&src).unwrap();
+        assert_eq!(std::fs::read(&pinned_a).unwrap(), b"generation A");
+
+        // A rebuilt binary (the lengths differ, so the key differs whatever
+        // the filesystem's mtime granularity) pins beside the old entry,
+        // which keeps serving processes that observed the old binary.
+        std::fs::write(&src, "generation B, rebuilt").unwrap();
+        let pinned_b = worktrunk::testing::pin_test_binary(&src);
+        assert_ne!(pinned_b, pinned_a);
+        assert_eq!(std::fs::read(&pinned_b).unwrap(), b"generation B, rebuilt");
+        assert_eq!(std::fs::read(&pinned_a).unwrap(), b"generation A");
+    }
+
+    /// The uplift window itself: a pin attempt landing while the binary is
+    /// momentarily absent polls until it reappears rather than failing the
+    /// spawn — the exact `NotFound` gap a concurrent cargo opens.
+    #[test]
+    fn pin_test_binary_rides_out_the_uplift_window() {
+        let dir = worktrunk::testing::test_tempdir();
+        let src = dir.path().join("wt");
+        let writer = {
+            let src = src.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::fs::write(&src, "late binary").unwrap();
+            })
+        };
+        let pinned = worktrunk::testing::pin_test_binary(&src);
+        writer.join().unwrap();
+        assert_eq!(std::fs::read(&pinned).unwrap(), b"late binary");
+    }
+
+    /// A non-transient error (here `ENOTDIR`: a path component is a file)
+    /// surfaces immediately rather than being retried as an uplift window.
+    /// Unix-only: Windows reports this shape as `NotFound`, which correctly
+    /// takes the retry path there.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "failed to pin test binary")]
+    fn pin_test_binary_surfaces_non_transient_errors() {
+        let dir = worktrunk::testing::test_tempdir();
+        let file = dir.path().join("wt");
+        std::fs::write(&file, "not a directory").unwrap();
+        let _ = worktrunk::testing::pin_test_binary(&file.join("child"));
+    }
+
+    /// `wt_bin()` pins the binary against concurrent-build uplifts. A spawn
+    /// naming the `CARGO_BIN_EXE_wt` path directly bypasses the pin and can
+    /// hit the uplift's `NotFound` window, so the variable has exactly one
+    /// reader: `wt_bin()` itself.
+    #[test]
+    fn test_wt_spawns_are_pinned() {
+        // Built from parts so this file doesn't match its own needle.
+        let needle = ["CARGO_BIN_EXE_", "wt\""].concat();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        // Counted per root rather than in aggregate: the sole offender lives
+        // under `src`, so the equality below is satisfied by that root alone
+        // and would pass unchanged if `tests` or `benches` stopped yielding
+        // `.rs` files — the absence claim silently narrowing to one third of
+        // what it names. See "Guards that scan source text" in
+        // `tests/CLAUDE.md`.
+        for dir in ["src", "tests", "benches"] {
+            let seen = scan_for_needle(&root.join(dir), &needle, root, &mut offenders);
+            assert!(
+                seen > 0,
+                "{dir}/ holds no .rs files — this guard asserts absence, so it \
+                 would now be passing over nothing there"
+            );
+        }
+        assert_eq!(
+            offenders,
+            vec![PathBuf::from("src/testing/mod.rs")],
+            "spawn wt via wt_bin() (or a helper that does), never via \
+             CARGO_BIN_EXE_wt directly — the uplifted path can vanish under \
+             a concurrent cargo build"
+        );
+    }
+
+    /// Collect files under `dir` containing `needle`, returning how many `.rs`
+    /// files were read. `#[must_use]` for the same reason `visit_files` is:
+    /// the caller asserts absence, so it has to answer for coverage.
+    #[must_use]
+    fn scan_for_needle(
+        dir: &Path,
+        needle: &str,
+        root: &Path,
+        offenders: &mut Vec<PathBuf>,
+    ) -> usize {
+        super::source_scan::visit_files(dir, "rs", "spawn-pin scan", &mut |path, contents| {
+            if contents.contains(needle) {
+                offenders.push(path.strip_prefix(root).unwrap().to_path_buf());
+            }
+        })
+    }
+
+    /// Every PTY spawn routes through [`configure_pty_command`] (directly or
+    /// via `shell_command` / `build_pty_command`), and it is the only floor
+    /// the shell-wrapper suite gets: those call sites layer fixture paths and
+    /// an identity on top, never `pty_env_vars`. `useConfigOnly` fires only
+    /// where an identity is missing, so no wrapper assertion would notice the
+    /// floor going missing — this pins it instead.
+    #[test]
+    fn configure_pty_command_carries_the_git_config_floor() {
+        let mut cmd = portable_pty::CommandBuilder::new("true");
+        configure_pty_command(&mut cmd);
+        for (key, value) in worktrunk::shell_exec::HERMETIC_TEST_GIT_ENV {
+            assert_eq!(
+                cmd.get_env(key),
+                Some(std::ffi::OsStr::new(value)),
+                "{key} missing from configure_pty_command"
+            );
+        }
+    }
 
     #[rstest]
     fn test_commit_with_age(repo: TestRepo) {

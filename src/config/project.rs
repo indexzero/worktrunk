@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
 use super::commands::CommandConfig;
 use super::is_default;
+use super::{ConfigError, LoadError};
 use super::{CopyIgnoredConfig, HooksConfig, StepConfig};
 
 /// Project-level configuration for `wt list` output.
@@ -59,8 +59,7 @@ pub struct ProjectCiConfig {
     pub platform: Option<String>,
 }
 
-/// Project-level commit message configuration. *(Experimental — fields may
-/// change in future releases.)*
+/// Project-level commit message configuration.
 ///
 /// Only fields appropriate as shared, checked-in settings live here. The LLM
 /// command and full prompt template stay in user/system config — they
@@ -94,9 +93,9 @@ pub struct ProjectCommitGenerationConfig {
 
 /// Project-level forge configuration.
 ///
-/// Names the forge explicitly, for repos where URL-based detection can't
-/// determine it (e.g., SSH host aliases, GitHub Enterprise, or self-hosted
-/// GitLab with custom domains).
+/// Names the forge explicitly, for a remote whose hostname carries no forge
+/// name for [`ForgeKind::from_host`](crate::git::ForgeKind::from_host) to read
+/// (a Forgejo instance at `forge.example.com`, a company git server).
 ///
 /// # Example
 ///
@@ -133,19 +132,12 @@ impl ProjectListConfig {
 }
 
 impl ProjectConfig {
-    /// The CI platform set in `[ci]`, if any.
-    ///
-    /// Deprecated: use [`forge_platform()`](Self::forge_platform) instead.
-    pub fn ci_platform(&self) -> Option<&str> {
-        self.ci.platform.as_deref()
-    }
-
     /// The configured forge platform, checking `[forge]` first then `[ci]`.
     pub fn forge_platform(&self) -> Option<&str> {
         self.forge
             .platform
             .as_deref()
-            .or_else(|| self.ci_platform())
+            .or(self.ci.platform.as_deref())
     }
 
     /// Get the forge API hostname if configured.
@@ -175,11 +167,32 @@ impl ProjectConfig {
     }
 }
 
+/// Where a loaded [`ProjectConfig`] came from.
+///
+/// Attribution only — every source passes through the same approval gate
+/// ("Project Commands Run Only After Approval" in `CLAUDE.md`). Even
+/// `.git/config` content can originate remotely via an `include`/`includeIf`
+/// of a file from a cloned dotfiles repo, so no source is exempt. The enum
+/// exists so `wt config show` and `wt hook show` can name the active source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectConfigSource {
+    /// `.config/wt.toml` on disk (or the committed object-store fallback).
+    #[default]
+    File,
+    /// `worktrunk.config.*` keys read from git config (experimental, #3454).
+    GitConfig,
+}
+
 /// Project-specific configuration with hooks.
 ///
 /// This config is stored at `<repo>/.config/wt.toml` within the repository and
 /// IS checked into git. It defines project-specific hooks that run automatically
 /// during worktree operations. All developers working on the project share this config.
+///
+/// Alternatively (experimental), the same schema can be supplied privately via
+/// `worktrunk.config.*` keys in git config — see `src/config/git_source.rs`.
+/// When any such key exists, that source replaces the file entirely. Commands
+/// from either source pass through the same approval gate.
 ///
 /// # Template Variables
 ///
@@ -244,6 +257,13 @@ pub struct ProjectConfig {
     /// ```
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, CommandConfig>,
+
+    /// Provenance of this config — not part of the TOML schema. Set to
+    /// [`ProjectConfigSource::GitConfig`] only by the git-config branch of
+    /// [`ProjectConfig::load`]; deserialization defaults it to `File`.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub source: ProjectConfigSource,
 }
 
 impl ProjectConfig {
@@ -251,10 +271,28 @@ impl ProjectConfig {
     ///
     /// Set `write_hints` to true for normal usage. Set to false during completion
     /// to avoid side effects (writing git config hints).
-    pub fn load(
-        repo: &crate::git::Repository,
-        write_hints: bool,
-    ) -> Result<Option<Self>, ConfigError> {
+    ///
+    /// A parse failure surfaces as `LoadError::File` — the same typed error
+    /// the user-config layer collects — so both configs render through one
+    /// diagnostic path, and a caller that tolerates a broken file (`wt list`,
+    /// via [`crate::git::Repository::warn_if_project_config_unloadable`]) can
+    /// split the file it names from the parser's complaint.
+    pub fn load(repo: &crate::git::Repository, write_hints: bool) -> anyhow::Result<Option<Self>> {
+        // Experimental git-config source (#3454): when any `worktrunk.config.*`
+        // key exists in the merged effective git config, that source is the
+        // complete project config and the file is not read (all-or-nothing —
+        // see `src/config/git_source.rs`). A parse failure is a hard error;
+        // falling back to the file would silently change which config runs.
+        let git_pairs = repo
+            .worktrunk_config_git_pairs()
+            .map_err(|e| ConfigError(format!("Failed to read git config: {e}")))?;
+        if !git_pairs.is_empty() {
+            super::git_source::warn_superseded_project_file(repo);
+            return Ok(Some(super::git_source::project_config_from_git(
+                &git_pairs,
+            )?));
+        }
+
         let (contents, config_path) = match repo
             .project_config_path()
             .map_err(|e| ConfigError(format!("Failed to get config path: {}", e)))?
@@ -262,8 +300,12 @@ impl ProjectConfig {
             Some(path) if path.exists() => {
                 // Load directly with toml crate to preserve insertion order
                 // (with preserve_order feature).
-                let contents = std::fs::read_to_string(&path)
-                    .map_err(|e| ConfigError(format!("Failed to read config file: {}", e)))?;
+                let contents = std::fs::read_to_string(&path).map_err(|e| {
+                    ConfigError(format!(
+                        "Failed to read {}: {e}",
+                        crate::path::format_path_for_display(&path)
+                    ))
+                })?;
                 (contents, path)
             }
             // No config resolved on disk. In a bare layout with the default
@@ -278,8 +320,8 @@ impl ProjectConfig {
             },
         };
 
-        // Check for deprecated template variables and create migration file if needed
-        // Only write migration file in main worktree, not linked worktrees
+        // Check for deprecated patterns. They are actionable only from the main
+        // worktree, where `wt config update` rewrites the file.
         // emit_inline_warnings=true: print per-kind warnings inline during config load
         let is_main_worktree = !repo.current_worktree().is_linked().unwrap_or(true);
         let repo_for_hints = if write_hints { Some(repo) } else { None };
@@ -294,25 +336,29 @@ impl ProjectConfig {
         .map_err(|e| ConfigError(e.to_string()))?
         .migrated_content;
 
-        // Warn about unknown fields (only in main worktree where it's actionable).
+        // Warn about unknown fields, from every worktree. Unlike the
+        // deprecation channel above — whose message points at `wt config
+        // update`, which needs the primary worktree — this one just reports
+        // that a key is being ignored, and its fix (edit the tracked file, or
+        // move the key to user config) is available from any worktree. Gating
+        // it on the primary hid it from the commands the keys govern: `wt
+        // merge` runs from the feature worktree, so a project `[merge]`
+        // section was silently dropped with nothing said (#4144).
+        //
         // Runs on the raw contents so deprecated keys are detected as written;
         // `DEPRECATED_SECTION_KEYS` defers them to the deprecation messaging.
-        if is_main_worktree {
-            super::deprecation::warn_unknown_fields::<ProjectConfig>(
-                &contents,
-                &config_path,
-                super::ConfigFileKind::Project,
-            );
-        }
+        super::deprecation::warn_unknown_fields::<ProjectConfig>(
+            &contents,
+            &config_path,
+            super::ConfigFileKind::Project,
+        );
 
         // Deserialize the structurally migrated content so deprecated keys
         // (e.g. `pre-start`/`post-start`) still load into their canonical fields.
-        let config: ProjectConfig = toml::from_str(&migrated).map_err(|e| {
-            ConfigError(format!(
-                "{} at {} failed to parse:\n{e}",
-                super::ConfigFileKind::Project.label(),
-                crate::path::format_path_for_display(&config_path),
-            ))
+        let config: ProjectConfig = toml::from_str(&migrated).map_err(|e| LoadError::File {
+            path: config_path,
+            kind: super::ConfigFileKind::Project,
+            err: Box::new(e),
         })?;
 
         Ok(Some(config))
@@ -488,8 +534,7 @@ platform = "github"
         let config: ProjectConfig = toml::from_str(contents).unwrap();
         // forge.platform takes precedence
         assert_eq!(config.forge_platform(), Some("github"));
-        // ci.platform still accessible directly
-        assert_eq!(config.ci_platform(), Some("gitlab"));
+        assert_eq!(config.ci.platform.as_deref(), Some("gitlab"));
     }
 
     #[test]

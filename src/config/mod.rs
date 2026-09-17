@@ -8,8 +8,11 @@
 //! 3. **Project config** (`.config/wt.toml`) - Lifecycle hooks, checked into git
 //!
 //! System and user configs share the same schema and are merged via
-//! `deep_merge_table` (user values override system values at the key level).
-//! Project config is independent — different schema, different purpose.
+//! `merge_layer`, which ranks each layer above the one beneath it as a whole:
+//! a user value overrides the system value for the same key, and a user global
+//! key also outranks a system `[projects."…"]` entry that would otherwise be
+//! the more specific match. Project config is independent — different schema,
+//! different purpose.
 //!
 //! See `wt config --help` for complete documentation.
 
@@ -17,6 +20,7 @@ pub mod approvals;
 mod commands;
 pub(crate) mod deprecation;
 mod expansion;
+mod git_source;
 mod hooks;
 mod project;
 #[cfg(test)]
@@ -111,16 +115,32 @@ pub(crate) fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 /// `#[serde(rename = ...)]`; adding the aliases here keeps the unknown-key
 /// round-trip from flagging an accepted name as unknown.
 pub(crate) fn schema_top_level_keys<T: schemars::JsonSchema>() -> Vec<String> {
-    let schema = schemars::SchemaGenerator::default().into_root_schema_for::<T>();
-    let mut keys: Vec<String> = schema
+    let mut keys = schema_property_names::<T>();
+    keys.push("pre-create".to_string());
+    keys.push("post-create".to_string());
+    keys
+}
+
+/// The field names `T`'s schema declares, with `#[serde(rename = "…")]`
+/// applied.
+///
+/// `#[serde(alias = "…")]` is invisible here — schemars only sees canonical
+/// names — so a caller that needs every key serde *accepts* must add the
+/// aliases itself, as [`schema_top_level_keys`] does for
+/// `pre-create`/`post-create`.
+///
+/// [`schema_top_level_keys`] builds on this for whole-config types; the
+/// deprecation layer uses it for *section* types, to tell which keys a
+/// deprecated section can carry into its replacement (see
+/// `drop_unsupported_keys` in `deprecation.rs`).
+pub(crate) fn schema_property_names<T: schemars::JsonSchema>() -> Vec<String> {
+    schemars::SchemaGenerator::default()
+        .into_root_schema_for::<T>()
         .as_object()
         .and_then(|obj| obj.get("properties"))
         .and_then(|p| p.as_object())
         .map(|props| props.keys().cloned().collect())
-        .unwrap_or_default();
-    keys.push("pre-create".to_string());
-    keys.push("post-create".to_string());
-    keys
+        .unwrap_or_default()
 }
 
 /// Whether `key` is a top-level field of a `[projects."<id>"]` table (the
@@ -136,6 +156,22 @@ pub fn is_user_project_override_key(key: &str) -> bool {
         .any(|k| k == key)
 }
 
+/// Refuse to write a config file that is not valid TOML.
+///
+/// wt can't load such a file: every later command skips user config with a
+/// warning, and the commands that need project config fail, until the user
+/// hand-edits it. Both writers of a config file the user owns check the
+/// content they are about to write: the `UserConfig` mutations and
+/// `wt config update`. Neither starts from invalid TOML, so this fires only when
+/// the edit itself broke the syntax, and the file on disk stays as it was.
+pub fn ensure_config_parses(content: &str) -> Result<(), ConfigError> {
+    content.parse::<toml::Table>().map(|_| ()).map_err(|e| {
+        ConfigError(format!(
+            "Refusing to write a config file wt could not read back: {e}"
+        ))
+    })
+}
+
 // Re-export public types
 pub use approvals::{Approvals, approvals_path, require_approvals_path};
 pub use commands::{Command, CommandConfig, HookStep, append_aliases};
@@ -145,10 +181,9 @@ pub use deprecation::DeprecationInfo;
 pub use deprecation::check_and_migrate;
 pub use deprecation::compute_migrated_content;
 pub use deprecation::copy_approved_commands_to_approvals_file;
-pub use deprecation::detect_deprecations;
 pub use deprecation::format_deprecation_details;
 pub use deprecation::format_deprecation_warnings;
-pub use deprecation::format_migration_diff;
+pub use deprecation::format_migration_diff_block;
 pub use deprecation::migrate_content;
 pub use deprecation::normalize_template_vars;
 pub use deprecation::suppress_warnings;
@@ -160,23 +195,27 @@ pub use deprecation::{
 };
 pub use deprecation::{DeprecationKind, Deprecations};
 pub use expansion::{
-    ACTIVE_VARS, ALIAS_ARGS_KEY, DEPRECATED_TEMPLATE_VARS, EXEC_BASE_VARS, REPO_VARS,
-    TemplateContext, TemplateExpandError, ValidationScope, VarScope, VarsMode,
-    alias_context_filter, base_vars, expand_template, format_alias_variables,
-    format_base_variables, format_hook_variables, redact_credentials, referenced_vars_for_config,
-    referenced_vars_for_templates, sanitize_branch_name, sanitize_db, short_hash,
-    template_environment, template_references_var, validate_list_column_template,
+    ACTIVE_VARS, ALIAS_ARGS_KEY, EXEC_BASE_VARS, REPO_VARS, TemplateContext, TemplateExpandError,
+    ValidationScope, VarScope, VarsMode, alias_context_filter, base_vars, expand_template,
+    format_alias_variables, format_base_variables, format_hook_variables, redact_credentials,
+    referenced_vars_for_config, referenced_vars_for_templates, sanitize_branch_name, sanitize_db,
+    short_hash, template_environment, template_references_var, validate_list_column_template,
     validate_template, validate_template_syntax, vars_available_in, vars_map_to_value,
+};
+pub use git_source::{
+    GIT_CONFIG_LIST_COMMAND, GIT_CONFIG_PREFIX, GIT_CONFIG_SOURCE_LABEL, redact_worktrunk_config_z,
+    render_git_source_toml, superseded_project_file_label,
 };
 pub use hooks::HooksConfig;
 pub use project::{
     ProjectCiConfig, ProjectCommitConfig, ProjectCommitGenerationConfig, ProjectConfig,
-    ProjectListConfig, valid_project_config_keys,
+    ProjectConfigSource, ProjectForgeConfig, ProjectListConfig, valid_project_config_keys,
 };
 pub use unknown_tree::{
-    UnknownAnalysis, UnknownTree, UnknownWarning, collect_unknown_warnings, compute_unknown_tree,
+    UnknownTree, UnknownWarning, collect_unknown_warnings, compute_unknown_tree,
 };
-pub(crate) use user::LoadError;
+pub use user::LoadError;
+pub(crate) use user::project_match::matching_keys as matching_project_keys;
 pub use user::{
     CommitConfig, CommitGenerationConfig, CopyIgnoredConfig, ListColumnConfig, ListConfig,
     MergeConfig, RemoveConfig, ResolvedConfig, StageMode, StepConfig, SwitchConfig,
@@ -195,6 +234,16 @@ mod tests {
 
     fn test_repo() -> TestRepo {
         TestRepo::new()
+    }
+
+    #[test]
+    fn test_ensure_config_parses_rejects_a_header_holding_the_key_decor() {
+        // The shape an inline-to-table rewrite once wrote: the key's leading
+        // comment rendered inside the brackets.
+        let err =
+            ensure_config_parses("[# why squash is off\nmerge ]\nsquash = true\n").unwrap_err();
+        assert!(err.0.contains("could not read back"), "{}", err.0);
+        ensure_config_parses("# why squash is off\n[merge]\nsquash = true\n").unwrap();
     }
 
     #[test]
@@ -230,7 +279,7 @@ mod tests {
     fn test_format_worktree_path() {
         let test = test_repo();
         let config = UserConfig {
-            worktree_path: Some("{{ main_worktree }}.{{ branch }}".to_string()),
+            worktree_path: Some("{{ repo }}.{{ branch }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -245,7 +294,7 @@ mod tests {
     fn test_format_worktree_path_custom_template() {
         let test = test_repo();
         let config = UserConfig {
-            worktree_path: Some("{{ main_worktree }}-{{ branch }}".to_string()),
+            worktree_path: Some("{{ repo }}-{{ branch }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -260,7 +309,7 @@ mod tests {
     fn test_format_worktree_path_only_branch() {
         let test = test_repo();
         let config = UserConfig {
-            worktree_path: Some(".worktrees/{{ main_worktree }}/{{ branch }}".to_string()),
+            worktree_path: Some(".worktrees/{{ repo }}/{{ branch }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -276,7 +325,7 @@ mod tests {
         let test = test_repo();
         // Use {{ branch | sanitize }} to replace slashes with dashes
         let config = UserConfig {
-            worktree_path: Some("{{ main_worktree }}.{{ branch | sanitize }}".to_string()),
+            worktree_path: Some("{{ repo }}.{{ branch | sanitize }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -291,9 +340,7 @@ mod tests {
     fn test_format_worktree_path_with_multiple_slashes() {
         let test = test_repo();
         let config = UserConfig {
-            worktree_path: Some(
-                ".worktrees/{{ main_worktree }}/{{ branch | sanitize }}".to_string(),
-            ),
+            worktree_path: Some(".worktrees/{{ repo }}/{{ branch | sanitize }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -309,9 +356,7 @@ mod tests {
         let test = test_repo();
         // Windows-style path separators should also be sanitized
         let config = UserConfig {
-            worktree_path: Some(
-                ".worktrees/{{ main_worktree }}/{{ branch | sanitize }}".to_string(),
-            ),
+            worktree_path: Some(".worktrees/{{ repo }}/{{ branch | sanitize }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -327,7 +372,7 @@ mod tests {
         let test = test_repo();
         // {{ branch }} without filter gives raw branch name
         let config = UserConfig {
-            worktree_path: Some("{{ main_worktree }}.{{ branch }}".to_string()),
+            worktree_path: Some("{{ repo }}.{{ branch }}".to_string()),
             ..Default::default()
         };
         assert_eq!(
@@ -501,10 +546,10 @@ task2 = "echo 'Task 2 running' > task2.txt"
 
         let test = test_repo();
         let mut vars = HashMap::new();
-        vars.insert("main_worktree", "myrepo");
+        vars.insert("repo", "myrepo");
         vars.insert("branch", "feature-x");
         let result = expand_template(
-            "../{{ main_worktree }}.{{ branch }}",
+            "../{{ repo }}.{{ branch }}",
             &vars,
             ShellEscapeMode::Posix,
             &test.repo,
@@ -523,10 +568,10 @@ task2 = "echo 'Task 2 running' > task2.txt"
         // Use {{ branch | sanitize }} filter for filesystem-safe paths
         // shell_escape=false to test filter in isolation (shell escaping tested separately)
         let mut vars = HashMap::new();
-        vars.insert("main_worktree", "myrepo");
+        vars.insert("repo", "myrepo");
         vars.insert("branch", "feature/foo");
         let result = expand_template(
-            "{{ main_worktree }}/{{ branch | sanitize }}",
+            "{{ repo }}/{{ branch | sanitize }}",
             &vars,
             ShellEscapeMode::Literal,
             &test.repo,
@@ -536,10 +581,10 @@ task2 = "echo 'Task 2 running' > task2.txt"
         assert_eq!(result, "myrepo/feature-foo");
 
         let mut vars = HashMap::new();
-        vars.insert("main_worktree", "myrepo");
+        vars.insert("repo", "myrepo");
         vars.insert("branch", r"feat\bar");
         let result = expand_template(
-            ".worktrees/{{ main_worktree }}/{{ branch | sanitize }}",
+            ".worktrees/{{ repo }}/{{ branch | sanitize }}",
             &vars,
             ShellEscapeMode::Literal,
             &test.repo,
@@ -554,11 +599,11 @@ task2 = "echo 'Task 2 running' > task2.txt"
         use std::collections::HashMap;
 
         let mut vars = HashMap::new();
-        vars.insert("worktree", "/path/to/worktree");
-        vars.insert("repo_root", "/path/to/repo");
+        vars.insert("worktree_path", "/path/to/worktree");
+        vars.insert("repo_path", "/path/to/repo");
 
         let result = expand_template(
-            "{{ repo_root }}/target -> {{ worktree }}/target",
+            "{{ repo_path }}/target -> {{ worktree_path }}/target",
             &vars,
             ShellEscapeMode::Posix,
             &test_repo().repo,
@@ -573,9 +618,7 @@ task2 = "echo 'Task 2 running' > task2.txt"
         let config = CommitGenerationConfig {
             command: Some("llm -m model".to_string()),
             template: Some("template content".to_string()),
-            template_file: None,
             squash_template: None,
-            squash_template_file: None,
             template_append: None,
         };
 
@@ -586,17 +629,11 @@ task2 = "echo 'Task 2 running' > task2.txt"
     }
 
     fn project_warn_tree(contents: &str) -> UnknownTree {
-        compute_unknown_tree::<ProjectConfig>(contents)
-            .warn_tree()
-            .cloned()
-            .unwrap()
+        compute_unknown_tree::<ProjectConfig>(contents).unwrap()
     }
 
     fn user_warn_tree(contents: &str) -> UnknownTree {
-        compute_unknown_tree::<UserConfig>(contents)
-            .warn_tree()
-            .cloned()
-            .unwrap()
+        compute_unknown_tree::<UserConfig>(contents).unwrap()
     }
 
     #[test]
@@ -642,22 +679,14 @@ task2 = "echo 'Task 2 running' > task2.txt"
     #[test]
     fn test_unknown_tree_invalid_toml() {
         let toml = "this is not valid toml {{{";
-        assert!(
-            compute_unknown_tree::<ProjectConfig>(toml)
-                .warn_tree()
-                .is_none()
-        );
-        assert!(
-            compute_unknown_tree::<UserConfig>(toml)
-                .warn_tree()
-                .is_none()
-        );
+        assert!(compute_unknown_tree::<ProjectConfig>(toml).is_none());
+        assert!(compute_unknown_tree::<UserConfig>(toml).is_none());
     }
 
     #[test]
     fn test_user_hooks_config_parsing() {
         let toml_str = r#"
-worktree-path = "../{{ main_worktree }}.{{ branch }}"
+worktree-path = "../{{ repo }}.{{ branch }}"
 
 [post-start]
 log = "echo '{{ repo }}' >> ~/.log"
@@ -688,7 +717,7 @@ lint = "cargo clippy"
     #[test]
     fn test_user_hooks_config_single_command() {
         let toml_str = r#"
-worktree-path = "../{{ main_worktree }}.{{ branch }}"
+worktree-path = "../{{ repo }}.{{ branch }}"
 post-start = "npm install"
 "#;
         let config: UserConfig = toml::from_str(toml_str).unwrap();

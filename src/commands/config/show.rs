@@ -9,13 +9,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use color_print::cformat;
+use serde::{Serialize, de::DeserializeOwned};
 use worktrunk::config::{
-    ProjectConfig, UserConfig, default_system_config_path, require_config_path, system_config_path,
+    LoadError, ProjectConfig, UserConfig, default_system_config_path, require_config_path,
+    system_config_path,
 };
 use worktrunk::git::remote_ref::azure::azure_devops_extension_installed;
-use worktrunk::git::{CiPlatform, ErrorExt, Repository};
+use worktrunk::git::{ErrorExt, ForgeKind, Repository, WorktrunkError};
 use worktrunk::path::format_path_for_display;
-use worktrunk::shell::{FileDetectionResult, Shell, scan_for_detection_details};
+use worktrunk::shell::{
+    FileDetectionResult, Shell, ZshStartupScope, probe_zsh_compdef, scan_for_detection_details,
+};
 use worktrunk::shell_exec::Cmd;
 use worktrunk::styling::{
     FormattedMessage, error_message, format_bash_with_gutter, format_heading, format_toml,
@@ -28,8 +32,9 @@ use crate::commands::list::ci_status::CiToolsStatus;
 use crate::help_pager::show_help_in_pager;
 use crate::llm::test_commit_generation;
 use crate::output;
+use crate::output::print_json;
 
-/// Handle the config show command
+/// Render the full report, then exit non-zero if any section is invalid.
 pub fn handle_config_show(full: bool, format: SwitchFormat) -> anyhow::Result<()> {
     if format == SwitchFormat::Json {
         return handle_config_show_json();
@@ -37,19 +42,31 @@ pub fn handle_config_show(full: bool, format: SwitchFormat) -> anyhow::Result<()
     // Build the complete output as a string
     let mut show_output = String::new();
 
-    // Render system config section (only when a system config file exists)
-    let has_system_config = render_system_config(&mut show_output)?;
-    if has_system_config {
+    let repo = Repository::current().ok();
+
+    let mut invalid = false;
+    let has_system_config = if let Some(system_invalid) = render_system_config(&mut show_output) {
+        invalid |= system_invalid;
         show_output.push('\n');
-    }
+        true
+    } else {
+        false
+    };
 
     // Render user config
-    render_user_config(&mut show_output, has_system_config)?;
+    invalid |= render_user_config(&mut show_output, repo.as_ref(), has_system_config)?;
     show_output.push('\n');
 
     // Render project config if in a git repository
-    render_project_config(&mut show_output)?;
+    invalid |= render_project_config(&mut show_output, repo.as_ref())?;
     show_output.push('\n');
+
+    let mut approvals_output = String::new();
+    invalid |= render_approvals(&mut approvals_output, repo.as_ref());
+    if !approvals_output.is_empty() {
+        show_output.push_str(&approvals_output);
+        show_output.push('\n');
+    }
 
     // Render shell integration status
     render_shell_status(&mut show_output)?;
@@ -69,7 +86,34 @@ pub fn handle_config_show(full: bool, format: SwitchFormat) -> anyhow::Result<()
     // Render OpenCode status (only when opencode CLI is available)
     if is_opencode_available() {
         show_output.push('\n');
-        render_opencode_status(&mut show_output)?;
+        show_output.push_str(&file_plugin_status(
+            "OPENCODE",
+            "wt config plugins opencode install",
+            super::opencode::is_plugin_installed(),
+            super::opencode::plugin_file_exists(),
+        ));
+    }
+
+    // Render oh-my-pi status (only when the oh-my-pi CLI is available)
+    if is_omp_available() {
+        show_output.push('\n');
+        show_output.push_str(&file_plugin_status(
+            "OH-MY-PI",
+            "wt config plugins omp install",
+            super::omp::is_plugin_installed(),
+            super::omp::plugin_file_exists(),
+        ));
+    }
+
+    // Render Pi status (only when the Pi CLI is available)
+    if is_pi_available() {
+        show_output.push('\n');
+        show_output.push_str(&file_plugin_status(
+            "PI",
+            "wt config plugins pi install",
+            super::pi::is_plugin_installed(),
+            super::pi::plugin_file_exists(),
+        ));
     }
 
     // Render Gemini status (only when gemini CLI is available)
@@ -91,47 +135,103 @@ pub fn handle_config_show(full: bool, format: SwitchFormat) -> anyhow::Result<()
     // Display through pager (config show is always long-form output)
     show_help_in_pager(&show_output, true);
 
+    if invalid {
+        return Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into());
+    }
+
     Ok(())
 }
 
-/// JSON output for config show: paths, existence, and parsed config contents.
+/// JSON retains the report on invalid input and signals failure by exit code.
 fn handle_config_show_json() -> anyhow::Result<()> {
+    let repo = Repository::current().ok();
+    let (merged_user_config, user_warnings) = UserConfig::load_with_warnings();
+    let mut invalid = user_warnings
+        .iter()
+        .any(|warning| matches!(warning, LoadError::Validation(_)));
     let user_path = require_config_path()?;
     let user_exists = user_path.exists();
     let user_config = if user_exists {
-        Some(serde_json::to_value(&UserConfig::load()?)?)
+        match read_user_config(&user_path) {
+            Some(_) => Some(serde_json::to_value(merged_user_config)?),
+            None => {
+                invalid = true;
+                None
+            }
+        }
     } else {
         None
     };
 
-    let (project_path, project_config, project_identifier) = if let Ok(repo) = Repository::current()
-    {
-        let config = repo.load_project_config()?;
-        let on_disk = repo.project_config_path()?;
-        // When config resolved but not from an existing on-disk file, it came
-        // from the object-store fallback (bare repo, default branch checked out
-        // in no worktree — #3461). Surface that revision spec as the source so
-        // `path`/`exists`/`config` agree, instead of pointing `path` at a
-        // missing file while `config` is populated.
-        let path = match &on_disk {
-            Some(p) if p.exists() => on_disk.clone(),
-            _ if config.is_some() => repo
-                .default_branch_project_config_content()
-                .map(|(_, spec)| spec),
-            _ => on_disk.clone(),
+    let (project_path, project_exists, project_config, project_identifier, project_source) =
+        if let Some(repo) = repo.as_ref() {
+            // Experimental git-config source (#3454): when any `worktrunk.config.*`
+            // key exists it is the whole project config, with no on-disk path.
+            // A failed read propagates, matching `config_show_output` and
+            // `ProjectConfig::load` — swallowing it would report the file as
+            // active while execution errors on the same read. An unparsable
+            // source is still tolerated like the file path below: `invalid` is
+            // set and the config reported null rather than aborting the report.
+            let git_pairs = repo.worktrunk_config_git_pairs()?;
+            if !git_pairs.is_empty() {
+                let config = match worktrunk::config::render_git_source_toml(&git_pairs) {
+                    Ok(rendered) => parse_json_config::<ProjectConfig>(&rendered)?,
+                    Err(_) => None,
+                };
+                if config.is_none() {
+                    invalid = true;
+                }
+                let identifier = repo.project_identifier().ok();
+                (None, true, config, identifier, Some("git-config"))
+            } else {
+                let on_disk = repo.project_config_path()?;
+                let object_store = match &on_disk {
+                    Some(path) if path.exists() => None,
+                    _ => repo.default_branch_project_config_content(),
+                };
+                let object_store_exists = object_store.is_some();
+                let (path, config) = match &on_disk {
+                    Some(path) if path.exists() => {
+                        let config = read_json_config::<ProjectConfig>(path)?;
+                        (on_disk.clone(), config)
+                    }
+                    _ => match object_store {
+                        Some((contents, spec)) => {
+                            let config = parse_json_config::<ProjectConfig>(&contents)?;
+                            (Some(spec), config)
+                        }
+                        None => (on_disk.clone(), None),
+                    },
+                };
+                if (on_disk.as_ref().is_some_and(|path| path.exists()) || object_store_exists)
+                    && config.is_none()
+                {
+                    invalid = true;
+                }
+                let identifier = repo.project_identifier().ok();
+                let exists =
+                    on_disk.as_ref().is_some_and(|path| path.exists()) || object_store_exists;
+                let source = if exists { Some("file") } else { None };
+                (path, exists, config, identifier, source)
+            }
+        } else {
+            (None, false, None, None, None)
         };
-        let identifier = repo.project_identifier().ok();
-        (
-            path,
-            config.map(|c| serde_json::to_value(&c)).transpose()?,
-            identifier,
-        )
-    } else {
-        (None, None, None)
-    };
 
     let system_path = system_config_path().or_else(default_system_config_path);
     let system_exists = system_path.as_ref().is_some_and(|p| p.exists());
+    let system_invalid = if let Some(path) = system_path.as_deref().filter(|_| system_exists) {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => parse_user_config(&contents).is_err(),
+            Err(_) => true,
+        }
+    } else {
+        false
+    };
+    let approvals_invalid = matches!(
+        approvals_diagnostic(repo.as_ref()),
+        ApprovalsDiagnostic::Invalid(_)
+    );
 
     let output = serde_json::json!({
         "user": {
@@ -141,13 +241,14 @@ fn handle_config_show_json() -> anyhow::Result<()> {
         },
         "project": {
             "path": project_path,
-            // Config source resolved — an on-disk file or the object-store
-            // fallback — iff `config` is populated. Keying `exists` off the
-            // loaded config (not `path.exists()`) keeps it consistent with
-            // `config` in the object-store case, where `path` is a revision
-            // spec with no file on disk.
-            "exists": project_config.is_some(),
+            // An invalid on-disk source still exists even though `config` is
+            // null. The object-store and git-config sources count as existing
+            // too, though their spec/keys are not filesystem paths.
+            "exists": project_exists,
             "identifier": project_identifier,
+            // "file" | "git-config" (experimental worktrunk.config.* source),
+            // absent when no config resolved.
+            "source": project_source,
             "config": project_config,
         },
         "system": {
@@ -155,8 +256,51 @@ fn handle_config_show_json() -> anyhow::Result<()> {
             "exists": system_exists,
         },
     });
-    worktrunk::styling::println!("{}", serde_json::to_string_pretty(&output)?);
+    invalid |= system_invalid
+        || approvals_invalid
+        || repo
+            .as_ref()
+            .is_some_and(|repo| validate_column_selection(repo).is_err());
+    print_json(&output)?;
+
+    if invalid {
+        return Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into());
+    }
+
     Ok(())
+}
+
+fn read_json_config<C>(path: &Path) -> anyhow::Result<Option<serde_json::Value>>
+where
+    C: DeserializeOwned + Serialize,
+{
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    parse_json_config::<C>(&contents)
+}
+
+fn read_user_config(path: &Path) -> Option<UserConfig> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    parse_user_config(&contents).ok()
+}
+
+fn parse_user_config(contents: &str) -> Result<UserConfig, String> {
+    let migrated = worktrunk::config::migrate_content(contents);
+    let config = toml::from_str::<UserConfig>(&migrated).map_err(|err| err.to_string())?;
+    config.validate().map_err(|err| err.to_string())?;
+    Ok(config)
+}
+
+fn parse_json_config<C>(contents: &str) -> anyhow::Result<Option<serde_json::Value>>
+where
+    C: DeserializeOwned + Serialize,
+{
+    let migrated = worktrunk::config::migrate_content(contents);
+    toml::from_str::<C>(&migrated)
+        .ok()
+        .map(|config| serde_json::to_value(config).map_err(Into::into))
+        .transpose()
 }
 
 // ==================== Helper Functions ====================
@@ -192,11 +336,17 @@ pub(super) fn home_dir() -> Option<PathBuf> {
 
 /// Get the Claude Code config directory.
 ///
-/// Honors `CLAUDE_CONFIG_DIR`, which Claude Code uses to relocate its entire
-/// config tree (`settings.json`, `plugins/`, ...) away from the default
-/// `~/.claude`. A leading `~/` in the value is expanded against the home
-/// directory; the shell normally expands it before the variable is set, so a
-/// literal `~` only reaches us when the variable is set in a non-shell context.
+/// This locates `settings.json`, the one Claude Code file wt reads. It reads
+/// that file because it writes it: `install-statusline` merges the
+/// `statusLine` key in, and Claude Code has no command that reports the
+/// setting back. Everything else wt wants to know about a harness it asks the
+/// harness (see [`super::harness_listing`]).
+///
+/// Honors `CLAUDE_CONFIG_DIR`, which Claude Code uses to relocate its config
+/// away from the default `~/.claude`. A leading `~/` in the value is expanded
+/// against the home directory; the shell normally expands it before the
+/// variable is set, so a literal `~` only reaches us when the variable is set
+/// in a non-shell context.
 pub(super) fn claude_config_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
         && !dir.is_empty()
@@ -207,26 +357,6 @@ pub(super) fn claude_config_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(dir));
     }
     home_dir().map(|home| home.join(".claude"))
-}
-
-/// Check if the worktrunk plugin is installed in Claude Code
-pub(super) fn is_plugin_installed() -> bool {
-    let Some(config_dir) = claude_config_dir() else {
-        return false;
-    };
-
-    let plugins_file = config_dir.join("plugins/installed_plugins.json");
-    let Ok(content) = std::fs::read_to_string(&plugins_file) else {
-        return false;
-    };
-
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
-    };
-
-    json.get("plugins")
-        .and_then(|p| p.get("worktrunk@worktrunk"))
-        .is_some()
 }
 
 /// Whether Claude Code's statusline runs worktrunk's.
@@ -260,88 +390,6 @@ pub(super) fn is_statusline_configured() -> bool {
         })
 }
 
-/// Get the git version string (e.g., "2.47.1")
-fn git_version() -> Option<String> {
-    let output = Cmd::new("git").arg("--version").run().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    // Parse "git version 2.47.1" -> "2.47.1"
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .trim()
-        .strip_prefix("git version ")
-        .map(|s| s.to_string())
-}
-
-/// Args for the interactive zsh compinit probe.
-///
-/// `+m` (disable job control) is load-bearing: without it the interactive
-/// `zsh -ic` grabs wt's controlling terminal and, if the timeout kills it
-/// first, leaves the pager to suspend with SIGTTOU. See `check_zsh_compinit_missing`
-/// and issue #3322.
-const ZSH_COMPINIT_PROBE_ARGS: [&str; 4] =
-    ["--no-globalrcs", "+m", "-ic", "(( $+functions[compdef] ))"];
-
-/// Check if zsh has compinit enabled by spawning an interactive shell
-///
-/// Returns true if compinit is NOT enabled (i.e., user needs to add it).
-/// Returns false if compinit is enabled or we can't determine (fail-safe: don't warn).
-///
-// TODO(zsh-compinit-probe-unify): this duplicates `shell::detect_zsh_compinit`
-// — both spawn an interactive `zsh -ic` to probe for the `compdef` function, and
-// #3322 had to add the `+m` job-control fix to both. They diverge on purpose, so
-// folding them into one parameterized probe isn't a mechanical rename: this one
-// passes `--no-globalrcs` (checks the USER's config so we only nudge when *they*
-// haven't enabled compinit) while `detect_zsh_compinit` intentionally sources
-// global rcs (so shell setup won't re-add what /etc/zshrc already enables); they
-// also differ in result type (bool vs Option<bool>) and runner (`Cmd` vs raw
-// `Command`). Unify behind one `probe_zsh_compdef(no_globalrcs: bool)` helper.
-fn check_zsh_compinit_missing() -> bool {
-    // Allow tests to bypass this check since zsh subprocess behavior varies across CI envs
-    if std::env::var("WORKTRUNK_TEST_COMPINIT_CONFIGURED").is_ok() {
-        return false; // Assume compinit is configured
-    }
-
-    // Force compinit to be missing (for tests that expect the warning)
-    if std::env::var("WORKTRUNK_TEST_COMPINIT_MISSING").is_ok() {
-        return true; // Force warning to appear
-    }
-
-    // Probe zsh to check if compdef function exists (indicates compinit has run)
-    // Use --no-globalrcs to skip system files (like /etc/zshrc on macOS which enables compinit)
-    // This ensures we're checking the USER's configuration, not system defaults
-    // Suppress stderr to avoid noise like "can't change option: zle"
-    // The (( ... )) arithmetic returns exit 0 if true (compdef exists), 1 if false
-    // Suppress zsh's "insecure directories" warning from compinit.
-    // See detailed rationale in shell::detect_zsh_compinit().
-    //
-    // Bound the probe with a timeout that kills the child on expiry — the same
-    // hardening detect_zsh_compinit() relies on. An interactive `zsh -ic` whose
-    // startup prompts on /dev/tty (compinit's insecure-directories prompt
-    // bypasses both the stdin=null default and the stderr suppression above)
-    // would otherwise hang `wt config show` indefinitely. On timeout run()
-    // returns Err, so the `else` below declines to warn rather than misreport.
-    // `+m` disables job control so this interactive probe doesn't grab wt's
-    // controlling terminal. An interactive zsh with job control on `tcsetpgrp`s
-    // to claim the terminal foreground; if the 2s timeout kills it before it
-    // restores that, wt is left in a background process group and the pager
-    // spawned moments later (config show always pages) raises SIGTTOU,
-    // suspending the command (`suspended (tty output)`). See issue #3322.
-    let Ok(output) = Cmd::new("zsh")
-        .args(ZSH_COMPINIT_PROBE_ARGS)
-        .env("ZSH_DISABLE_COMPFIX", "true")
-        .timeout(std::time::Duration::from_secs(2))
-        .run()
-    else {
-        return false; // Can't determine, don't warn
-    };
-
-    // compdef NOT found = need to warn
-    !output.status.success()
-}
-
 // ==================== Render Functions ====================
 
 /// Render CLAUDE CODE section (plugin and statusline status).
@@ -349,9 +397,10 @@ fn check_zsh_compinit_missing() -> bool {
 fn render_claude_code_status(out: &mut String) -> anyhow::Result<()> {
     writeln!(out, "{}", format_heading("CLAUDE CODE", None))?;
 
-    // Plugin status
-    let plugin_installed = is_plugin_installed();
-    if plugin_installed {
+    // Plugin status. An answer wt could not read gets the same hint as a
+    // plain absence: the install it points at is idempotent, so following it
+    // is safe either way, and Claude Code's own output then says what is true.
+    if super::plugins::is_plugin_installed() == Some(true) {
         writeln!(out, "{}", success_message("Plugin installed"))?;
     } else {
         writeln!(
@@ -380,7 +429,7 @@ fn render_claude_code_status(out: &mut String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Render CODEX section (marketplace install hint).
+/// Render CODEX section (plugin install hint).
 /// Caller must check `is_codex_available()` first.
 fn render_codex_status(out: &mut String) -> anyhow::Result<()> {
     writeln!(out, "{}", format_heading("CODEX", None))?;
@@ -405,35 +454,48 @@ fn is_opencode_available() -> bool {
     which::which("opencode").is_ok()
 }
 
-/// Render OPENCODE section (plugin status).
-/// Caller must check `is_opencode_available()` first.
-fn render_opencode_status(out: &mut String) -> anyhow::Result<()> {
-    writeln!(out, "{}", format_heading("OPENCODE", None))?;
-
-    // Plugin status
-    let plugin_installed = super::opencode::is_plugin_installed();
-    let plugin_exists = super::opencode::plugin_file_exists();
-    if plugin_installed {
-        writeln!(out, "{}", success_message("Plugin installed"))?;
-    } else if plugin_exists {
-        writeln!(
-            out,
-            "{}",
-            hint_message(cformat!(
-                "Plugin outdated. To update, run <underline>wt config plugins opencode install</>"
-            ))
-        )?;
-    } else {
-        writeln!(
-            out,
-            "{}",
-            hint_message(cformat!(
-                "Plugin not installed. To install, run <underline>wt config plugins opencode install</>"
-            ))
-        )?;
+/// Check if the Pi coding agent CLI is available.
+pub(super) fn is_pi_available() -> bool {
+    if let Ok(val) = std::env::var("WORKTRUNK_TEST_PI_INSTALLED") {
+        return val == "1";
     }
+    which::which("pi").is_ok()
+}
 
-    Ok(())
+/// Check if the oh-my-pi coding agent CLI is available.
+pub(super) fn is_omp_available() -> bool {
+    if let Ok(val) = std::env::var("WORKTRUNK_TEST_OMP_INSTALLED") {
+        return val == "1";
+    }
+    which::which("omp").is_ok()
+}
+
+/// The section for a plugin the installer writes as a plain file: a heading,
+/// then one line of status, with the trailing newline the caller would add.
+///
+/// OpenCode, Pi, and oh-my-pi each install one file and each report the same
+/// three states, differing only in the heading and the command that writes the
+/// file — so they share this rather than keeping a copy apiece. Callers check
+/// their own `is_*_available()` first, and answer `installed` / `file_exists`
+/// from their own module.
+fn file_plugin_status(
+    heading: &str,
+    install_command: &str,
+    installed: bool,
+    file_exists: bool,
+) -> String {
+    let status = if installed {
+        success_message("Plugin installed")
+    } else if file_exists {
+        hint_message(cformat!(
+            "Plugin outdated. To update, run <underline>{install_command}</>"
+        ))
+    } else {
+        hint_message(cformat!(
+            "Plugin not installed. To install, run <underline>{install_command}</>"
+        ))
+    };
+    format!("{}\n{status}\n", format_heading(heading, None))
 }
 
 /// Check if Gemini CLI is available
@@ -445,26 +507,18 @@ fn is_gemini_available() -> bool {
     which::which("gemini").is_ok()
 }
 
-/// Check if the worktrunk extension is installed in Gemini CLI.
+/// Whether Gemini CLI lists the worktrunk extension, or `None` where its
+/// answer cannot be read.
 ///
-/// `gemini extensions install` clones the extension into
-/// `~/.gemini/extensions/<name>/`, so a worktrunk install leaves a
-/// `gemini-extension.json` whose `name` is `worktrunk` at that path.
-fn is_gemini_extension_installed() -> bool {
-    let Some(home) = home_dir() else {
-        return false;
-    };
-
-    let manifest = home.join(".gemini/extensions/worktrunk/gemini-extension.json");
-    let Ok(content) = std::fs::read_to_string(&manifest) else {
-        return false;
-    };
-
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
-    };
-
-    json.get("name").and_then(|n| n.as_str()) == Some("worktrunk")
+/// `gemini extensions list -o json` prints a bare array of extension objects
+/// carrying the `name` the install was made under. The question goes to
+/// Gemini for the reason [`super::harness_listing`] gives: the alternative is
+/// reading `~/.gemini/extensions/`, whose layout is Gemini's to change, and a
+/// layout that changed would read here as an extension that was never
+/// installed.
+fn is_gemini_extension_installed() -> Option<bool> {
+    let listed = super::harness_listing("gemini", &["extensions", "list", "-o", "json"])?;
+    super::listing_names(listed.as_array()?, "name", "worktrunk")
 }
 
 /// Render GEMINI CLI section (extension status).
@@ -472,7 +526,7 @@ fn is_gemini_extension_installed() -> bool {
 fn render_gemini_status(out: &mut String) -> anyhow::Result<()> {
     writeln!(out, "{}", format_heading("GEMINI CLI", None))?;
 
-    if is_gemini_extension_installed() {
+    if is_gemini_extension_installed() == Some(true) {
         writeln!(out, "{}", success_message("Extension installed"))?;
     } else {
         writeln!(
@@ -500,7 +554,7 @@ fn render_runtime_info(out: &mut String) -> anyhow::Result<()> {
         "{}",
         info_message(cformat!("{cmd}: <bold>{version}</>"))
     )?;
-    if let Some(git_version) = git_version() {
+    if let Ok(git_version) = worktrunk::git::git_version() {
         writeln!(
             out,
             "{}",
@@ -529,10 +583,11 @@ fn render_runtime_info(out: &mut String) -> anyhow::Result<()> {
 fn render_diagnostics(out: &mut String) -> anyhow::Result<()> {
     writeln!(out, "{}", format_heading("DIAGNOSTICS", None))?;
 
-    // Check the CI tool for this repo's platform (project config, else remote URL).
+    // Check the CI tool for this repo's platform (configured forge platform,
+    // else remote URL).
     let repo = Repository::current()?;
     match repo.ci_platform(None) {
-        Some(CiPlatform::GitHub) => {
+        Some(ForgeKind::GitHub) => {
             let ci_tools = CiToolsStatus::detect(None);
             render_ci_tool_status(
                 out,
@@ -542,7 +597,7 @@ fn render_diagnostics(out: &mut String) -> anyhow::Result<()> {
                 ci_tools.gh_authenticated,
             )?;
         }
-        Some(CiPlatform::GitLab) => {
+        Some(ForgeKind::GitLab) => {
             let ci_tools = CiToolsStatus::detect(None);
             render_ci_tool_status(
                 out,
@@ -552,7 +607,7 @@ fn render_diagnostics(out: &mut String) -> anyhow::Result<()> {
                 ci_tools.glab_authenticated,
             )?;
         }
-        Some(CiPlatform::Gitea) => {
+        Some(ForgeKind::Gitea) => {
             let ci_tools = CiToolsStatus::detect(None);
             render_ci_tool_status(
                 out,
@@ -562,7 +617,7 @@ fn render_diagnostics(out: &mut String) -> anyhow::Result<()> {
                 ci_tools.tea_authenticated,
             )?;
         }
-        Some(CiPlatform::AzureDevOps) => {
+        Some(ForgeKind::AzureDevOps) => {
             let ci_tools = CiToolsStatus::detect(None);
             render_ci_tool_status(
                 out,
@@ -597,7 +652,7 @@ fn render_diagnostics(out: &mut String) -> anyhow::Result<()> {
     render_version_check(out)?;
 
     // Test commit generation - use effective config for current project
-    let config = UserConfig::load()?;
+    let config = UserConfig::load().context("Failed to load config")?;
     let project_id = repo.project_identifier().ok();
     let commit_config = config.commit_generation(project_id.as_deref());
 
@@ -639,45 +694,46 @@ fn render_diagnostics(out: &mut String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Render the SYSTEM CONFIG section. Returns true if a system config file was found.
-fn render_system_config(out: &mut String) -> anyhow::Result<bool> {
-    let Some(system_path) = system_config_path() else {
-        return Ok(false);
-    };
+/// Render system config when present, returning whether it is invalid.
+fn render_system_config(out: &mut String) -> Option<bool> {
+    let system_path = system_config_path()?;
 
-    writeln!(
+    let _ = writeln!(
         out,
         "{}",
         format_heading(
             "SYSTEM CONFIG",
             Some(&format!("@ {}", format_path_for_display(&system_path)))
         )
-    )?;
+    );
 
-    // Read and display the file contents
-    let contents =
-        std::fs::read_to_string(&system_path).context("Failed to read system config file")?;
+    let contents = match std::fs::read_to_string(&system_path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            render_config_read_error(out, &err);
+            return Some(true);
+        }
+    };
 
     if contents.trim().is_empty() {
-        writeln!(out, "{}", hint_message("Empty file (no system defaults)"))?;
-        return Ok(true);
+        let _ = writeln!(out, "{}", hint_message("Empty file (no system defaults)"));
+        return Some(false);
     }
 
-    // Validate config (syntax + schema) and warn if invalid
-    if let Err(e) = toml::from_str::<UserConfig>(&contents) {
-        writeln!(out, "{}", error_message("Invalid config"))?;
-        writeln!(out, "{}", format_with_gutter(&e.to_string(), None))?;
-    } else {
-        out.push_str(&warn_unknown_keys::<UserConfig>(&contents));
-    }
+    let invalid = render_user_config_diagnostics(out, &contents);
 
     // Display TOML with syntax highlighting
-    writeln!(out, "{}", format_toml(&contents))?;
+    let _ = writeln!(out, "{}", format_toml(&contents));
 
-    Ok(true)
+    Some(invalid)
 }
 
-fn render_user_config(out: &mut String, has_system_config: bool) -> anyhow::Result<()> {
+/// Render the USER CONFIG section. Returns true if the config is invalid.
+fn render_user_config(
+    out: &mut String,
+    repo: Option<&Repository>,
+    has_system_config: bool,
+) -> anyhow::Result<bool> {
     let config_path = require_config_path()?;
 
     writeln!(
@@ -698,19 +754,25 @@ fn render_user_config(out: &mut String, has_system_config: bool) -> anyhow::Resu
                 "Not found; to create one, run <underline>wt config create</>"
             ))
         )?;
-        return Ok(());
+        // A `[list] columns` selection can still arrive from the system layer,
+        // the environment, or `--config-set`, so the check runs either way.
+        return render_column_selection(out, repo);
     }
 
-    // Read and display the file contents
-    let contents = std::fs::read_to_string(&config_path).context("Failed to read config file")?;
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            render_config_read_error(out, &err);
+            render_column_selection(out, repo)?;
+            return Ok(true);
+        }
+    };
 
     // Check for deprecations with emit_inline_warnings=false (silent mode)
     // User config is global, not tied to any repository
-    // Deprecated patterns supersede the TOML dump below (their diff covers
-    // the file); a pending-default pin is additive, so the dump stays. An
-    // empty file still gets the pending-pin details — `wt config update`
-    // would rewrite it — just no dump.
-    let mut details_shown = false;
+    // Deprecated patterns supersede the TOML dump below because their diff
+    // covers the file.
+    let mut invalid = false;
     let skip_dump = match worktrunk::config::check_and_migrate(
         &config_path,
         &contents,
@@ -724,13 +786,13 @@ fn render_user_config(out: &mut String, has_system_config: bool) -> anyhow::Resu
                 out.push_str(&worktrunk::config::format_deprecation_details(
                     &info, &contents,
                 ));
-                details_shown = true;
-                info.has_deprecated_patterns()
+                true
             } else {
                 false
             }
         }
         Err(err) => {
+            invalid = true;
             writeln!(out, "{}", error_message(err.to_string()))?;
             false
         }
@@ -738,25 +800,14 @@ fn render_user_config(out: &mut String, has_system_config: bool) -> anyhow::Resu
 
     if contents.trim().is_empty() {
         writeln!(out, "{}", hint_message("Empty file (using defaults)"))?;
-        return Ok(());
+        return Ok(invalid | render_column_selection(out, repo)?);
     }
 
-    // Validate config (syntax + schema) and warn if invalid
-    if let Err(e) = toml::from_str::<UserConfig>(&contents) {
-        // Use gutter for error details to avoid markup interpretation of user content
-        writeln!(out, "{}", error_message("Invalid config"))?;
-        writeln!(out, "{}", format_with_gutter(&e.to_string(), None))?;
-    } else {
-        out.push_str(&warn_unknown_keys::<UserConfig>(&contents));
-    }
+    invalid |= render_user_config_diagnostics(out, &contents);
 
     // Display TOML with syntax highlighting (gutter at column 0).
     // Skip when deprecations were shown — the proposed diff already covers it.
     if !skip_dump {
-        if details_shown {
-            // Pending-pin details above end in their diff; separate phases.
-            out.push('\n');
-        }
         writeln!(out, "{}", format_toml(&contents))?;
     }
 
@@ -764,7 +815,7 @@ fn render_user_config(out: &mut String, has_system_config: bool) -> anyhow::Resu
         render_system_config_hint(out)?;
     }
 
-    Ok(())
+    Ok(invalid | render_column_selection(out, repo)?)
 }
 
 fn render_system_config_hint(out: &mut String) -> anyhow::Result<()> {
@@ -778,6 +829,48 @@ fn render_system_config_hint(out: &mut String) -> anyhow::Result<()> {
             ))
         )?;
     }
+    Ok(())
+}
+
+fn render_config_read_error(out: &mut String, err: &std::io::Error) {
+    let _ = writeln!(out, "{}", error_message("Cannot read config"));
+    let _ = writeln!(out, "{}", format_with_gutter(&err.to_string(), None));
+}
+
+/// Render parse, validation, and unknown-key diagnostics for a user-config source.
+fn render_user_config_diagnostics(out: &mut String, contents: &str) -> bool {
+    let Err(error) = parse_user_config(contents) else {
+        out.push_str(&warn_unknown_keys::<UserConfig>(contents));
+        return false;
+    };
+
+    let _ = writeln!(out, "{}", error_message("Invalid config"));
+    // Use a gutter to avoid interpreting user-controlled parser output as markup.
+    let _ = writeln!(out, "{}", format_with_gutter(&error, None));
+    true
+}
+
+/// Report list-column settings that `wt list` would reject.
+fn render_column_selection(out: &mut String, repo: Option<&Repository>) -> anyhow::Result<bool> {
+    let Some(repo) = repo else {
+        return Ok(false);
+    };
+    if let Err(e) = validate_column_selection(repo) {
+        writeln!(out, "{}", error_message(e.to_string()))?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Validate the resolved list-column config exactly as `wt list` does.
+fn validate_column_selection(repo: &Repository) -> anyhow::Result<()> {
+    let config = repo.config();
+    let custom = crate::commands::list::custom_columns::resolve_custom_columns(
+        &config.list.custom_columns,
+        repo,
+    )?;
+    let custom_names: Vec<&str> = custom.iter().map(|c| c.name.as_str()).collect();
+    crate::commands::list::columns::parse_selected_columns(&config.list.columns, &custom_names)?;
     Ok(())
 }
 
@@ -830,11 +923,12 @@ fn format_show_warning(warning: &worktrunk::config::UnknownWarning) -> String {
     }
 }
 
-fn render_project_config(out: &mut String) -> anyhow::Result<()> {
+/// Render the PROJECT CONFIG section. Returns true if the config is invalid.
+fn render_project_config(out: &mut String, repo: Option<&Repository>) -> anyhow::Result<bool> {
     // Try to get current repository root
-    let repo = match Repository::current() {
-        Ok(repo) => repo,
-        Err(_) => {
+    let repo = match repo {
+        Some(repo) => repo,
+        None => {
             writeln!(
                 out,
                 "{}",
@@ -843,20 +937,15 @@ fn render_project_config(out: &mut String) -> anyhow::Result<()> {
                     format_heading("PROJECT CONFIG", Some("Not in a git repository"))
                 )
             )?;
-            return Ok(());
+            return Ok(false);
         }
     };
-    // Helper: heading + project identifier, shared across the resolved and
-    // absent branches so their output stays uniform.
     fn write_heading_and_identifier(
         out: &mut String,
         repo: &Repository,
         source: &str,
     ) -> anyhow::Result<()> {
         writeln!(out, "{}", format_heading("PROJECT CONFIG", Some(source)))?;
-        // Project identifier — used as the key for [projects."..."] sections in
-        // user config. Surface it here so users can find the right key without
-        // hand-deriving it from the remote URL.
         if let Ok(project_id) = repo.project_identifier() {
             let line = info_message(cformat!("Identifier: <bold>{project_id}</>"));
             writeln!(out, "{line}")?;
@@ -864,65 +953,111 @@ fn render_project_config(out: &mut String) -> anyhow::Result<()> {
         Ok(())
     }
 
-    // Resolve the effective config source, mirroring `ProjectConfig::load`: an
-    // on-disk `.config/wt.toml` when one exists, otherwise the committed
-    // default-branch config read from the object store (bare repo, default
-    // branch checked out in no worktree — #3461). Reading the raw text here
-    // rather than calling `load_project_config` keeps the deprecation and
-    // validation rendering below, which operates on the TOML source. Without
-    // this fallback, `config show` reports "Not found" while the hooks from the
-    // object-store config actually run — the opposite of reality.
+    // Experimental git-config source (#3454), mirroring `ProjectConfig::load`:
+    // any `worktrunk.config.*` keys in the merged effective git config are the
+    // project config, and the file (when one resolves) is superseded. Rendered
+    // first so the section reports the source that actually runs. A failed
+    // read propagates rather than defaulting to empty — swallowing it would
+    // render the file as active while actual execution errors on the same
+    // read, and diagnostics must not disagree with execution. Returns the
+    // invalid flag like the file branch below.
+    let git_pairs = repo.worktrunk_config_git_pairs()?;
+    if !git_pairs.is_empty() {
+        let source = format!("@ {}", worktrunk::config::GIT_CONFIG_SOURCE_LABEL);
+        write_heading_and_identifier(out, repo, &source)?;
+        if let Some(superseded) = worktrunk::config::superseded_project_file_label(repo) {
+            // push_str, not writeln!(…)? — the write into a String is
+            // infallible, so `?` leaves an uncoverable error region.
+            out.push_str(
+                &warning_message(cformat!(
+                    "Project config file @ <bold>{superseded}</> is superseded by these keys"
+                ))
+                .to_string(),
+            );
+            out.push('\n');
+        }
+        out.push_str(
+            &hint_message(cformat!(
+                "To list the keys and their origins, run <underline>{}</>",
+                worktrunk::config::GIT_CONFIG_LIST_COMMAND
+            ))
+            .to_string(),
+        );
+        out.push('\n');
+        let mut invalid = false;
+        match worktrunk::config::render_git_source_toml(&git_pairs) {
+            Ok(rendered) => {
+                // Same validation rendering as the file branch below.
+                if let Err(e) = toml::from_str::<ProjectConfig>(&rendered) {
+                    invalid = true;
+                    writeln!(out, "{}", error_message("Invalid config"))?;
+                    writeln!(out, "{}", format_with_gutter(&e.to_string(), None))?;
+                } else {
+                    out.push_str(&warn_unknown_keys::<ProjectConfig>(&rendered));
+                }
+                writeln!(out, "{}", format_toml(&rendered))?;
+            }
+            Err(e) => {
+                invalid = true;
+                writeln!(out, "{}", error_message(e.to_string()))?;
+            }
+        }
+        return Ok(invalid);
+    }
+
+    // Match ProjectConfig::load's on-disk then object-store source order.
     let on_disk = repo.project_config_path()?;
     let (config_path, contents) = match &on_disk {
         Some(path) if path.exists() => {
-            let contents = std::fs::read_to_string(path).context("Failed to read config file")?;
             let source = format!("@ {}", format_path_for_display(path));
-            write_heading_and_identifier(out, &repo, &source)?;
+            write_heading_and_identifier(out, repo, &source)?;
+            let contents = match std::fs::read_to_string(path) {
+                Ok(contents) => contents,
+                Err(err) => {
+                    render_config_read_error(out, &err);
+                    return Ok(true);
+                }
+            };
             (path.clone(), contents)
         }
         _ => match repo.default_branch_project_config_content() {
             Some((object_store_contents, spec)) => {
-                // `spec` is a git revision spec (`<default>:.config/wt.toml`),
-                // not a filesystem path — display it verbatim, tagged as the
-                // object-store source so it isn't mistaken for an on-disk file.
                 let source = format!("@ {} (from object store)", spec.to_string_lossy());
-                write_heading_and_identifier(out, &repo, &source)?;
+                write_heading_and_identifier(out, repo, &source)?;
                 (spec, object_store_contents)
             }
             None => {
-                // Neither an on-disk file nor a committed fallback resolved.
                 let Some(path) = on_disk else {
                     let heading = format_heading("PROJECT CONFIG", Some("No project config"));
                     writeln!(out, "{}", cformat!("<dim>{}</>", heading))?;
-                    return Ok(());
+                    return Ok(false);
                 };
                 let source = format!("@ {}", format_path_for_display(&path));
-                write_heading_and_identifier(out, &repo, &source)?;
+                write_heading_and_identifier(out, repo, &source)?;
                 writeln!(out, "{}", hint_message("Not found"))?;
-                return Ok(());
+                return Ok(false);
             }
         },
     };
 
     if contents.trim().is_empty() {
         writeln!(out, "{}", hint_message("Empty file"))?;
-        return Ok(());
+        return Ok(false);
     }
 
-    // Check for deprecations with emit_inline_warnings=false (silent mode)
-    // Only write migration file in main worktree, not linked worktrees.
-    // Deprecated patterns supersede the TOML dump below (their diff covers
-    // the file); a pending-default pin would be additive, so the dump stays —
-    // no pending-default rule targets project config today, but the shape
-    // mirrors render_user_config so the two stay interchangeable.
+    // Check for deprecations with emit_inline_warnings=false (silent mode).
+    // They are actionable only from the main worktree, where `wt config update`
+    // rewrites the file.
+    // Deprecated patterns supersede the TOML dump below because their diff
+    // covers the file.
     let is_main_worktree = !repo.current_worktree().is_linked().unwrap_or(true);
-    let mut details_shown = false;
+    let mut invalid = false;
     let skip_dump = match worktrunk::config::check_and_migrate(
         &config_path,
         &contents,
         is_main_worktree,
         worktrunk::config::ConfigFileKind::Project,
-        Some(&repo),
+        Some(repo),
         false, // silent mode - we'll format the output ourselves
     ) {
         Ok(result) => {
@@ -930,13 +1065,13 @@ fn render_project_config(out: &mut String) -> anyhow::Result<()> {
                 out.push_str(&worktrunk::config::format_deprecation_details(
                     &info, &contents,
                 ));
-                details_shown = true;
-                info.has_deprecated_patterns()
+                true
             } else {
                 false
             }
         }
         Err(err) => {
+            invalid = true;
             writeln!(out, "{}", error_message(err.to_string()))?;
             false
         }
@@ -945,6 +1080,7 @@ fn render_project_config(out: &mut String) -> anyhow::Result<()> {
     // Validate config (syntax + schema) and warn if invalid
     if let Err(e) = toml::from_str::<ProjectConfig>(&contents) {
         // Use gutter for error details to avoid markup interpretation of user content
+        invalid = true;
         writeln!(out, "{}", error_message("Invalid config"))?;
         writeln!(out, "{}", format_with_gutter(&e.to_string(), None))?;
     } else {
@@ -954,19 +1090,92 @@ fn render_project_config(out: &mut String) -> anyhow::Result<()> {
     // Display TOML with syntax highlighting (gutter at column 0).
     // Skip when deprecations were shown — the proposed diff already covers it.
     if !skip_dump {
-        if details_shown {
-            // Pending-pin details above end in their diff; separate phases.
-            out.push('\n');
-        }
         writeln!(out, "{}", format_toml(&contents))?;
     }
 
-    Ok(())
+    Ok(invalid)
 }
 
-/// Emit the "fish integration found in deprecated location" notice plus the
-/// hint pointing at the canonical path. Used wherever fish integration lives
-/// at the legacy `~/.config/fish/conf.d/` location (deprecated since #566).
+/// Report an invalid approvals file or project commands awaiting approval.
+fn render_approvals(out: &mut String, repo: Option<&Repository>) -> bool {
+    match approvals_diagnostic(repo) {
+        ApprovalsDiagnostic::Valid => false,
+        ApprovalsDiagnostic::Invalid(err) => {
+            render_approvals_heading(out);
+            let _ = writeln!(out, "{}", error_message("Invalid approvals"));
+            let _ = writeln!(out, "{}", format_with_gutter(&err, None));
+            true
+        }
+        ApprovalsDiagnostic::Pending(pending) => {
+            render_approvals_heading(out);
+            let plural = if pending == 1 { "command" } else { "commands" };
+            let status = info_message(format!("{pending} project {plural} awaiting approval"));
+            let _ = writeln!(out, "{status}");
+            let hint = hint_message(cformat!(
+                "To review, run <underline>wt config approvals list</>"
+            ));
+            let _ = writeln!(out, "{hint}");
+            false
+        }
+    }
+}
+
+fn render_approvals_heading(out: &mut String) {
+    let source = worktrunk::config::approvals_path()
+        .map(|path| format!("@ {}", format_path_for_display(&path)));
+    let _ = writeln!(out, "{}", format_heading("APPROVALS", source.as_deref()));
+}
+
+enum ApprovalsDiagnostic {
+    Valid,
+    Invalid(String),
+    Pending(usize),
+}
+
+fn approvals_diagnostic(repo: Option<&Repository>) -> ApprovalsDiagnostic {
+    let approvals_file_exists = worktrunk::config::approvals_path()
+        .as_ref()
+        .is_some_and(|path| path.exists());
+    let approvals = match worktrunk::config::Approvals::load() {
+        Ok(approvals) => approvals,
+        Err(err) if approvals_file_exists => {
+            return ApprovalsDiagnostic::Invalid(err.to_string());
+        }
+        // With no approvals file, `Approvals::load` falls back to the user
+        // config. Its error belongs to that section, which already reports the
+        // same broken source and marks the whole diagnostic invalid.
+        Err(_) => return ApprovalsDiagnostic::Valid,
+    };
+    let Some(repo) = repo else {
+        return ApprovalsDiagnostic::Valid;
+    };
+    let Ok(Some(project_config)) = repo.load_project_config() else {
+        return ApprovalsDiagnostic::Valid;
+    };
+    let commands = super::approvals::collect_approvable_commands(&project_config);
+    if commands.is_empty() {
+        return ApprovalsDiagnostic::Valid;
+    }
+    let Ok(project_id) = repo.project_identifier() else {
+        return ApprovalsDiagnostic::Valid;
+    };
+    let pending = commands
+        .into_iter()
+        .filter(|cmd| !approvals.is_command_approved(&project_id, &cmd.command.template))
+        .count();
+    if pending == 0 {
+        ApprovalsDiagnostic::Valid
+    } else {
+        ApprovalsDiagnostic::Pending(pending)
+    }
+}
+
+/// Emit the "fish extension lives at the deprecated location" row, naming the
+/// canonical path it should move to. Used wherever fish integration lives at
+/// the legacy `~/.config/fish/conf.d/` location (deprecated since #566). The
+/// migration is one of the things `wt config shell install` does, so the row
+/// carries no hint of its own — the caller counts it toward the section's
+/// single trailing hint.
 fn render_fish_legacy_migration(
     out: &mut String,
     legacy_fish_conf_d: Option<&Path>,
@@ -985,14 +1194,7 @@ fn render_fish_legacy_migration(
         out,
         "{}",
         info_message(cformat!(
-            "Fish integration found in deprecated location @ <bold>{legacy_path}</>"
-        ))
-    )?;
-    writeln!(
-        out,
-        "{}",
-        hint_message(cformat!(
-            "To migrate to <underline>{canonical_path}</>, run <underline>{cmd} config shell install fish</>"
+            "<bold>fish</>: Shell extension @ <bold>{legacy_path}</> (deprecated; now <bold>{canonical_path}</>)"
         ))
     )?;
     Ok(())
@@ -1001,7 +1203,7 @@ fn render_fish_legacy_migration(
 /// Zsh-only: warn when compinit isn't enabled, since the integration
 /// installs completions but they won't load without compinit.
 fn render_zsh_compinit_warning(out: &mut String) -> anyhow::Result<()> {
-    if !check_zsh_compinit_missing() {
+    if probe_zsh_compdef(ZshStartupScope::UserOnly) != Some(false) {
         return Ok(());
     }
     writeln!(
@@ -1012,18 +1214,17 @@ fn render_zsh_compinit_warning(out: &mut String) -> anyhow::Result<()> {
     writeln!(
         out,
         "{}",
-        format_with_gutter("autoload -Uz compinit && compinit", None)
+        format_bash_with_gutter("autoload -Uz compinit && compinit")
     )?;
     Ok(())
 }
 
 /// Fish-only: report whether the separate completions file is in place.
-/// Doesn't flip `any_not_configured` — missing fish completions have a
-/// shell-specific remediation hint rather than the generic "To configure"
-/// summary.
-fn render_fish_completion_status(out: &mut String, cmd: &str) -> anyhow::Result<()> {
+/// Returns whether the file is missing, so it counts toward the section's
+/// single trailing `wt config shell install` hint.
+fn render_fish_completion_status(out: &mut String, cmd: &str) -> anyhow::Result<bool> {
     let Ok(completion_path) = Shell::Fish.completion_path(cmd) else {
-        return Ok(());
+        return Ok(false);
     };
     let completion_display = format_path_for_display(&completion_path);
     let shell = Shell::Fish;
@@ -1035,16 +1236,16 @@ fn render_fish_completion_status(out: &mut String, cmd: &str) -> anyhow::Result<
                 "<bold>{shell}</>: Already configured completions @ {completion_display}"
             ))
         )?;
-    } else {
-        let warning = warning_message(cformat!(
-            "<bold>{shell}</>: Completions not configured @ <bold>{completion_display}</>"
-        ));
-        let hint = hint_message(cformat!(
-            "To configure completions, run <underline>{cmd} config shell install {shell}</>"
-        ));
-        writeln!(out, "{warning}\n{hint}")?;
+        return Ok(false);
     }
-    Ok(())
+    writeln!(
+        out,
+        "{}",
+        warning_message(cformat!(
+            "<bold>{shell}</>: Completions not configured @ <bold>{completion_display}</>"
+        ))
+    )?;
+    Ok(true)
 }
 
 /// When the integration is configured but the wrapper isn't loaded in the
@@ -1073,13 +1274,14 @@ fn render_verify_wrapper_hint(
 
 /// Render the `AlreadyExists` row plus any per-shell follow-ups (matched
 /// lines, .exe warning, zsh compinit, fish completions, verify hint).
+/// Returns whether the row still wants `wt config shell install`.
 fn render_already_configured(
     out: &mut String,
     result: &ConfigureResult,
     detection_results: &[FileDetectionResult],
     cmd: &str,
     shell_active: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let shell = result.shell;
     let path = format_path_for_display(&result.path);
     let what = crate::output::shell_integration::shell_extension_label(shell);
@@ -1119,19 +1321,22 @@ fn render_already_configured(
         }
     }
 
-    match shell {
-        Shell::Zsh => render_zsh_compinit_warning(out)?,
+    let needs_install = match shell {
+        Shell::Zsh => {
+            render_zsh_compinit_warning(out)?;
+            false
+        }
         Shell::Fish => render_fish_completion_status(out, cmd)?,
-        _ => {}
-    }
+        _ => false,
+    };
 
     render_verify_wrapper_hint(out, shell, cmd, shell_active)?;
-    Ok(())
+    Ok(needs_install)
 }
 
-/// Render the `WouldAdd`/`WouldCreate` arm. Returns whether the row
-/// should count toward `any_not_configured` (the trailing "To configure"
-/// summary is suppressed for outdated wrappers and dotfile-managed setups).
+/// Render the `WouldAdd`/`WouldCreate` arm. Returns whether the row should
+/// count toward `any_not_configured` — false only for a dotfile-managed setup,
+/// which `wt config shell install` cannot fix.
 fn render_would_add_or_create(
     out: &mut String,
     result: &ConfigureResult,
@@ -1144,25 +1349,24 @@ fn render_would_add_or_create(
     let path = format_path_for_display(&result.path);
     let what = crate::output::shell_integration::shell_extension_label(shell);
 
-    // Fish: prefer migration hint when the legacy conf.d location has
-    // working integration — silencing the "Not configured" row.
+    // Fish: prefer the deprecated-location row when the legacy conf.d location
+    // has working integration — silencing the "Not configured" row.
     if matches!(shell, Shell::Fish) && legacy_fish_has_integration {
         render_fish_legacy_migration(out, legacy_fish_conf_d, cmd)?;
-        return Ok(false);
+        return Ok(true);
     }
 
     // Wrapper-based shells with WouldAdd: file exists but content drifted
-    // (e.g. outdated wrapper). The per-shell "To update" hint covers it,
-    // so the generic "To configure" summary stays silent.
+    // (e.g. outdated wrapper).
     if shell.is_wrapper_based() && matches!(result.action, ConfigAction::WouldAdd) {
-        let warning = warning_message(cformat!(
-            "<bold>{shell}</>: Outdated shell extension @ <bold>{path}</>"
-        ));
-        let hint = hint_message(cformat!(
-            "To update, run <underline>{cmd} config shell install {shell}</>"
-        ));
-        writeln!(out, "{warning}\n{hint}")?;
-        return Ok(false);
+        writeln!(
+            out,
+            "{}",
+            warning_message(cformat!(
+                "<bold>{shell}</>: Outdated shell extension @ <bold>{path}</>"
+            ))
+        )?;
+        return Ok(true);
     }
 
     // Integration is loaded at runtime even though no rc file matched —
@@ -1309,7 +1513,8 @@ fn render_shell_status(out: &mut String) -> anyhow::Result<()> {
     for result in &scan_result.configured {
         match result.action {
             ConfigAction::AlreadyExists => {
-                render_already_configured(out, result, &detection_results, &cmd, shell_active)?;
+                any_not_configured |=
+                    render_already_configured(out, result, &detection_results, &cmd, shell_active)?;
             }
             ConfigAction::WouldAdd | ConfigAction::WouldCreate
                 if render_would_add_or_create(
@@ -1327,14 +1532,10 @@ fn render_shell_status(out: &mut String) -> anyhow::Result<()> {
         }
     }
 
-    // Show skipped (not installed) shells
-    // For fish with legacy integration, show migration hint instead of "skipped"
+    // Show skipped (not installed) shells. Fish with a wrapper at the
+    // deprecated conf.d path never lands here — `scan_shell_configs` treats
+    // that wrapper as a config location, so the row comes from the loop above.
     for (shell, path) in &scan_result.skipped {
-        if matches!(shell, Shell::Fish) && legacy_fish_has_integration {
-            // Show migration hint for legacy fish location
-            render_fish_legacy_migration(out, legacy_fish_conf_d.as_deref(), &cmd)?;
-            continue;
-        }
         let path = format_path_for_display(path);
         writeln!(
             out,
@@ -1644,17 +1845,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_git_version_returns_version() {
-        // In a normal environment with git installed, should return a version
-        let version = git_version();
-        assert!(version.is_some());
-        let version = version.unwrap();
-        // Version should look like a semver (e.g., "2.47.1")
-        assert!(version.chars().next().unwrap().is_ascii_digit());
-        assert!(version.contains('.'));
-    }
-
-    #[test]
     fn test_is_newer_version() {
         // Newer versions
         assert!(is_newer_version("0.24.0", "0.23.2"));
@@ -1672,25 +1862,6 @@ mod tests {
         // Invalid input
         assert!(!is_newer_version("invalid", "0.23.2"));
         assert!(!is_newer_version("0.23.2", "invalid"));
-    }
-
-    /// Regression guard for #3322: the interactive zsh compinit probe must
-    /// disable job control (`+m`). Without it, the probe grabs wt's controlling
-    /// terminal; a timeout-kill then leaves wt in a background process group and
-    /// the `wt config show` pager suspends with SIGTTOU (`suspended (tty output)`).
-    #[test]
-    fn test_compinit_probe_disables_job_control() {
-        assert!(
-            ZSH_COMPINIT_PROBE_ARGS.contains(&"+m"),
-            "compinit probe must pass +m to disable job control (#3322); got {ZSH_COMPINIT_PROBE_ARGS:?}"
-        );
-        // `+m` must precede `-ic` so it's parsed as an option, not a command arg.
-        let m = ZSH_COMPINIT_PROBE_ARGS.iter().position(|a| *a == "+m");
-        let ic = ZSH_COMPINIT_PROBE_ARGS.iter().position(|a| *a == "-ic");
-        assert!(
-            m < ic,
-            "+m must come before -ic: {ZSH_COMPINIT_PROBE_ARGS:?}"
-        );
     }
 
     #[test]

@@ -5,7 +5,8 @@
 #![cfg(all(unix, feature = "shell-integration-tests"))]
 
 use crate::common::progressive_output::{ProgressiveCaptureOptions, capture_progressive_output};
-use crate::common::{TestRepo, repo};
+use crate::common::pty::{build_pty_command, exec_cmd_in_pty};
+use crate::common::{TestRepo, repo, wt_bin};
 use rstest::rstest;
 
 /// Tests progressive rendering with multiple worktrees.
@@ -145,6 +146,47 @@ fn test_list_progressive_overflow(mut repo: TestRepo) {
     );
 }
 
+/// A wrapped final footer occupies several physical rows. The progressive
+/// renderer must preserve every row instead of applying one width budget to
+/// the whole string and replacing the continuation with an ellipsis.
+#[rstest]
+fn test_list_progressive_wraps_final_footer(mut repo: TestRepo) {
+    for branch in ["feature-alpha", "feature-beta", "feature-gamma"] {
+        repo.add_worktree(branch);
+    }
+
+    let mut opts = ProgressiveCaptureOptions::with_byte_interval(500);
+    opts.terminal_size = (24, 40);
+
+    let output = capture_progressive_output(&repo, "list", &[], opts);
+    assert_eq!(output.exit_code, 0);
+
+    let final_text = output.final_output();
+    let footer = final_text
+        .split_once("Showing")
+        .map(|(_, footer)| footer)
+        .expect("final output should contain the summary footer");
+    assert!(footer.contains("hidden:"), "footer:\n{footer}");
+    assert!(footer.contains("Path"), "footer:\n{footer}");
+    assert!(
+        !footer.lines().any(|line| line.trim() == "…"),
+        "footer:\n{footer}"
+    );
+
+    // The footer redraw moves up exactly one row before clearing. An
+    // off-by-one there would swallow the spacer and every assertion above
+    // would still pass, since they only look below "Showing".
+    let rows: Vec<_> = final_text.lines().collect();
+    let footer_start = rows
+        .iter()
+        .position(|row| row.contains("Showing"))
+        .expect("final output should contain the summary footer");
+    assert!(
+        rows[footer_start - 1].trim().is_empty(),
+        "spacer row should survive the footer redraw.\nFinal output:\n{final_text}"
+    );
+}
+
 /// Tests progressive rendering with no worktrees (fast path).
 #[rstest]
 fn test_list_progressive_fast_command(repo: TestRepo) {
@@ -177,5 +219,55 @@ fn test_list_progressive_fast_command(repo: TestRepo) {
         (content_rows, 0),
         "Cursor should rest directly under the footer.\nFinal output:\n{}",
         output.final_output()
+    );
+}
+
+/// The progressive render applies the stream's resolved color choice to its
+/// content: under `NO_COLOR` the raw PTY byte stream carries no SGR sequence
+/// while the cursor-control CSI the in-place redraw is built on still flows —
+/// distinguishing a stripped progressive render from a fall-through to the
+/// buffered path, whose stream would carry no escapes at all. The forced run
+/// proves the same command emits SGR when color is on, so the absence check
+/// can't pass vacuously.
+#[rstest]
+fn test_list_progressive_honors_no_color(mut repo: TestRepo) {
+    repo.add_worktree("feature-color");
+    let sgr = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+
+    let capture = |no_color: bool| {
+        let mut cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["list", "--full", "--branches"],
+            repo.root_path(),
+            &repo.test_env_vars(),
+            None,
+        );
+        if no_color {
+            // configure_pty_command sets the suite's CLICOLOR_FORCE=1, which
+            // outranks NO_COLOR in anstream's resolution — remove it so the
+            // choice resolves to Never.
+            cmd.env_remove("CLICOLOR_FORCE");
+            cmd.env("NO_COLOR", "1");
+        }
+        exec_cmd_in_pty(cmd, "")
+    };
+
+    let (plain, exit_code) = capture(true);
+    assert_eq!(exit_code, 0);
+    assert!(plain.contains("feature-color"), "output:\n{plain}");
+    assert!(
+        plain.contains("\x1b["),
+        "cursor-control CSI should still flow under NO_COLOR:\n{plain:?}"
+    );
+    assert!(
+        !sgr.is_match(&plain),
+        "no SGR should reach the terminal under NO_COLOR:\n{plain:?}"
+    );
+
+    let (forced, exit_code) = capture(false);
+    assert_eq!(exit_code, 0);
+    assert!(
+        sgr.is_match(&forced),
+        "forced color should emit SGR:\n{forced:?}"
     );
 }

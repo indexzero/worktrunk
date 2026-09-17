@@ -21,18 +21,39 @@
 //!   caller-specified path (e.g. the `project/.git` clone layout).
 //! - [`TestRepo::standard()`] — copies pre-built fixture with remote + worktrees.
 //!   For integration tests (used by the `repo()` rstest fixture).
+//! - [`TestRepo::standard_main_only()`] — copies the same pinned main history and
+//!   remote without linked worktrees. For tests that shape their own topology.
 //! - [`TestRepo::empty()`] — `git init` with no commits, no branches.
 //!
 //! ## Environment Isolation
 //!
-//! Git commands are run with isolated environments using `Cmd::env()` to ensure:
-//! - No interference from global git config
-//! - Deterministic commit timestamps
-//! - Consistent locale settings
-//! - No cross-test contamination
-//! - Thread-safe execution (no global state mutation)
+//! No `git` the suite runs reads the developer's `~/.gitconfig`. The
+//! guarantee is `shell_exec::HERMETIC_TEST_GIT_ENV` — the deny pair pointing
+//! `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` at a path that does not exist,
+//! plus `user.useConfigOnly` through `GIT_CONFIG_COUNT` so a git with no
+//! identity fails rather than guessing one from the host — applied to every
+//! child at its spawn site. For the git that *production* code spawns while a
+//! test drives it in-process, the spawn site is `Cmd`, and the harness has no
+//! per-command hook there; instead the fixture constructors latch
+//! `shell_exec::enable_hermetic_test_env`, and `Cmd` applies the floor to
+//! every child while the latch is set. (A test cannot set its own process
+//! environment instead — under `cargo test` tests are parallel threads, and
+//! `std::env::set_var` beside them is the race that makes it `unsafe`; the
+//! atomic latch is sound from any thread.)
+//!
+//! The rest applies the same floor at the spawn sites the harness does own:
+//!
+//! - [`git_test_env`] adds the test identity, pinned dates, and locale per
+//!   command, which the floor leaves to the per-command layers.
+//! - [`isolate_subprocess_env`] scrubs the host's `GIT_*` from `wt` children
+//!   and re-applies the floor explicitly, so a subprocess denies host config
+//!   just as this process does.
+//!
+//! On top of that isolation the helpers pin commit timestamps, locale, and
+//! terminal width, all per command — no test mutates process-global state.
 
 pub mod mock_commands;
+pub mod mock_stub;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,51 +61,126 @@ use std::process::Command;
 
 use crate::config::sanitize_branch_name;
 use crate::git::Repository;
-use crate::shell_exec::{Cmd, INHERITED_GIT_PATH_VARS};
+use crate::shell_exec::{self, Cmd, INHERITED_GIT_PATH_VARS};
 use path_slash::PathExt;
 
-use self::mock_commands::{MockConfig, MockResponse};
+use self::mock_commands::{MockConfig, MockResponse, tea_api_include_stderr};
 
-/// Path to the `wt` binary built by Cargo.
+/// Path to the `wt` binary built by Cargo, pinned against concurrent builds.
 ///
-/// Tries compile-time `option_env!()` first (works for unit tests in this
-/// crate), then falls back to runtime `std::env::var()` (works for
-/// integration tests that import via `worktrunk::testing`).
+/// Resolved at runtime from `CARGO_BIN_EXE_wt`, which cargo and nextest both
+/// provide to integration-test processes, naming the binary the same
+/// invocation just built — so the path can never be stale. Unit-test targets
+/// get neither this variable nor a compile-time `option_env!` value (cargo
+/// sets `CARGO_BIN_EXE_<name>` only for integration tests and benches), so
+/// code that spawns `wt` — `mock_commands` included — belongs in integration
+/// tests.
 ///
-/// Panics if neither is available (only set during `cargo test`).
+/// The returned path is not `CARGO_BIN_EXE_wt` itself but a hardlink to it
+/// under `target/<profile>/wt-test-bin/<key>/` (see [`pin_test_binary`]):
+/// cargo uplifts `target/debug/wt` by removing the path and recreating it, so
+/// a concurrent `cargo build` in the same tree leaves the uplifted path absent
+/// for a fraction of a millisecond per rebuild, failing whatever spawn is in
+/// flight with `NotFound`. The hardlink keeps the observed binary's inode
+/// alive whatever a concurrent cargo does to the uplifted path. Pinned once
+/// per test process; every spawn helper routes through here, so no test
+/// spawns the unlinkable path directly (`test_wt_spawns_are_pinned`).
+///
+/// Panics when the variable is absent (the test binary run outside a cargo
+/// runner) rather than deriving a path that could name a stale binary.
 pub fn wt_bin() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_wt") {
-        return PathBuf::from(path);
-    }
-    PathBuf::from(
-        std::env::var("CARGO_BIN_EXE_wt")
-            .expect("CARGO_BIN_EXE_wt not set — only available during `cargo test`"),
-    )
+    static PINNED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PINNED
+        .get_or_init(|| {
+            let uplifted = PathBuf::from(
+                std::env::var("CARGO_BIN_EXE_wt")
+                    .expect("CARGO_BIN_EXE_wt not set — only available during `cargo test`"),
+            );
+            pin_test_binary(&uplifted)
+        })
+        .clone()
 }
 
-/// Path to a workspace member binary (`mock-stub`).
+/// Pin `src` where a concurrent cargo can't unlink it, returning the pinned
+/// path.
 ///
-/// Binaries from other workspace packages (not the main `wt` crate) have no
-/// `CARGO_BIN_EXE_<name>` in the main crate's tests. Derives the path from
-/// the test executable's location in `target/debug/deps/`.
-pub fn workspace_bin(name: &str) -> PathBuf {
-    let mut path = std::env::current_exe().expect("failed to get test executable path");
-    path.pop(); // Remove test binary name
-    path.pop(); // Remove deps/
-
-    #[cfg(windows)]
-    path.push(format!("{name}.exe"));
-
-    #[cfg(not(windows))]
-    path.push(name);
-
-    path
+/// Hardlinks `src` into a sibling `wt-test-bin/<mtime>-<len>/` directory named
+/// by the observed binary's identity, keeping `src`'s basename. The hardlink
+/// pins the inode: cargo's uplift only unlinks the *path*, so the pinned entry
+/// keeps serving the observed binary through any number of concurrent
+/// rebuilds. An entry's marginal disk cost is near zero — where cargo uplifts
+/// by hardlink (Linux) the pin shares the `deps/` artifact's inode outright,
+/// and where it uplifts by copy-on-write clone (macOS/APFS) the pin keeps the
+/// clone, whose blocks stay shared with that artifact (measured: cloning the
+/// 70 MB binary consumes 8 KB) — the bytes belong to `deps/`, which cargo
+/// already retains. Everything under `wt-test-bin/` dies with `cargo clean`,
+/// so nothing sweeps it; a sweeper could unlink a generation another live
+/// suite pinned, re-creating the very window this exists to close.
+///
+/// Two runs observing the same binary converge on the same entry (`link`
+/// returning `AlreadyExists` is success — the key names the content); a run
+/// observing a rebuilt binary creates a new entry beside the old one, exactly
+/// as it would have spawned the rebuilt binary before pinning existed. A
+/// `NotFound` from `stat` or `link` is the uplift window itself — the binary
+/// is absent for well under a millisecond — so it's polled through rather than
+/// surfaced (bounded; a genuinely missing binary still panics, with the path).
+pub fn pin_test_binary(src: &Path) -> PathBuf {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match try_pin(src) {
+            Ok(pinned) => return pinned,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "binary to pin stayed absent for 10s: {}",
+                    src.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("failed to pin test binary {}: {e}", src.display()),
+        }
+    }
 }
+
+/// One pin attempt. `NotFound` means `src` was observed mid-uplift (or the
+/// pin directory's ancestors vanished under a `cargo clean`); the caller
+/// retries those.
+fn try_pin(src: &Path) -> std::io::Result<PathBuf> {
+    let meta = std::fs::metadata(src)?;
+    let mtime = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = src
+        .parent()
+        .expect("binary path has a parent")
+        .join("wt-test-bin")
+        .join(format!("{mtime:x}-{:x}", meta.len()));
+    let pinned = dir.join(src.file_name().expect("binary path has a file name"));
+    if pinned.exists() {
+        return Ok(pinned);
+    }
+    std::fs::create_dir_all(&dir)?;
+    match std::fs::hard_link(src, &pinned) {
+        // A concurrent test process pinned the same key first; the key names
+        // the content, so its entry is ours.
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(pinned),
+    }
+}
+
 use tempfile::TempDir;
 
 /// Bump when [`build_standard_fixture`] changes, so stale templates under
 /// `target/` are abandoned rather than reused.
 const STANDARD_FIXTURE_VERSION: u32 = 1;
+
+/// Bump when the main-only transformation in
+/// [`build_standard_main_only_fixture`] changes. Its cache key also includes
+/// [`STANDARD_FIXTURE_VERSION`] because the derived template copies that
+/// fixture as its source.
+const STANDARD_MAIN_ONLY_FIXTURE_VERSION: u32 = 1;
 
 /// Timestamp for the template's commits, author and committer alike.
 ///
@@ -114,6 +210,25 @@ fn standard_fixture_template() -> PathBuf {
     let dir = fixtures.join(format!("standard-v{STANDARD_FIXTURE_VERSION}"));
     if !dir.exists() {
         claim_template(&fixtures, &dir, build_standard_fixture);
+    }
+    dir
+}
+
+/// Get-or-create the standard fixture's main-only topology.
+///
+/// Picker tests build every linked-worktree topology themselves. Copying this
+/// template avoids immediately tearing down the standard fixture's three
+/// linked worktrees with six serial Git subprocesses in every test.
+fn standard_main_only_fixture_template() -> PathBuf {
+    let mut base = std::env::current_exe().expect("failed to get test executable path");
+    base.pop(); // test binary name
+    base.pop(); // deps/
+    let fixtures = base.join("wt-test-fixtures");
+    let dir = fixtures.join(format!(
+        "standard-v{STANDARD_FIXTURE_VERSION}-main-only-v{STANDARD_MAIN_ONLY_FIXTURE_VERSION}"
+    ));
+    if !dir.exists() {
+        claim_template(&fixtures, &dir, build_standard_main_only_fixture);
     }
     dir
 }
@@ -150,7 +265,7 @@ fn claim_template(parent: &Path, dir: &Path, build: impl FnOnce(&Path)) {
 /// back-pointing remote), and three feature worktrees with one commit each.
 fn build_standard_fixture(root: &Path) {
     let git = |dir: &Path| {
-        configure_git_env(Cmd::new("git"), test_gitconfig_path())
+        configure_git_env(Cmd::new("git"))
             .env("GIT_AUTHOR_DATE", STANDARD_FIXTURE_COMMIT_DATE)
             .env("GIT_COMMITTER_DATE", STANDARD_FIXTURE_COMMIT_DATE)
             .current_dir(dir)
@@ -206,28 +321,60 @@ fn build_standard_fixture(root: &Path) {
     }
 }
 
+/// Build the main-only template from the standard fixture once per target
+/// directory. Deriving it with real Git preserves the pinned commit, remote,
+/// tracking refs, attributes, and config while removing linked-worktree
+/// administration through Git's supported path.
+fn build_standard_main_only_fixture(root: &Path) {
+    let fixture = copy_standard_fixture(root);
+    let git = |dir: &Path| configure_git_env(Cmd::new("git")).current_dir(dir);
+    let run = |cmd: Cmd, what: &str| {
+        let output = cmd.run().unwrap();
+        check_git_status(&output, what);
+    };
+    let repo = root.join("repo");
+
+    for branch in ["feature-a", "feature-b", "feature-c"] {
+        let worktree = fixture
+            .worktrees
+            .get(branch)
+            .expect("standard fixture worktree");
+        let worktree = worktree.to_string_lossy();
+        run(
+            git(&repo).args(["worktree", "remove", "--force", worktree.as_ref()]),
+            "worktree remove",
+        );
+        run(
+            git(&repo).args(["branch", "-D", branch]),
+            "delete fixture branch",
+        );
+    }
+}
+
+/// Copy a directory tree without spawning a platform-specific copy command.
+fn copy_dir_recursive(src: &Path, dest: &Path) {
+    std::fs::create_dir_all(dest).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let file_type = entry.file_type().unwrap();
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path);
+        } else if file_type.is_file() {
+            std::fs::copy(&src_path, &dest_path).unwrap();
+        }
+        // Skip symlinks, sockets, etc (shouldn't be in fixtures).
+    }
+}
+
 /// Copy the standard fixture template to create a new test repo with
 /// worktrees and remote.
 ///
 /// Pure Rust recursive copy - 2.5x faster than spawning cp/robocopy.
 /// Benchmarked at 21ms vs 53ms per fixture copy on macOS.
 fn copy_standard_fixture(dest: &Path) -> FixtureWorktrees {
-    fn copy_dir_recursive(src: &Path, dest: &Path) {
-        std::fs::create_dir_all(dest).unwrap();
-        for entry in std::fs::read_dir(src).unwrap() {
-            let entry = entry.unwrap();
-            let file_type = entry.file_type().unwrap();
-            let src_path = entry.path();
-            let dest_path = dest.join(entry.file_name());
-            if file_type.is_dir() {
-                copy_dir_recursive(&src_path, &dest_path);
-            } else if file_type.is_file() {
-                std::fs::copy(&src_path, &dest_path).unwrap();
-            }
-            // Skip symlinks, sockets, etc (shouldn't be in fixture)
-        }
-    }
-
+    shell_exec::enable_hermetic_test_env();
     copy_dir_recursive(&standard_fixture_template(), dest);
 
     // Canonicalize dest for worktrees map (on macOS /var -> /private/var)
@@ -271,49 +418,46 @@ fn copy_standard_fixture(dest: &Path) -> FixtureWorktrees {
     FixtureWorktrees { worktrees, remote }
 }
 
-/// The gitconfig that harness-built commands point `GIT_CONFIG_GLOBAL` at
-/// (see [`configure_git_env`]). The content is identical for every test, so
-/// one file per process serves them all — created lazily like
-/// `isolated_test_cwd`, reaped by the OS after the process exits. Settings
-/// that must also hold for git spawned in-process go in `LOCAL_TEST_CONFIG`
-/// instead.
-pub fn test_gitconfig_path() -> &'static Path {
-    static GITCONFIG: std::sync::LazyLock<(TempDir, PathBuf)> = std::sync::LazyLock::new(|| {
-        let dir = TempDir::new().expect("create test gitconfig dir");
-        let path = dir.path().join("test-gitconfig");
-        std::fs::write(
-            &path,
-            "[user]\n\tname = Test User\n\temail = test@example.com\n\
-             [advice]\n\tmergeConflict = false\n\tresolveConflict = false\n\
-             [init]\n\tdefaultBranch = main\n\
-             [commit]\n\tgpgsign = false\n\
-             [rerere]\n\tenabled = true\n",
-        )
-        .expect("write test gitconfig");
-        (dir, path)
-    });
-    &GITCONFIG.1
+/// Copy the pinned standard history with only its primary worktree and remote.
+fn copy_standard_main_only_fixture(dest: &Path) -> PathBuf {
+    shell_exec::enable_hermetic_test_env();
+    copy_dir_recursive(&standard_main_only_fixture_template(), dest);
+    canonicalize(dest).unwrap().join("origin.git")
 }
+
+/// The identity every test commit is authored and committed under.
+///
+/// Reaches a harness-built `git` through [`git_test_env`] and an in-process one
+/// through [`LOCAL_TEST_CONFIG`], which repeats these two values because a
+/// config file cannot interpolate a constant.
+const TEST_IDENTITY_NAME: &str = "Test User";
+const TEST_IDENTITY_EMAIL: &str = "test@example.com";
 
 /// Settings written into every test repo's own config by
 /// [`write_local_test_config`].
 ///
 /// A unit test driving the library in-process — `Repository::run_command` and
 /// everything layered on it — gets a `git` carrying the *test process's*
-/// environment, so none of [`configure_git_env`]'s isolation applies: no
-/// `GIT_CONFIG_GLOBAL`, meaning the developer's own `~/.gitconfig`, and no
-/// `GIT_ALLOW_PROTOCOL`. The repo's own config is the one layer such a command
-/// still reads, so whatever must hold for it lives here.
+/// environment, so none of [`configure_git_env`]'s per-command isolation
+/// applies: no `GIT_ALLOW_PROTOCOL`, no identity, no pinned dates. The
+/// repo's own config is the one layer such a command still reads, so whatever
+/// must hold for it lives here.
+///
+/// What it does *not* have to carry is host-config denial or the floor's
+/// settings. The hermetic latch (`shell_exec::enable_hermetic_test_env`)
+/// puts both on every `Cmd` child, so an in-process git resolves those
+/// rather than the developer's — see the Git Config Isolation section of
+/// `tests/CLAUDE.md`.
 ///
 /// `protocol.allow = never` with a `file` exception is the config spelling of
 /// `GIT_ALLOW_PROTOCOL=file` (see [`GIT_ALLOWED_PROTOCOLS`] for why the suite
-/// stays off the wire). Identity and `commit.gpgsign` make an in-process commit
-/// work, and work the same way, on a machine that signs commits by default.
+/// stays off the wire). The identity is required rather than convenient: the
+/// hermetic floor sets `user.useConfigOnly`, and deliberately carries no name or
+/// email, so a repo without a local identity fails its commit instead of
+/// authoring one from the host's username and hostname.
 const LOCAL_TEST_CONFIG: &str = r#"[user]
 	name = Test User
 	email = test@example.com
-[commit]
-	gpgsign = false
 [protocol]
 	allow = never
 [protocol "file"]
@@ -380,7 +524,7 @@ const GIT_ALLOWED_PROTOCOLS: &str = "file";
 
 /// Restore git's default protocol set on a command built by
 /// [`configure_git_cmd`], for a caller whose job is to fetch a fixture from
-/// upstream — the real-repo benchmark clone. Grep for this to enumerate
+/// upstream — the large-repository benchmark corpus. Grep for this to enumerate
 /// everything that may reach the wire; tests are not among them.
 pub fn allow_network_transports(cmd: &mut Command) {
     cmd.env_remove("GIT_ALLOW_PROTOCOL");
@@ -413,6 +557,11 @@ pub const STATIC_TEST_ENV_VARS: &[(&str, &str)] = &[
     // Disable delayed streaming for deterministic output across platforms.
     // Without this, slow CI triggers progress messages that don't appear on faster systems.
     ("WORKTRUNK_TEST_DELAYED_STREAM_MS", "-1"),
+    // Give the `--reap` probes (`git::reap::probe_timeout`) a load-proof
+    // bound. At the production 5s, a probe spawn stalling under suite load
+    // trips the timeout, whose fail-safe empty result turns "reap the child"
+    // into "No processes to reap" — a load-dependent outcome.
+    ("WORKTRUNK_TEST_PROBE_TIMEOUT_MS", "60000"),
     // Treat shells as not installed by default so the "Skipped …; rc not found"
     // filter in scan_shell_configs is deterministic across hosts. Tests that need
     // a shell to count as installed (e.g., to assert the Skipped path) set "1".
@@ -482,11 +631,15 @@ pub fn pty_env_vars(paths: TestEnvPaths<'_>) -> Vec<(String, String)> {
         .chain(PTY_TEST_ENV_VARS)
         .map(|&(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    // A PTY child is `env_clear`ed, so the hermetic floor reaches it only if
+    // carried across by hand — every other transport gets it from the `Cmd`
+    // latch or `isolate_subprocess_env`.
     vars.extend(
-        git_test_env(test_gitconfig_path())
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v)),
+        shell_exec::HERMETIC_TEST_GIT_ENV
+            .iter()
+            .map(|&(k, v)| (k.to_string(), v.to_string())),
     );
+    vars.extend(git_test_env().into_iter().map(|(k, v)| (k.to_string(), v)));
 
     vars.extend(
         [
@@ -514,13 +667,6 @@ pub fn pty_env_vars(paths: TestEnvPaths<'_>) -> Vec<(String, String)> {
     vars
 }
 
-/// Null device path, platform-appropriate.
-/// Use this for GIT_CONFIG_SYSTEM to disable system config in tests.
-#[cfg(windows)]
-pub const NULL_DEVICE: &str = "NUL";
-#[cfg(not(windows))]
-pub const NULL_DEVICE: &str = "/dev/null";
-
 /// Default user-config path for isolated subprocesses — points at a
 /// nonexistent file so wt treats it as "no config." Callers can override
 /// via the `user_config` parameter to [`isolate_subprocess_env`].
@@ -546,8 +692,7 @@ pub const COVERAGE_ENV_VARS: &[&str] = &["CARGO_LLVM_COV", "CARGO_LLVM_COV_TARGE
 /// Returns the inherited value when the parent is running under
 /// `cargo llvm-cov` (so coverage data lands where the runner expects). When
 /// nothing is inherited, returns a per-binary, per-pid path under the system
-/// temp dir so an instrumented child (e.g. a stale `mock-stub` left
-/// instrumented by an earlier coverage build) can't fall back to writing
+/// temp dir so an instrumented child can't fall back to writing
 /// `default_<hash>_<pid>.profraw` into the subprocess's cwd. That cwd is the
 /// test worktree for any `wt list` snapshot that spawns a mock, and a stray
 /// profraw there flips `wt list` to "1 with changes" and flakes the snapshot.
@@ -575,7 +720,8 @@ fn default_llvm_profile_file_with(inherited: Option<std::ffi::OsString>) -> std:
 /// Prepare a subprocess to run with a clean wt environment.
 ///
 /// Strips every `GIT_*` and `WORKTRUNK_*` from the parent env, plus
-/// `NO_COLOR` / `FORCE_HYPERLINK` / `SHELL` / `PSModulePath`, then points the three
+/// `NO_COLOR` / `FORCE_HYPERLINK` / `SHELL` / `PSModulePath`; re-applies the
+/// hermetic floor (`shell_exec::HERMETIC_TEST_GIT_ENV`), then points the three
 /// `WORKTRUNK_*_PATH` env vars at known locations:
 ///
 /// - `WORKTRUNK_CONFIG_PATH` ← `user_config` (or [`DEFAULT_ISOLATED_USER_CONFIG`])
@@ -613,6 +759,12 @@ where
         if key.starts_with("GIT_") || key.starts_with("WORKTRUNK_") {
             cmd.env_remove(&key);
         }
+    }
+    // The hermetic floor, restated explicitly now that every inherited
+    // `GIT_*` is gone — the subprocess must deny the host's git config just
+    // as this process does.
+    for (key, val) in shell_exec::HERMETIC_TEST_GIT_ENV {
+        cmd.env(key, val);
     }
     cmd.env_remove("NO_COLOR");
     // Overrides the OSC 8 probe, so an inherited value changes whether `wt
@@ -660,19 +812,71 @@ pub fn scrub_git_path_vars(cmd: &mut Command) {
     }
 }
 
-/// A process-scoped empty directory used as the default `current_dir` for
-/// [`wt_command`]. Created lazily on first use and kept alive for the rest of
-/// the test process; the OS reaps it from the temp dir afterwards (statics
-/// aren't dropped at process exit, so `TempDir::drop` doesn't run).
+/// Root for every temp directory the test fixtures create: one subdirectory of
+/// the system temp dir rather than hundreds of siblings directly inside it.
 ///
-/// The dir is guaranteed to be outside any git repository and to have no
-/// `.config/wt.toml`, so `wt` invocations spawned through [`wt_command`] don't
-/// pick up the test process's inherited CWD (which is typically the worktrunk
-/// repo root, with its own `.config/wt.toml` and git history).
+/// Entries in the shared temp root are cheap to ignore but expensive to *walk*,
+/// and `git::recover::recover_from_path` read_dirs every existing ancestor of a
+/// deleted CWD until a repo claims it — reaching the shared dir itself when
+/// nothing nearer does. This sub-root can't shorten that worst-case walk; what
+/// it does is keep the suite's own churn from growing the shared dir every
+/// run, the accumulation that made the walk slow (see `isolated_test_cwd`).
+///
+/// Where that root sits carries no isolation weight: the fixtures read no
+/// git config outside themselves wherever they live, so a conditional
+/// `includeIf "gitdir:<home>"` in the developer's config can't reach them.
+/// Only the ancestor-walk cost above argues for one location over another.
+///
+/// The name is two characters because a unix socket path can't exceed
+/// `sun_path` (104 bytes on macOS, including the NUL). macOS's per-user
+/// `$TMPDIR` is 56 canonicalized characters, and
+/// `test_copy_ignored_skips_non_regular_files` binds a listener at
+/// `<fixture>/repo/target/test.sock` — 89 bytes before this directory exists at
+/// all. The name and its slash come out of the 14 bytes that were spare;
+/// `worktrunk-tests` (16 with its slash) would overflow them by two.
+///
+/// Created on first use and left in place; what goes inside it are `TempDir`s
+/// that remove themselves on drop, so it stays near-empty between runs.
+pub fn test_temp_root() -> &'static Path {
+    static ROOT: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        let root = std::env::temp_dir().join("wt");
+        std::fs::create_dir_all(&root).expect("create test temp root");
+        root
+    });
+    ROOT.as_path()
+}
+
+/// Create a temp directory under [`test_temp_root`].
+///
+/// The fixtures' replacement for `TempDir::new()` / `tempfile::tempdir()`.
+pub fn test_tempdir() -> TempDir {
+    TempDir::new_in(test_temp_root()).expect("create test temp dir")
+}
+
+/// A single fixed empty directory used as the default `current_dir` for
+/// [`wt_command`], created on first use and shared by every test process.
+///
+/// The dir is outside any git repository and has no `.config/wt.toml`, so `wt`
+/// invocations spawned through [`wt_command`] don't pick up the test process's
+/// inherited CWD (which is typically the worktrunk repo root, with its own
+/// `.config/wt.toml` and git history). Nothing writes into it — a test that
+/// needs to write uses a `TestRepo`.
+///
+/// Deliberately *not* a `TempDir`. Statics aren't dropped at process exit, so a
+/// `TempDir` here is never cleaned up, and nextest runs one process per test:
+/// that leaked one empty directory per test — ~700 per integration-suite run —
+/// into a temp root nothing reliably sweeps (macOS clears it only at boot).
+/// Hundreds of thousands of stale entries cost nothing to ignore but are
+/// expensive to enumerate, and `git::recover::recover_from_path` reads every
+/// ancestor directory of a deleted CWD — the measured cost is in
+/// `tests/CLAUDE.md` → Profiling the Suite. One fixed directory never grows.
 fn isolated_test_cwd() -> &'static Path {
-    static ISOLATED_CWD: std::sync::LazyLock<TempDir> =
-        std::sync::LazyLock::new(|| TempDir::new().expect("create isolated test cwd"));
-    ISOLATED_CWD.path()
+    static ISOLATED_CWD: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        let dir = test_temp_root().join("isolated-cwd");
+        std::fs::create_dir_all(&dir).expect("create isolated test cwd");
+        dir
+    });
+    ISOLATED_CWD.as_path()
 }
 
 /// Create a `wt` CLI command with standardized test environment settings.
@@ -681,8 +885,8 @@ fn isolated_test_cwd() -> &'static Path {
 /// - All host `GIT_*` and `WORKTRUNK_*` variables are cleared
 /// - Color output is forced (`CLICOLOR_FORCE=1`) so ANSI styling appears in snapshots
 /// - Terminal width set to 150 columns (`COLUMNS=150`)
-/// - `current_dir` defaults to a process-scoped empty tempdir (not a git repo,
-///   no project config), so `wt` doesn't pick up worktrunk's own
+/// - `current_dir` defaults to one fixed empty directory shared by every test
+///   process (not a git repo, no project config), so `wt` doesn't pick up worktrunk's own
 ///   `.config/wt.toml` or detect a git repo from the test process's inherited
 ///   CWD. Tests that need a specific CWD must override via
 ///   `cmd.current_dir(...)`; `repo.wt_command()` does so automatically.
@@ -806,17 +1010,27 @@ pub fn configure_cli_command(cmd: &mut Command) {
     // callers get the same defense; nothing extra needed here.
 }
 
-/// The environment for a directly-spawned test `git`: isolated config,
-/// deterministic timestamps and locale, no terminal prompts, no network
-/// transports (`GIT_ALLOWED_PROTOCOLS`).
+/// The environment for a directly-spawned test `git`: deterministic identity,
+/// timestamps and locale, no terminal prompts, no network transports
+/// (`GIT_ALLOWED_PROTOCOLS`). Host-config denial is not here — that is the
+/// hermetic floor's job (`shell_exec::HERMETIC_TEST_GIT_ENV`), which every
+/// consumer of this set applies through its own transport.
 ///
 /// Single home for these settings — [`configure_git_cmd`] (Command),
 /// [`configure_git_env`] (`Cmd`), and [`pty_env_vars`] (PTY) all
 /// consume it, so the three spellings cannot drift.
-pub fn git_test_env(git_config_path: &Path) -> [(&'static str, String); 9] {
+///
+/// The identity is here rather than in the hermetic floor because the floor
+/// carries only the denial and the two `-c` settings; identity already has
+/// this per-command home, and a second copy in the floor could only drift
+/// from it. A harness-built `git` needs one because it commits into repos it
+/// has just created, before `LOCAL_TEST_CONFIG` reaches their local config.
+pub fn git_test_env() -> [(&'static str, String); 11] {
     [
-        ("GIT_CONFIG_GLOBAL", git_config_path.display().to_string()),
-        ("GIT_CONFIG_SYSTEM", NULL_DEVICE.to_string()),
+        ("GIT_AUTHOR_NAME", TEST_IDENTITY_NAME.to_string()),
+        ("GIT_AUTHOR_EMAIL", TEST_IDENTITY_EMAIL.to_string()),
+        ("GIT_COMMITTER_NAME", TEST_IDENTITY_NAME.to_string()),
+        ("GIT_COMMITTER_EMAIL", TEST_IDENTITY_EMAIL.to_string()),
         ("GIT_AUTHOR_DATE", "2025-01-01T00:00:00Z".to_string()),
         ("GIT_COMMITTER_DATE", "2025-01-01T00:00:00Z".to_string()),
         ("LC_ALL", "C".to_string()),
@@ -830,17 +1044,19 @@ pub fn git_test_env(git_config_path: &Path) -> [(&'static str, String); 9] {
 /// Configure a git command with isolated environment for testing.
 ///
 /// Applies [`git_test_env`].
-///
-/// # Arguments
-/// * `cmd` - The git Command to configure
-/// * `git_config_path` - Path to git config file (use `/dev/null` or `NULL_DEVICE` for none)
-pub fn configure_git_cmd(cmd: &mut Command, git_config_path: &Path) {
+pub fn configure_git_cmd(cmd: &mut Command) {
+    shell_exec::enable_hermetic_test_env();
     // Defensive: every existing caller is downstream of `configure_cli_command`
     // (which already stripped these via `isolate_subprocess_env`), but a future
     // test that spawns `git` from an unprepared parent shouldn't be vulnerable
     // to an inherited relative `GIT_DIR` redirecting discovery.
     scrub_git_path_vars(cmd);
-    for (key, value) in git_test_env(git_config_path) {
+    // The floor by hand — a plain `Command` child doesn't pass through the
+    // `Cmd` latch.
+    for (key, val) in shell_exec::HERMETIC_TEST_GIT_ENV {
+        cmd.env(key, val);
+    }
+    for (key, value) in git_test_env() {
         cmd.env(key, value);
     }
 }
@@ -849,12 +1065,13 @@ pub fn configure_git_cmd(cmd: &mut Command, git_config_path: &Path) {
 ///
 /// This is the `Cmd` equivalent of [`configure_git_cmd`]. Use this when building
 /// git commands via the builder pattern (`Cmd::new("git")`).
-pub fn configure_git_env(cmd: Cmd, git_config_path: &Path) -> Cmd {
+pub fn configure_git_env(cmd: Cmd) -> Cmd {
+    shell_exec::enable_hermetic_test_env();
     // Defensive `GIT_*` path-var strip — see `configure_git_cmd` for rationale.
     let cmd = INHERITED_GIT_PATH_VARS
         .iter()
         .fold(cmd, |acc, var| acc.env_remove(var));
-    git_test_env(git_config_path)
+    git_test_env()
         .into_iter()
         .fold(cmd, |acc, (key, value)| acc.env(key, value))
 }
@@ -864,17 +1081,14 @@ pub fn configure_git_env(cmd: Cmd, git_config_path: &Path) -> Cmd {
 /// Provides `configure_git_cmd()` (for `Command`), `git_command()` (returns `Cmd`),
 /// and `run_git_in()` with consistent environment isolation.
 pub trait TestRepoBase {
-    /// Path to the git config file for this test.
-    fn git_config_path(&self) -> &Path;
-
     /// Configure a git command with isolated environment.
     fn configure_git_cmd(&self, cmd: &mut Command) {
-        configure_git_cmd(cmd, self.git_config_path());
+        configure_git_cmd(cmd);
     }
 
     /// Create a git command for the given directory.
     fn git_command(&self, dir: &Path) -> Cmd {
-        configure_git_env(Cmd::new("git"), self.git_config_path()).current_dir(dir)
+        configure_git_env(Cmd::new("git")).current_dir(dir)
     }
 
     /// Run a git command in a specific directory, panicking on failure.
@@ -910,20 +1124,14 @@ pub trait TestRepoBase {
     }
 }
 
-/// Create a pair of temporary files for directive output (cd + exec), in a
-/// directory of their own.
+/// Create a temporary CD directive file for a shell-integration test.
 ///
-/// The shell wrapper creates temp files and sets `WORKTRUNK_DIRECTIVE_CD_FILE`
-/// and `WORKTRUNK_DIRECTIVE_EXEC_FILE` before running wt. Use
-/// `configure_directive_files()` to set these on a Command for testing.
-///
-/// Returns `(cd_path, exec_path, guard)`. The guard must be kept alive for the
-/// duration of the test — dropping it removes the directory and both files.
-pub fn directive_files() -> (PathBuf, PathBuf, TempDir) {
+/// The guard must be kept alive for the duration of the test — dropping it
+/// removes the directory and file.
+pub fn directive_file() -> (PathBuf, TempDir) {
     let dir = directive_temp_dir();
     let cd_path = create_empty(dir.path().join("cd"));
-    let exec_path = create_empty(dir.path().join("exec"));
-    (cd_path, exec_path, dir)
+    (cd_path, dir)
 }
 
 /// A private directory for a test's directive files.
@@ -943,48 +1151,15 @@ fn directive_temp_dir() -> TempDir {
     TempDir::new().expect("failed to create directive temp dir")
 }
 
-/// Create `path` as an empty file, as the shell wrapper's `mktemp` would, and
-/// return it. wt appends to the exec file rather than creating it, so it has to
-/// exist before wt runs.
+/// Create `path` as an empty file and return it.
 fn create_empty(path: PathBuf) -> PathBuf {
     std::fs::File::create(&path).expect("failed to create a directive file in its own temp dir");
     path
 }
 
-/// Configure a Command to use the new split directive-file protocol.
-///
-/// Sets `WORKTRUNK_DIRECTIVE_CD_FILE` and `WORKTRUNK_DIRECTIVE_EXEC_FILE` env
-/// vars so the wt binary writes a raw path to the cd file and arbitrary shell
-/// to the exec file.
-pub fn configure_directive_files(cmd: &mut Command, cd_path: &Path, exec_path: &Path) {
+/// Configure a Command with the shell wrapper's CD directive file.
+pub fn configure_directive_file(cmd: &mut Command, cd_path: &Path) {
     cmd.env("WORKTRUNK_DIRECTIVE_CD_FILE", cd_path);
-    cmd.env("WORKTRUNK_DIRECTIVE_EXEC_FILE", exec_path);
-}
-
-/// Configure a Command to use the split directive-file protocol with only the
-/// CD file (EXEC scrubbed). This simulates running inside an alias/hook body
-/// where the EXEC env var was stripped.
-pub fn configure_directive_cd_only(cmd: &mut Command, cd_path: &Path) {
-    cmd.env("WORKTRUNK_DIRECTIVE_CD_FILE", cd_path);
-}
-
-/// Create a temporary file for legacy single-file directive output, in a
-/// directory of its own (see `directive_temp_dir` for why).
-///
-/// Used to test the legacy fallback path where an old shell wrapper sets
-/// `WORKTRUNK_DIRECTIVE_FILE`. Returns `(path, guard)`.
-pub fn legacy_directive_file() -> (PathBuf, TempDir) {
-    let dir = directive_temp_dir();
-    let path = create_empty(dir.path().join("directive"));
-    (path, dir)
-}
-
-/// Configure a Command to use the legacy single-file directive protocol.
-///
-/// Sets `WORKTRUNK_DIRECTIVE_FILE` env var (no new vars) to simulate an
-/// outdated shell wrapper that hasn't been updated to the split protocol.
-pub fn configure_legacy_directive_file(cmd: &mut Command, path: &Path) {
-    cmd.env("WORKTRUNK_DIRECTIVE_FILE", path);
 }
 
 /// Set home environment variables for commands that rely on isolated temp homes.
@@ -1012,6 +1187,19 @@ pub fn set_temp_home_env(cmd: &mut Command, home: &Path) {
     // matches the setup helpers and stays hermetic against an ambient
     // CLAUDE_CONFIG_DIR inherited from the test runner's environment.
     cmd.env("CLAUDE_CONFIG_DIR", home.join(".claude"));
+    for var in [
+        "OMP_PROFILE",
+        "PI_PROFILE",
+        "PI_CONFIG_DIR",
+        "PI_CODING_AGENT_DIR",
+        // Codex resolves its config root from CODEX_HOME, falling back to
+        // `$HOME/.codex` — which the temp home already pins. Dropping an
+        // ambient value is all hermeticity needs, and unlike setting one it
+        // keeps the variable out of every snapshot's env block.
+        "CODEX_HOME",
+    ] {
+        cmd.env_remove(var);
+    }
 }
 
 /// Override `WORKTRUNK_CONFIG_PATH` to point to the XDG-derived user config path
@@ -1046,8 +1234,8 @@ pub fn check_git_status(output: &std::process::Output, cmd_desc: &str) {
 }
 
 /// The isolated per-test config files a [`TestRepo`] carries, both rooted in
-/// one temp directory. (The test gitconfig is not here: its content is
-/// per-process constant, so it lives at [`test_gitconfig_path`].)
+/// one temp directory. (There is no git config among them: the suite's git
+/// isolation is environment, carrying no per-test state.)
 struct TestConfigPaths {
     wt: PathBuf,
     approvals: PathBuf,
@@ -1119,7 +1307,7 @@ impl TestRepo {
     /// Bare repos have no working tree — useful for testing error paths
     /// and bare-repo-specific behavior (e.g., hint fallback to `wt list`).
     pub fn bare() -> Self {
-        Self::init_repo(&["init", "--bare"])
+        Self::init_repo(&["init", "--bare", "-b", "main"])
     }
 
     /// Path to the repository working directory.
@@ -1143,7 +1331,7 @@ impl TestRepo {
     /// Also sets up mock gh/glab commands that appear authenticated to prevent
     /// CI status hints from appearing in test output.
     pub fn standard() -> Self {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = test_tempdir();
 
         // Copy from standard fixture (includes worktrees and remote)
         let fixture = copy_standard_fixture(temp_dir.path());
@@ -1158,6 +1346,24 @@ impl TestRepo {
         // Mock gh/glab as authenticated to prevent CI hints in test output
         repo.setup_mock_gh();
 
+        repo
+    }
+
+    /// Create a test repository with the standard fixture's pinned main
+    /// history and remote, but no linked worktrees.
+    ///
+    /// Use when a test constructs its own worktree topology. Unlike
+    /// [`standard()`](Self::standard), this does not install forge mocks:
+    /// callers that exercise forge commands should install strict mocks for
+    /// the route they expect.
+    pub fn standard_main_only() -> Self {
+        let temp_dir = test_tempdir();
+        let remote = copy_standard_main_only_fixture(temp_dir.path());
+
+        let paths = TestConfigPaths::in_dir(temp_dir.path());
+        let root = temp_dir.path().join("repo");
+        let mut repo = Self::assemble(temp_dir, &root, paths);
+        repo.remote = Some(remote);
         repo
     }
 
@@ -1179,7 +1385,7 @@ impl TestRepo {
     /// project/.git` pattern where the bare dir sits inside a project
     /// directory the test owns.
     pub fn bare_at(path: &Path) -> Self {
-        Self::at_with(path, &["init", "--bare", "--quiet"])
+        Self::at_with(path, &["init", "--bare", "-b", "main", "--quiet"])
     }
 
     /// Shared initializer for [`at()`](Self::at) and [`bare_at()`](Self::bare_at):
@@ -1187,10 +1393,10 @@ impl TestRepo {
     fn at_with(path: &Path, git_args: &[&str]) -> Self {
         std::fs::create_dir_all(path).unwrap();
 
-        let config_dir = TempDir::new().unwrap();
+        let config_dir = test_tempdir();
         let paths = TestConfigPaths::in_dir(config_dir.path());
 
-        configure_git_env(Cmd::new("git"), test_gitconfig_path())
+        configure_git_env(Cmd::new("git"))
             .args(git_args.iter().copied())
             .current_dir(path)
             .run()
@@ -1204,19 +1410,22 @@ impl TestRepo {
     /// Use this for tests that specifically need to test behavior in an
     /// uninitialized repo. Most tests should use `new()` instead.
     pub fn empty() -> Self {
-        Self::init_repo(&["init", "-q"])
+        Self::init_repo(&["init", "-q", "-b", "main"])
     }
 
     /// Shared initializer for `new()`, `bare()`, and `empty()`: makes a tempdir
-    /// and runs `git init` with the given arguments inside it.
-    fn init_repo(git_args: &[&str]) -> Self {
-        let temp_dir = TempDir::new().unwrap();
+    /// and runs `git init` with the given arguments inside it. Public for a
+    /// test that needs an `init` option no named constructor covers, such as
+    /// `--object-format=sha256`.
+    pub fn init_repo(git_args: &[&str]) -> Self {
+        shell_exec::enable_hermetic_test_env();
+        let temp_dir = test_tempdir();
         let root = temp_dir.path().join("repo");
         std::fs::create_dir(&root).unwrap();
 
         let paths = TestConfigPaths::in_dir(temp_dir.path());
 
-        configure_git_env(Cmd::new("git"), test_gitconfig_path())
+        configure_git_env(Cmd::new("git"))
             .args(git_args.iter().copied())
             .current_dir(&root)
             .run()
@@ -1259,7 +1468,7 @@ impl TestRepo {
     /// This sets environment variables only for the specific command,
     /// ensuring thread-safety and test isolation.
     pub fn configure_git_cmd(&self, cmd: &mut Command) {
-        configure_git_cmd(cmd, test_gitconfig_path());
+        configure_git_cmd(cmd);
     }
 
     /// This repo's environment for a PTY-spawned wt subprocess.
@@ -1304,7 +1513,7 @@ impl TestRepo {
     /// ```
     #[must_use]
     pub fn git_command(&self) -> Cmd {
-        configure_git_env(Cmd::new("git"), test_gitconfig_path()).current_dir(&self.root)
+        configure_git_env(Cmd::new("git")).current_dir(&self.root)
     }
 
     /// Run a git command in the repo root, panicking on failure.
@@ -1933,12 +2142,10 @@ impl TestRepo {
     /// The mock gh returns:
     /// - `gh auth status`: exits successfully (0)
     /// - `gh pr list`: returns empty JSON array (no PRs found)
-    /// - `gh run list`: returns empty JSON array (no runs found)
     ///
     /// This prevents CI detection from blocking tests with network calls.
     pub fn setup_mock_gh(&mut self) {
-        // Delegate to setup_mock_gh_with_ci_data with empty arrays
-        self.setup_mock_gh_with_ci_data("[]", "[]");
+        self.setup_mock_gh_with_ci_data("[]");
     }
 
     /// Setup mock `gh` and `glab` commands that show "installed but not authenticated"
@@ -2006,13 +2213,36 @@ impl TestRepo {
             .write(mock_bin);
     }
 
-    /// Setup mock `claude` CLI as installed
+    /// Setup mock `claude` CLI as installed, listing no plugins
     ///
-    /// Call this after setup_mock_ci_tools_unauthenticated() to simulate
-    /// Claude Code being available on the system.
+    /// `wt config show` and the plugin commands ask Claude Code what it
+    /// holds, so a test that says Claude Code is available has to put a mock
+    /// on `PATH` to answer — otherwise the question reaches whatever `claude`
+    /// the developer has installed, and the answer is their own plugin list.
+    /// Call `setup_mock_ci_tools_unauthenticated()` first.
     pub fn setup_mock_claude_installed(&mut self) {
-        // Mark Claude as installed for test environment
+        self.write_claude_plugin_list(MockResponse::output("[]"));
         self.claude_installed = true;
+    }
+
+    /// Setup mock `claude` CLI as installed, listing the worktrunk plugin
+    ///
+    /// The counterpart of [`Self::setup_mock_claude_installed`] for the state
+    /// after a successful install.
+    pub fn setup_mock_claude_with_plugin_installed(&mut self) {
+        self.write_claude_plugin_list(MockResponse::output(Self::CLAUDE_PLUGINS_WITH_WORKTRUNK));
+        self.claude_installed = true;
+    }
+
+    /// Write a `claude` mock whose only answer is `plugin list --json`.
+    fn write_claude_plugin_list(&self, list: MockResponse) {
+        let mock_bin = self
+            .mock_bin_path
+            .as_ref()
+            .expect("call setup_mock_ci_tools_unauthenticated() first");
+        MockConfig::new("claude")
+            .command("plugin list", list)
+            .write(mock_bin);
     }
 
     /// Setup mock `codex` CLI as installed
@@ -2023,19 +2253,39 @@ impl TestRepo {
         self.codex_installed = true;
     }
 
-    /// Setup the worktrunk plugin as installed in Claude Code
+    /// `claude plugin list --json` holding the worktrunk plugin
     ///
-    /// Creates the installed_plugins.json file in the temp home directory.
-    /// The temp_home must already be set up (via set_temp_home_env on the command).
-    pub fn setup_plugin_installed(temp_home: &std::path::Path) {
-        let plugins_dir = temp_home.join(".claude/plugins");
-        std::fs::create_dir_all(&plugins_dir).unwrap();
-        std::fs::write(
-            plugins_dir.join("installed_plugins.json"),
-            r#"{"version":2,"plugins":{"worktrunk@worktrunk":[{"scope":"user"}]}}"#,
-        )
-        .unwrap();
-    }
+    /// Claude Code prints a bare array of plugin objects whose `id` is the
+    /// `PLUGIN@MARKETPLACE` selector its install and uninstall commands take.
+    pub const CLAUDE_PLUGINS_WITH_WORKTRUNK: &'static str =
+        r#"[{"id":"worktrunk@worktrunk","version":"9f13c0a41e57","scope":"user","enabled":true}]"#;
+
+    /// `claude plugin marketplace list --json` holding the worktrunk
+    /// marketplace
+    ///
+    /// Claude Code prints a bare array of marketplace objects. These bodies
+    /// are the mock's stdout rather than a config-file fixture, because wt
+    /// asks the harness what it holds instead of reading the file the harness
+    /// keeps it in.
+    pub const CLAUDE_MARKETPLACES_WITH_WORKTRUNK: &'static str =
+        r#"[{"name":"worktrunk","source":"github","repo":"max-sixty/worktrunk"}]"#;
+
+    /// `claude plugin marketplace list --json` holding some other marketplace
+    ///
+    /// The state a second `uninstall` lands in for a user who has other
+    /// marketplaces: the list is non-empty and worktrunk is simply not in it.
+    pub const CLAUDE_MARKETPLACES_WITHOUT_WORKTRUNK: &'static str =
+        r#"[{"name":"other","source":"github","repo":"someone/other"}]"#;
+
+    /// `codex plugin marketplace list --json` holding the worktrunk
+    /// marketplace
+    ///
+    /// Codex nests its entries under `marketplaces` where Claude Code prints
+    /// a bare array.
+    pub const CODEX_MARKETPLACES_WITH_WORKTRUNK: &'static str = r#"{"marketplaces":[{"name":"worktrunk","root":"/marketplaces/worktrunk","marketplaceSource":{"sourceType":"git","source":"https://github.com/max-sixty/worktrunk.git"}}]}"#;
+
+    /// `codex plugin marketplace list --json` holding some other marketplace
+    pub const CODEX_MARKETPLACES_WITHOUT_WORKTRUNK: &'static str = r#"{"marketplaces":[{"name":"other","root":"/marketplaces/other","marketplaceSource":{"sourceType":"git","source":"https://github.com/someone/other.git"}}]}"#;
 
     /// Setup the statusline as configured in Claude Code settings
     ///
@@ -2073,49 +2323,62 @@ impl TestRepo {
         .unwrap();
     }
 
-    /// Setup mock `gemini` CLI as installed
+    /// Setup mock `gemini` CLI as installed, listing no extensions
     ///
-    /// Call this to simulate Gemini CLI being available on the system.
+    /// Like [`Self::setup_mock_claude_installed`], the mock has to be on
+    /// `PATH` to answer, or the question reaches the developer's own Gemini
+    /// CLI. Call `setup_mock_ci_tools_unauthenticated()` first.
     pub fn setup_mock_gemini_installed(&mut self) {
+        self.write_gemini_extensions_list(MockResponse::output("[]"));
         self.gemini_installed = true;
     }
 
-    /// Make `claude`, `codex`, `opencode`, and `gemini` resolvable on `PATH`.
+    /// Setup mock `gemini` CLI as installed, listing the worktrunk extension
+    pub fn setup_mock_gemini_with_extension_installed(&mut self) {
+        self.write_gemini_extensions_list(MockResponse::output(
+            Self::GEMINI_EXTENSIONS_WITH_WORKTRUNK,
+        ));
+        self.gemini_installed = true;
+    }
+
+    /// `gemini extensions list -o json` holding the worktrunk extension
+    ///
+    /// Gemini CLI prints a bare array of extension objects carrying the
+    /// `name` the extension was installed under.
+    pub const GEMINI_EXTENSIONS_WITH_WORKTRUNK: &'static str = r#"[{"name":"worktrunk","version":"0.77.0","path":"/extensions/worktrunk","isActive":true}]"#;
+
+    /// Write a `gemini` mock whose only answer is `extensions list -o json`.
+    fn write_gemini_extensions_list(&self, list: MockResponse) {
+        let mock_bin = self
+            .mock_bin_path
+            .as_ref()
+            .expect("call setup_mock_ci_tools_unauthenticated() first");
+        MockConfig::new("gemini")
+            .command("extensions list", list)
+            .write(mock_bin);
+    }
+
+    /// Make `claude`, `codex`, `opencode`, `omp`, `pi`, and `gemini` resolvable on `PATH`.
     ///
     /// The `setup_mock_*_installed` helpers force detection through the
     /// `WORKTRUNK_TEST_*_INSTALLED` env overrides, so the `which::which`
     /// lookup inside each `is_*_available()` never runs under test. This
     /// helper instead drops those overrides and prepends real mock
     /// executables, exercising the production PATH-detection path for all
-    /// four AI CLIs at once. Call `setup_mock_ci_tools_unauthenticated()`
+    /// six AI CLIs at once. Call `setup_mock_ci_tools_unauthenticated()`
     /// first to create the mock bin directory.
     pub fn setup_mock_clis_on_path(&mut self) {
         let mock_bin = self
             .mock_bin_path
             .as_ref()
             .expect("call setup_mock_ci_tools_unauthenticated() first");
-        // `wt config show` only `which`-detects these CLIs (never runs
-        // them), so the mocks need no command behavior.
-        for cli in ["claude", "codex", "opencode", "gemini"] {
+        // The mocks answer nothing, so each `--json` listing `wt config show`
+        // asks for fails and the section renders its "not installed" hint.
+        // What this test covers is the `which::which` detection above it.
+        for cli in ["claude", "codex", "opencode", "omp", "pi", "gemini"] {
             MockConfig::new(cli).write(mock_bin);
         }
         self.detect_clis_via_path = true;
-    }
-
-    /// Setup the worktrunk extension as installed in Gemini CLI
-    ///
-    /// `gemini extensions install` clones the extension into
-    /// `~/.gemini/extensions/<name>/`; this writes the resulting
-    /// `gemini-extension.json` under the temp home directory (which must
-    /// already be set up via `set_temp_home_env` on the command).
-    pub fn setup_gemini_extension_installed(temp_home: &std::path::Path) {
-        let extension_dir = temp_home.join(".gemini/extensions/worktrunk");
-        std::fs::create_dir_all(&extension_dir).unwrap();
-        std::fs::write(
-            extension_dir.join("gemini-extension.json"),
-            include_str!("../../gemini-extension.json"),
-        )
-        .unwrap();
     }
 
     /// Setup mock `claude` CLI with plugin subcommand support
@@ -2131,6 +2394,11 @@ impl TestRepo {
 
         MockConfig::new("claude")
             .command("plugin marketplace", MockResponse::exit(0))
+            // Uninstall asks what Claude Code holds before deciding a target
+            // is already gone, so a mock that answered nothing would leave the
+            // question open on every path that reaches it.
+            .command("plugin marketplace list", MockResponse::output("[]"))
+            .command("plugin list", MockResponse::output("[]"))
             .command("plugin install", MockResponse::exit(0))
             .command("plugin uninstall", MockResponse::exit(0))
             .write(mock_bin);
@@ -2141,9 +2409,9 @@ impl TestRepo {
     /// Setup mock `codex` CLI with plugin marketplace support
     ///
     /// Creates a mock codex binary that handles `plugin marketplace add`,
-    /// and `plugin marketplace remove` commands. Must call
-    /// `setup_mock_ci_tools_unauthenticated()` first to create the mock bin
-    /// directory.
+    /// `plugin marketplace remove`, `plugin add`, and `plugin remove`
+    /// commands. Must call `setup_mock_ci_tools_unauthenticated()` first to
+    /// create the mock bin directory.
     pub fn setup_mock_codex_with_plugins(&mut self) {
         let mock_bin = self
             .mock_bin_path
@@ -2153,17 +2421,110 @@ impl TestRepo {
         MockConfig::new("codex")
             .command("plugin marketplace add", MockResponse::exit(0))
             .command("plugin marketplace remove", MockResponse::exit(0))
+            .command(
+                "plugin marketplace list",
+                MockResponse::output(r#"{"marketplaces":[]}"#),
+            )
+            .command("plugin add", MockResponse::exit(0))
+            .command("plugin remove", MockResponse::exit(0))
             .write(mock_bin);
 
         self.codex_installed = true;
     }
 
-    /// Setup mock `claude` CLI where plugin commands fail
+    /// Setup mock `claude` CLI whose only failing command is the marketplace
+    /// removal, answering `plugin marketplace list --json` with `list`
     ///
-    /// Creates a mock claude binary where `plugin marketplace`, `plugin install`,
-    /// and `plugin uninstall` all exit with code 1 and print an error.
-    /// Must call `setup_mock_ci_tools_unauthenticated()` first.
-    pub fn setup_mock_claude_with_plugins_failing(&mut self) {
+    /// Uninstall asks the harness what it holds to tell "the marketplace was
+    /// already gone" from a removal that genuinely failed, so the two cases
+    /// need a mock that fails the removal and leaves every other step alone.
+    /// `list` is the whole variable between them — a body for an answer the
+    /// reader can use, a failing response for one it cannot. Must call
+    /// `setup_mock_ci_tools_unauthenticated()` first.
+    pub fn setup_mock_claude_with_marketplace_remove_failing(&mut self, list: MockResponse) {
+        let mock_bin = self
+            .mock_bin_path
+            .as_ref()
+            .expect("call setup_mock_ci_tools_unauthenticated() first");
+
+        MockConfig::new("claude")
+            .command("plugin marketplace add", MockResponse::exit(0))
+            .command(
+                "plugin marketplace remove",
+                MockResponse::exit(1).with_stderr("error: marketplace remove failed\n"),
+            )
+            .command("plugin marketplace list", list)
+            .command("plugin list", MockResponse::output("[]"))
+            .command("plugin install", MockResponse::exit(0))
+            .command("plugin uninstall", MockResponse::exit(0))
+            .write(mock_bin);
+
+        self.claude_installed = true;
+    }
+
+    /// Setup mock `codex` CLI whose only failing command is the marketplace
+    /// removal, answering `plugin marketplace list --json` with `list`
+    ///
+    /// The Codex counterpart of
+    /// `setup_mock_claude_with_marketplace_remove_failing`.
+    pub fn setup_mock_codex_with_marketplace_remove_failing(&mut self, list: MockResponse) {
+        let mock_bin = self
+            .mock_bin_path
+            .as_ref()
+            .expect("call setup_mock_ci_tools_unauthenticated() first");
+
+        MockConfig::new("codex")
+            .command("plugin marketplace add", MockResponse::exit(0))
+            .command(
+                "plugin marketplace remove",
+                MockResponse::exit(1).with_stderr("error: marketplace remove failed\n"),
+            )
+            .command("plugin marketplace list", list)
+            .command("plugin add", MockResponse::exit(0))
+            .command("plugin remove", MockResponse::exit(0))
+            .write(mock_bin);
+
+        self.codex_installed = true;
+    }
+
+    /// Setup mock `codex` CLI whose marketplace commands succeed and whose
+    /// plugin commands fail
+    ///
+    /// Isolates a `codex plugin add` / `codex plugin remove` failure from the
+    /// marketplace step that runs beside it. Must call
+    /// `setup_mock_ci_tools_unauthenticated()` first.
+    pub fn setup_mock_codex_with_plugin_ops_failing(&mut self) {
+        let mock_bin = self
+            .mock_bin_path
+            .as_ref()
+            .expect("call setup_mock_ci_tools_unauthenticated() first");
+
+        MockConfig::new("codex")
+            .command("plugin marketplace add", MockResponse::exit(0))
+            .command("plugin marketplace remove", MockResponse::exit(0))
+            .command(
+                "plugin add",
+                MockResponse::exit(1).with_stderr("error: plugin add failed\n"),
+            )
+            .command(
+                "plugin remove",
+                MockResponse::exit(1).with_stderr("error: plugin remove failed\n"),
+            )
+            .write(mock_bin);
+
+        self.codex_installed = true;
+    }
+
+    /// Setup mock `claude` CLI where plugin commands fail, answering
+    /// `plugin list --json` with `list`
+    ///
+    /// Creates a mock claude binary where `plugin marketplace`, `plugin
+    /// install`, and `plugin uninstall` all exit with code 1 and print an
+    /// error. `list` is what the install short-circuits on and what decides
+    /// whether the failed uninstall is genuine, so each caller says which
+    /// state it is failing from. Must call
+    /// `setup_mock_ci_tools_unauthenticated()` first.
+    pub fn setup_mock_claude_with_plugins_failing(&mut self, list: MockResponse) {
         let mock_bin = self
             .mock_bin_path
             .as_ref()
@@ -2182,6 +2543,7 @@ impl TestRepo {
                 "plugin uninstall",
                 MockResponse::exit(1).with_stderr("error: uninstall failed\n"),
             )
+            .command("plugin list", list)
             .write(mock_bin);
 
         self.claude_installed = true;
@@ -2213,25 +2575,20 @@ impl TestRepo {
     /// Setup mock `gh` that returns configurable PR/CI data
     ///
     /// Use this for testing CI status parsing code. The mock returns JSON data
-    /// for `gh pr list` and `gh run list` commands.
+    /// for `gh pr list`.
     ///
     /// # Arguments
     /// * `pr_json` - JSON string to return for `gh pr list --json ...`
-    /// * `run_json` - JSON string to return for `gh run list --json ...`
-    pub fn setup_mock_gh_with_ci_data(&mut self, pr_json: &str, run_json: &str) {
+    pub fn setup_mock_gh_with_ci_data(&mut self, pr_json: &str) {
         let mock_bin = self.temp_dir.path().join("mock-bin");
         std::fs::create_dir_all(&mock_bin).unwrap();
 
-        // Write JSON data files
         std::fs::write(mock_bin.join("pr_data.json"), pr_json).unwrap();
-        std::fs::write(mock_bin.join("run_data.json"), run_json).unwrap();
 
-        // Configure gh mock
         MockConfig::new("gh")
             .version("gh version 2.0.0 (mock)")
             .command("auth", MockResponse::exit(0))
             .command("pr", MockResponse::file("pr_data.json"))
-            .command("run", MockResponse::file("run_data.json"))
             .write(&mock_bin);
 
         // Configure glab mock (fails - no GitLab support)
@@ -2282,7 +2639,7 @@ impl TestRepo {
             .command("mr list", MockResponse::file("mr_list_data.json"));
 
         // Parse MR array and create iid-specific view commands
-        // Triple match: "mr view 1" matches before "mr view" (see mock-stub)
+        // Triple match: "mr view 1" matches before "mr view" (see `mock_stub`)
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(mr_json)
             && let Some(arr) = parsed.as_array()
         {
@@ -2304,7 +2661,7 @@ impl TestRepo {
         };
 
         // Configure glab mock with compound command matching
-        // "mr view <iid>" is matched before "mr view" (see mock-stub triple matching)
+        // "mr view <iid>" is matched before "mr view" (see `mock_stub` triple matching)
         mock_config
             .command("repo", MockResponse::output(&project_id_response))
             .command("ci", MockResponse::output("[]"))
@@ -2497,48 +2854,69 @@ impl TestRepo {
         self.mock_bin_path = Some(mock_bin);
     }
 
-    /// Setup mock `tea` that returns configurable Gitea PR / commit-status data.
+    /// Setup mock `tea` that returns configurable Gitea PR / commit-status
+    /// responses.
     ///
     /// Use this for testing Gitea CI status parsing. The mock handles:
-    /// - `tea api repos/{owner}/{repo}/pulls?state=open` → `pulls_json`
-    /// - `tea api repos/{owner}/{repo}/commits/{head_sha}/status` → `status_json`
+    /// - `tea api --include repos/{owner}/{repo}/pulls?state=open` → `pulls`
+    /// - `tea api --include repos/{owner}/{repo}/commits/{head_sha}/status` →
+    ///   `status`
     ///
-    /// `owner`/`repo_name`/`head_sha` are needed because mock-stub matches the
-    /// invocation's leading arguments verbatim, and `tea api <path>` passes the
-    /// whole API path as a single argument — so the exact path string must be
-    /// registered.
+    /// `owner`/`repo_name`/`head_sha` are needed because the mock playback matches the
+    /// invocation's leading arguments verbatim, and `tea api --include <path>`
+    /// passes the whole API path as a single argument — so the exact path
+    /// string must be registered.
     ///
     /// # Arguments
     /// * `owner`, `repo_name` - the Gitea repo the test's remote points at.
     /// * `head_sha` - the SHA used for the `commits/{sha}/status` lookup
-    ///   (the feature branch's HEAD; also the PR head SHA in `pulls_json`).
-    /// * `pulls_json` - JSON array for `tea api .../pulls`. Each entry should
-    ///   include `mergeable`, `html_url`, and `head.{ref,sha,repo.owner.login}`.
-    /// * `status_json` - JSON object for `tea api .../commits/{sha}/status`,
-    ///   with `state` and `total_count`.
+    ///   (the feature branch's HEAD; also the PR head SHA in `pulls`).
+    /// * `pulls` - `(HTTP status, body)` for `tea api .../pulls`. On 200 the
+    ///   body is a JSON array whose entries carry `mergeable`, `html_url`, and
+    ///   `head.{ref,sha,repo.owner.login}`; on a 4xx/5xx it is whatever the
+    ///   server sent instead, which the backend reads only for error text.
+    /// * `status` - `(HTTP status, body)` for
+    ///   `tea api .../commits/{sha}/status`, the 200 body carrying `state` and
+    ///   `total_count`.
+    ///
+    /// The status is what the backend classifies on, so it is a parameter
+    /// rather than inferred from the body — an `APIError` served with a 200 is
+    /// a Gitea API change, and the tests say which they mean.
     pub fn setup_mock_tea_with_ci_data(
         &mut self,
         owner: &str,
         repo_name: &str,
         head_sha: &str,
-        pulls_json: &str,
-        status_json: &str,
+        pulls: (&str, &str),
+        status: (&str, &str),
     ) {
         let mock_bin = self.temp_dir.path().join("mock-bin");
         std::fs::create_dir_all(&mock_bin).unwrap();
 
+        let (pulls_status, pulls_json) = pulls;
+        let (status_status, status_json) = status;
         std::fs::write(mock_bin.join("tea_pulls.json"), pulls_json).unwrap();
         std::fs::write(mock_bin.join("tea_status.json"), status_json).unwrap();
 
         // Keep `&limit=20` in sync with `MAX_PRS_TO_FETCH` in
         // `src/commands/list/ci_status/mod.rs`.
-        let pulls_path = format!("api repos/{owner}/{repo_name}/pulls?state=open&limit=20");
-        let status_path = format!("api repos/{owner}/{repo_name}/commits/{head_sha}/status");
+        let pulls_path =
+            format!("api --include repos/{owner}/{repo_name}/pulls?state=open&limit=20");
+        let status_path =
+            format!("api --include repos/{owner}/{repo_name}/commits/{head_sha}/status");
 
         MockConfig::new("tea")
             .version("tea version development (mock)")
-            .command(&pulls_path, MockResponse::file("tea_pulls.json"))
-            .command(&status_path, MockResponse::file("tea_status.json"))
+            .command(
+                &pulls_path,
+                MockResponse::file("tea_pulls.json")
+                    .with_stderr(&tea_api_include_stderr(pulls_status)),
+            )
+            .command(
+                &status_path,
+                MockResponse::file("tea_status.json")
+                    .with_stderr(&tea_api_include_stderr(status_status)),
+            )
             .command("_default", MockResponse::exit(1))
             .write(&mock_bin);
 
@@ -2594,11 +2972,12 @@ impl TestRepo {
             .command(
                 // Keep `&limit=20` in sync with `MAX_PRS_TO_FETCH` in
                 // `src/commands/list/ci_status/mod.rs`.
-                "api repos/owner/test-repo/pulls?state=open&limit=20",
-                MockResponse::file("tea_pulls.json"),
+                "api --include repos/owner/test-repo/pulls?state=open&limit=20",
+                MockResponse::file("tea_pulls.json").with_stderr(&tea_api_include_stderr("200 OK")),
             )
             .command(
-                &format!("api repos/owner/test-repo/commits/{head_sha}/status"),
+                // `tea` itself failing: no response, so no status line.
+                &format!("api --include repos/owner/test-repo/commits/{head_sha}/status"),
                 MockResponse::stderr(stderr).with_exit_code(1),
             )
             .command("_default", MockResponse::exit(1))
@@ -2618,14 +2997,14 @@ impl TestRepo {
     /// Must call `setup_mock_gh()` first. Prepends the mock bin directory to PATH
     /// so gh/glab commands are intercepted.
     ///
-    /// On Windows, the mock commands have .exe files (via mock-stub) so they're
+    /// On Windows, the mock commands have .exe files (see `mock_commands`) so they're
     /// found directly by CreateProcessW without needing PATHEXT manipulation.
     ///
     /// Metadata redactions keep PATH private in snapshots, so we can reuse the
     /// caller's PATH instead of a hardcoded minimal list.
     pub fn configure_mock_commands(&self, cmd: &mut Command) {
         if let Some(mock_bin) = &self.mock_bin_path {
-            // Tell mock-stub where to find config files directly, avoiding PATH search
+            // Tell the mock playback where to find config files directly, avoiding PATH search
             cmd.env("WORKTRUNK_TEST_MOCK_CONFIG_DIR", mock_bin);
 
             // On Windows, env vars are case-insensitive but Rust stores them
@@ -2657,6 +3036,8 @@ impl TestRepo {
                 "WORKTRUNK_TEST_CLAUDE_INSTALLED",
                 "WORKTRUNK_TEST_CODEX_INSTALLED",
                 "WORKTRUNK_TEST_OPENCODE_INSTALLED",
+                "WORKTRUNK_TEST_PI_INSTALLED",
+                "WORKTRUNK_TEST_OMP_INSTALLED",
                 "WORKTRUNK_TEST_GEMINI_INSTALLED",
             ] {
                 cmd.env_remove(var);
@@ -2690,11 +3071,7 @@ impl TestRepo {
     }
 }
 
-impl TestRepoBase for TestRepo {
-    fn git_config_path(&self) -> &Path {
-        test_gitconfig_path()
-    }
-}
+impl TestRepoBase for TestRepo {}
 
 /// Helper to create a bare repository test setup.
 ///
@@ -2796,11 +3173,7 @@ impl BareRepoTest {
     }
 }
 
-impl TestRepoBase for BareRepoTest {
-    fn git_config_path(&self) -> &Path {
-        test_gitconfig_path()
-    }
-}
+impl TestRepoBase for BareRepoTest {}
 
 /// Create a configured Command for snapshot testing
 ///
@@ -3270,7 +3643,7 @@ mod tests {
         // named a protocol list would silently keep the fixture clone offline,
         // and the daily benchmark run is the only thing that would notice.
         let mut opted_out = Command::new("git");
-        configure_git_cmd(&mut opted_out, Path::new(NULL_DEVICE));
+        configure_git_cmd(&mut opted_out);
         allow_network_transports(&mut opted_out);
         assert!(
             opted_out
@@ -3375,29 +3748,45 @@ mod tests {
     #[test]
     fn test_standard_fixture_template_reproduces_pinned_shas() {
         let repo = standard_fixture_template().join("repo");
-        let rev_parse = |rev: &str| {
-            let output = configure_git_env(Cmd::new("git"), test_gitconfig_path())
+        let rev_parse = |repo: &Path, rev: &str| {
+            let output = configure_git_env(Cmd::new("git"))
                 .args(["rev-parse", rev])
-                .current_dir(&repo)
+                .current_dir(repo)
                 .run()
                 .unwrap();
             String::from_utf8(output.stdout).unwrap().trim().to_string()
         };
         assert_eq!(
-            rev_parse("main"),
+            rev_parse(&repo, "main"),
             "05a4a45d0b981dad5c27db59dca482836d59f89e"
         );
         assert_eq!(
-            rev_parse("feature-a"),
+            rev_parse(&repo, "feature-a"),
             "1b87d4731ea707905d15a726e193531c20affa14"
         );
         assert_eq!(
-            rev_parse("feature-b"),
+            rev_parse(&repo, "feature-b"),
             "f62940fcec424585adf98625e722fdf990810614"
         );
         assert_eq!(
-            rev_parse("feature-c"),
+            rev_parse(&repo, "feature-c"),
             "345c7c93ad7c3d8f5b08380898d78e024019599c"
+        );
+
+        let main_only = standard_main_only_fixture_template().join("repo");
+        assert_eq!(
+            rev_parse(&main_only, "main"),
+            "05a4a45d0b981dad5c27db59dca482836d59f89e"
+        );
+        let branches = configure_git_env(Cmd::new("git"))
+            .args(["branch", "--format=%(refname:short)"])
+            .current_dir(&main_only)
+            .run()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(branches.stdout).unwrap().trim(),
+            "main",
+            "main-only fixture must not retain the standard linked-worktree branches"
         );
     }
 
@@ -3444,12 +3833,41 @@ mod tests {
         assert!(warnings.is_empty() || !warnings[0].contains("loses"));
     }
 
+    /// A PTY child is the one transport that inherits nothing, so the floor
+    /// is carried by hand — by `configure_pty_command` (the PTY choke point in
+    /// `tests/common`, pinned by its own test there) and by this vector, which
+    /// declares a PTY `wt` child's complete environment and so carries the
+    /// floor itself rather than leaning on the transport. Losing the copy here
+    /// would break that contract silently: the settings only quiet advice and
+    /// refuse a guessed identity, so no PTY assertion would notice.
+    #[test]
+    fn pty_env_vars_carry_the_git_config_floor() {
+        let dir = Path::new("/tmp");
+        let vars = pty_env_vars(TestEnvPaths {
+            home: dir,
+            wt_config: dir,
+            approvals: dir,
+        });
+        let keys: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+
+        // The vector must be complete on its own — every member present,
+        // the numbered settings as much as the deny pair.
+        for (var, _) in shell_exec::HERMETIC_TEST_GIT_ENV {
+            assert!(keys.contains(&var), "{var} missing: {keys:?}");
+        }
+    }
+
     #[test]
     fn isolate_subprocess_env_scrubs_git_and_worktrunk_keys() {
         let mut cmd = Command::new("true");
         let synthetic_env = [
             "GIT_DIR".to_string(),
             "GIT_AUTHOR_DATE".to_string(),
+            "GIT_CONFIG_GLOBAL".to_string(),
+            "GIT_CONFIG_SYSTEM".to_string(),
+            "GIT_CONFIG_COUNT".to_string(),
+            "GIT_CONFIG_KEY_0".to_string(),
+            "GIT_CONFIG_VALUE_0".to_string(),
             "WORKTRUNK_CONFIG_PATH".to_string(),
             "WORKTRUNK_HISTORY".to_string(),
             "PATH".to_string(),
@@ -3480,6 +3898,18 @@ mod tests {
         // Not scrubbed: vars that don't match either prefix.
         assert!(!removed.contains_key("PATH"));
         assert!(!removed.contains_key("HOME"));
+        // The `GIT_CONFIG_*` family is scrubbed like the rest of `GIT_*`, then
+        // re-set to the hermetic floor's values — a host-exported member can't
+        // reach the child, and the child still denies `~/.gitconfig`. The
+        // numbered members matter as much as the deny pair: drop them and the
+        // child keeps the denial but loses every setting it was denying *for*.
+        for (var, val) in shell_exec::HERMETIC_TEST_GIT_ENV {
+            assert_eq!(
+                removed.get(var),
+                Some(&Some(val.to_string())),
+                "{var} should be re-set to the floor value"
+            );
+        }
         // No underscore — prefix check requires `GIT_`/`WORKTRUNK_`.
         assert!(!removed.contains_key("GIT"));
         assert!(!removed.contains_key("WORKTRUNK"));
@@ -3513,6 +3943,60 @@ mod tests {
             matches!(rust_log, Some(None)),
             "RUST_LOG should be explicitly removed from CLI test children"
         );
+    }
+
+    /// The isolation the whole suite rests on, asserted where it is weakest.
+    ///
+    /// `Repository::run_command` builds a plain `Cmd::new("git")` with no
+    /// `GIT_CONFIG_*` of its own, so what its child resolves is whatever env
+    /// the spawn site gives it — which the hermetic latch pins to the floor
+    /// for every `Cmd` child. Resolving it through the production API fails loudly if the layer
+    /// goes missing, instead of leaving the suite to read the developer's
+    /// `~/.gitconfig` and pass or fail on its contents.
+    #[test]
+    fn in_process_git_reads_only_the_hermetic_config() {
+        let repo = TestRepo::with_initial_commit();
+
+        // Every setting resolves, and every one of them comes from the
+        // environment rather than a file on the host.
+        let floor = repo
+            .repo
+            .run_command(&["config", "--list", "--show-scope"])
+            .unwrap();
+        let from_env: Vec<&str> = floor
+            .lines()
+            .filter_map(|line| line.strip_prefix("command\t"))
+            .collect();
+        insta::assert_snapshot!(from_env.join("\n"), @r"
+        user.useconfigonly=true
+        rerere.enabled=false
+        ");
+
+        // Nothing outside the fixture contributes. The only scopes a resolved
+        // setting may carry are `command` (the environment floor above) and
+        // `local` (the fixture's own config); a host `~/.gitconfig` or a
+        // system file reaching this git would surface as `global` or `system`.
+        let outside: Vec<&str> = floor
+            .lines()
+            .filter(|line| !line.starts_with("command\t") && !line.starts_with("local\t"))
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "config resolved from outside the fixture: {outside:#?}"
+        );
+
+        // Identity comes from the fixture's own local config, so a commit made
+        // through the production API is authored the same way on every machine
+        // — and `useConfigOnly` in the floor means a fixture that forgot one
+        // errors rather than borrowing the host's username.
+        std::fs::write(repo.path().join("second.txt"), "second").unwrap();
+        repo.repo.run_command(&["add", "second.txt"]).unwrap();
+        repo.repo.run_command(&["commit", "-m", "second"]).unwrap();
+        let author = repo
+            .repo
+            .run_command(&["log", "-1", "--format=%an <%ae>"])
+            .unwrap();
+        insta::assert_snapshot!(author.trim(), @"Test User <test@example.com>");
     }
 
     #[test]

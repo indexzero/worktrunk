@@ -1,9 +1,8 @@
 [workspace]
-members = ["tests/helpers/wt-perf", "tests/helpers/mock-stub"]
-# Include the helper packages so a workspace `cargo test` builds their
-# binaries: mock-stub via its dummy tests/builds.rs, wt-perf via its real
-# in-package CLI tests.
-default-members = [".", "tests/helpers/mock-stub", "tests/helpers/wt-perf"]
+members = ["tests/helpers/wt-perf"]
+# Include the helper package so a workspace `cargo test` runs its in-package
+# CLI tests (which build its binary).
+default-members = [".", "tests/helpers/wt-perf"]
 
 # cargo-affected input→test rules. cargo-affected selects tests by Rust-line
 # coverage overlap, so a file a test reads at *runtime* (never recorded in
@@ -27,19 +26,19 @@ filterset = "binary_id(=worktrunk) | binary_id(=worktrunk::bin/wt)"
 
 # tests/integration_tests/readme_sync.rs reads each of these at runtime (via
 # fs::read_to_string) and asserts the committed copies stay in sync — both the
-# sources (README.md, docs/content markdown, docs/config.toml's site title and
-# description, src/cli/mod.rs, src/llm.rs, the skill references, Taskfile.yaml)
+# sources (README.md, docs/src/content/docs Markdown, src/cli/mod.rs,
+# src/llm.rs, the skill references, Taskfile.yaml)
 # and the generated artifacts it regenerates and compares against (the
-# dev/*.example.toml files, docs/static/llms.txt, the agent-skills index.json).
+# dev/*.example.toml files, docs/public/llms.txt, the agent-skills index.json).
 # Editing any of them flips the test, but coverage can't link a runtime-read
 # file to it.
 [[workspace.metadata.affected.rule]]
 globs = [
     "README.md",
     "docs/**/*.md",
-    "docs/config.toml",
-    "docs/static/llms.txt",
-    "docs/static/.well-known/agent-skills/index.json",
+    "docs/public/llms.txt",
+    "docs/public/.well-known/agent-skills/index.json",
+    "docs/src/generated/terminal-styles.json",
     "dev/*.toml",
     "src/cli/mod.rs",
     "src/llm.rs",
@@ -48,17 +47,25 @@ globs = [
 ]
 filterset = "test(/readme_sync/)"
 
+# The AUR PKGBUILD hand-copies the fish completion `fish_completion_content`
+# generates; `test_aur_pkgbuild_ships_the_current_fish_completion` reads it at
+# test time (fs::read_to_string), so coverage can't link the two.
+[[workspace.metadata.affected.rule]]
+globs = [".github/aur/PKGBUILD"]
+filterset = "test(/aur_pkgbuild/)"
+
 [package]
 name = "worktrunk"
-version = "0.70.0"
+version = "0.78.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 build = "build.rs"
 repository = "https://github.com/max-sixty/worktrunk"
 homepage = "https://worktrunk.dev"
 description = "A CLI for Git worktree management, designed for parallel AI agent workflows"
 license = "MIT OR Apache-2.0"
 default-run = "wt"
+exclude = [".agents/skills/**"]
 
 [package.metadata.release]
 # Allow releases from any branch (GitHub Actions uses detached HEAD)
@@ -67,9 +74,8 @@ consolidate-commits = true
 
 [package.metadata.cargo-udeps.ignore]
 # `which` is used only on Windows (#[cfg(windows)] in src/shell_exec.rs).
-# `petname-macros` is not referenced in code — it's pinned only to constrain
-# the transitive resolution of `petname`'s proc-macro (see the dependency
-# comment above).
+# `petname-macros` is not referenced in code — its exact pin keeps the proc
+# macro version aligned with `petname` (see the dependency comment below).
 normal = ["which", "petname-macros"]
 
 [features]
@@ -97,16 +103,16 @@ cli = [
     "dep:tracing-log",
     "dep:tracing-subscriber",
 ]
-syntax-highlighting = ["dep:tree-sitter", "dep:tree-sitter-bash", "dep:tree-sitter-highlight"]
-# Enable shell/PTY integration tests (requires bash, zsh, fish installed on system)
+syntax-highlighting = ["dep:tree-sitter-bash", "dep:tree-sitter-highlight"]
+# Enable shell/PTY integration tests (needs bash, zsh, fish, nu, pwsh, and jq on PATH)
 # Includes: shell wrapper tests, PTY-based approval prompts, TUI select, progressive rendering
 shell-integration-tests = []
-# Enable benchmarks whose fixture is too large for hosted CI: the rust-scale
-# prune fixture (~15 GiB of rust-lang/rust worktrees, cached under
+# Enable benchmarks whose fixture is too large for hosted CI: the
+# large-repository prune fixture (multi-gigabyte linked worktrees, cached under
 # target/wt-perf/bench-repos). The daily benchmarks workflow runs plain `cargo bench`
 # and must never build it; opt in locally with
-# `cargo bench --bench prune --features real-repo-benches`.
-real-repo-benches = []
+# `cargo bench --bench prune --features large-repository-benches`.
+large-repository-benches = []
 # Install git-wt binary so `git wt` works as a git subcommand
 git-wt = []
 
@@ -189,11 +195,19 @@ tracing-log = { version = "0.2.0", optional = true }
 # `EnvFilter::builder().with_default_directive(...).from_env_lossy()` (used in
 # `src/logging.rs`) stabilized on top of the per-layer filtering rework.
 tracing-subscriber = { version = "0.3.17", default-features = false, features = ["ansi", "env-filter", "fmt", "registry"], optional = true }
-# Only enable needed features - saves ~200KB by excluding debug, macros, multi_template
-minijinja = { version = "2.20", default-features = false, features = ["builtins", "serde", "std_collections"] }
+# Only enable needed features - saves ~200KB by excluding debug, macros, multi_template.
+# `unstable_machinery` exposes the parser `src/config/deprecation.rs` migrates retired
+# template variables through, rather than re-deriving MiniJinja's grammar by hand; it
+# pulls in `internal_debug`, which costs ~116KB of that saving back (~67KB stripped).
+minijinja = { version = "2.20", default-features = false, features = [
+    "builtins",
+    "serde",
+    "std_collections",
+    "unstable_machinery",
+] }
 rayon = "1.12"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = "1.0.150"
 shell-escape = "0.1"
 shellexpand = "3.1"
 strsim = "0.11.1"
@@ -202,13 +216,12 @@ synoptic = "2"
 terminal_size = "0.4.3"
 toml = { version = "1.0", features = ["preserve_order"] }
 toml_edit = { version = "0.25", features = ["serde"] }
-# tree-sitter and tree-sitter-highlight should use matching versions.
-# tree-sitter-bash may lag behind (0.25.x works with tree-sitter 0.26.x).
+# tree-sitter-bash may lag behind tree-sitter-highlight (0.25.x works with
+# tree-sitter-highlight 0.27.x).
 # These are optional dependencies controlled by the "syntax-highlighting" feature.
 # To build without C compilation requirements, use: cargo install worktrunk --no-default-features --features cli
-tree-sitter = { version = "0.26", optional = true }
 tree-sitter-bash = { version = "0.25.1", optional = true }
-tree-sitter-highlight = { version = "0.26", optional = true }
+tree-sitter-highlight = { version = "0.27", optional = true }
 unicode-width = "0.2.1"
 wrap-ansi = "0.1"
 osc8 = "0.1.0"
@@ -216,7 +229,7 @@ supports-hyperlinks = "3"
 home = "0.5.12"
 humantime = { version = "2.2", optional = true }
 once_cell = "1.21.4"
-dirs = "6.0"
+dirs = "7.0"
 normalize-path = "0.2.1"
 path-slash = "0.2"
 pathdiff = "0.2"
@@ -247,22 +260,18 @@ sha2 = "0.11"
 # breaking-change rollout (see `test_codename_outputs_are_stable` and
 # `src/config/expansion.rs::codename`). We use only the static wordlists,
 # not the random-name generator, so `default-rng` and `clap` stay off.
-petname = { version = "=3.1.0", default-features = false, features = ["default-words"] }
-# PINNED EXACT to match the `petname` pin above. `petname` 3.0.1 declares a
-# caret range (`petname-macros = "3.0.0"` => `^3.0.0`), but petname-macros is
-# SemVer-incompatible with petname across the line in BOTH directions: macros
-# 3.1.0 emits `petnames!`-macro references (`::petname::lang::…`) that newer
-# petname has, but 3.0.x petname doesn't (E0433); macros 3.0.0 is missing the
-# `english` module that petname 3.0.1 re-exports (`petname_macros::english`),
-# so it too fails to compile (E0432). Only an exact match works. The committed
-# lockfile keeps 3.0.1, but the nightly `minimal-versions` job re-resolves with
-# `cargo update` (pulling 3.0.0) and a plain `cargo update` would pull 3.1.0 —
-# both broken. This direct `=3.0.1` requirement unifies the shared resolution
-# to 3.0.1. Bump in lockstep whenever `petname` itself is bumped.
-petname-macros = "=3.1.0"
+petname = { version = "=3.2.0", default-features = false, features = ["default-words"] }
+# PINNED EXACT to match `petname`: its caret dependency otherwise permits a
+# different proc-macro version, but the generated code and runtime re-exports
+# require an exact match. Keep both pins in lockstep.
+petname-macros = "=3.2.0"
 
 tempfile = "3.27"
-wait-timeout = "0.2"
+
+# Timed waits on child processes (`Cmd::timeout`, `Cmd::delayed_stream`, the
+# picker's pager). Replaced `wait-timeout`, whose SIGCHLD handler aborts the
+# process when its self-pipe write fails — see "Timed waits" in `shell_exec`.
+shared_child = "1.1"
 
 # Interactive picker (`wt switch`) TUI stack, pulled in only by the `cli`
 # feature's `dep:` entries. These are platform-neutral (skim 4.x is the
@@ -290,7 +299,7 @@ wait-timeout = "0.2"
 # not panic on push/pop keyboard enhancement flags failure") and is
 # Windows-green again. Kept as an exact pin; it can relax to a range now that
 # the keyboard-enhancement path no longer regresses the legacy console.
-skim = { version = "=5.5.0", optional = true, default-features = false, features = ["frizbee"] }
+skim = { version = "=5.7.0", optional = true, default-features = false, features = ["frizbee"] }
 # Pinned to skim's ratatui line so the `Line` type `display()` returns is the
 # same one skim consumes. `ansi-to-tui` parses ANSI SGR codes into ratatui spans.
 # Floor is 0.30.1: 0.30.0 is a broken release (its `#[instability::unstable]`
@@ -325,16 +334,16 @@ vergen-gitcl = { version = "10.0.0", features = ["build"] }
 [dev-dependencies]
 insta = { version = "1.47.2", features = ["yaml", "redactions", "filters"] }
 insta-cmd = "0.7"
-rstest = "0.26"
+rstest = "0.27"
 tempfile = "3.27"
 toml = "1.0"
 criterion = "0.8"
 portable-pty = "0.9"
 regex = "1.12.3"
 vt100 = "0.16.2"
-ansi-to-html = "0.2.3"
 wt-perf = { path = "tests/helpers/wt-perf" }
 similar = "3.1.1"
+jsonschema = { version = "0.56", default-features = false }
 
 [[bench]]
 name = "alias"

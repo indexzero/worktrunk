@@ -1,53 +1,51 @@
 use std::path::{Path, PathBuf};
-use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::worktree::{RemovalPlan, SharedBranchCheckout};
 use anyhow::{Context, bail};
 use color_print::cformat;
 use worktrunk::git::{
-    BranchDeletionMode, GitError, IntegrationReason, RefSnapshot, Repository, WorktreeInfo,
-    parse_porcelain_z, parse_untracked_files,
+    BranchDeletionMode, GitError, IntegrationReason, RefSnapshot, Repository, WorkingTree,
+    WorktreeInfo, parse_porcelain_z, parse_untracked_files,
 };
 use worktrunk::path::format_path_for_display;
 use worktrunk::styling::{
-    eprintln, format_with_gutter, progress_message, suggest_command, warning_message,
+    eprintln, format_with_gutter, hint_message, suggest_command, warning_message,
 };
 
 /// Target for worktree removal.
 #[derive(Debug)]
-pub enum RemoveTarget<'a> {
+pub enum RemoveTarget {
     /// Delete a branch that has no worktree.
     ///
     /// A branch names a worktree only while it has exactly one: let it name
     /// two, which `git worktree add --force` allows, and the lookup silently
     /// picks git's first-listed checkout. So callers resolve first and pass
-    /// [`Path`](Self::Path) for anything that has a worktree, and this variant
-    /// carries only the branch-only case. One that has since acquired a
-    /// worktree lost the race and errors rather than removing it unasked.
-    Branch(&'a str),
-    /// Remove the current worktree (supports detached HEAD)
-    Current,
-    /// Remove worktree by path (supports detached HEAD)
-    Path(&'a std::path::Path),
+    /// [`WorktreePath`](Self::WorktreePath) for anything that has a worktree,
+    /// and this variant carries only the branch-only case. One that has since
+    /// acquired a worktree lost the race and errors rather than removing it
+    /// unasked.
+    BranchOnly(String),
+    /// Remove the exact worktree at this path (supports detached HEAD and
+    /// duplicate branch checkouts).
+    WorktreePath(PathBuf),
 }
 
 /// CLI-only helpers implemented on [`Repository`] via an extension trait so we can keep orphan
 /// implementations inside the binary crate.
 pub trait RepositoryCliExt {
-    /// Warn about untracked files being auto-staged.
-    fn warn_if_auto_staging_untracked(&self) -> anyhow::Result<()>;
-
     /// Prepare the removal of whichever worktree or branch [`RemoveTarget`]
     /// names.
     ///
     /// Returns a `RemovalPlan` describing what will be removed. The actual
-    /// removal is performed by the output handler.
+    /// removal is performed by the output handler. Planning is a pure read —
+    /// every mutation, including unregistering a stale worktree entry
+    /// (`RemovalPlan::BranchOnly::prune_entry`), happens at execution — so
+    /// callers may plan speculatively: on a `--dry-run` scan, before an
+    /// approval prompt, or on the picker's event loop.
     ///
-    /// `current_path` overrides process-CWD discovery for determining which
-    /// worktree is "current". Pass `None` for normal CLI usage (discovers from
-    /// CWD). Pass `Some` when calling from a context where CWD may have changed
-    /// (e.g., background threads in the picker).
+    /// `current_path` is the worktree the caller started in. Callers resolve it
+    /// once at their boundary so target preparation never depends on a later
+    /// process-CWD lookup (notably on picker and prune background paths).
     ///
     /// `worktrees` provides a pre-fetched worktree list to avoid redundant
     /// `git worktree list` calls. Pass `None` to fetch on demand.
@@ -62,12 +60,17 @@ pub trait RepositoryCliExt {
         target: RemoveTarget,
         deletion_mode: BranchDeletionMode,
         force_worktree: bool,
-        current_path: Option<PathBuf>,
+        current_path: &Path,
         worktrees: Option<&[WorktreeInfo]>,
         snapshot: Option<&RefSnapshot>,
     ) -> anyhow::Result<RemovalPlan>;
 
-    /// Prepare the target worktree for push by auto-stashing non-overlapping changes when safe.
+    /// Refuse the push when target-worktree changes overlap the push range.
+    ///
+    /// Uncommitted changes at paths the push range doesn't touch are left
+    /// alone — the two-tree merge in `advance_target` carries them in place —
+    /// so this only names the files that genuinely conflict, before anything
+    /// moves.
     ///
     /// The caller has already established that `target_worktree` exists on disk
     /// (`MergeContext::prepare` refuses a registered-but-missing worktree), so
@@ -77,11 +80,11 @@ pub trait RepositoryCliExt {
     /// `git status --porcelain` read this works from, and matching git there is
     /// the decision, not an oversight. The module spec in
     /// `commands/worktree/push.rs` says why.
-    fn prepare_target_worktree(
+    fn ensure_no_target_conflicts(
         &self,
         target_worktree: Option<&PathBuf>,
         target_branch: &str,
-    ) -> anyhow::Result<Option<TargetWorktreeStash>>;
+    ) -> anyhow::Result<()>;
 
     /// Check if HEAD is a linear extension of the target branch.
     ///
@@ -95,25 +98,16 @@ pub trait RepositoryCliExt {
 }
 
 impl RepositoryCliExt for Repository {
-    fn warn_if_auto_staging_untracked(&self) -> anyhow::Result<()> {
-        // Use -z for NUL-separated output to handle filenames with spaces/newlines
-        let status = self
-            .run_command(&["status", "--porcelain", "-z"])
-            .context("Failed to get status")?;
-        warn_about_untracked_files(&status)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn prepare_worktree_removal(
         &self,
         target: RemoveTarget,
         deletion_mode: BranchDeletionMode,
         force_worktree: bool,
-        current_path: Option<PathBuf>,
+        current_path: &Path,
         worktrees: Option<&[WorktreeInfo]>,
         snapshot: Option<&RefSnapshot>,
     ) -> anyhow::Result<RemovalPlan> {
-        let current_path = current_path.map_or_else(|| self.current_worktree().root(), Ok)?;
         let worktrees = match worktrees {
             Some(wts) => wts,
             None => self.list_worktrees()?,
@@ -142,18 +136,19 @@ impl RepositoryCliExt for Repository {
                 is_current: bool,
             },
             BranchOnly {
-                /// Path of the stale worktree entry this fell back from, when
-                /// the fallback was a prune. `None` when the branch has no
-                /// worktree entry at all, which is also the only case with no
-                /// sibling to check — a branch that has one resolves to
-                /// `Worktree` above, or, named as a `Branch` target, errors.
+                /// Path of the stale worktree entry this fell back from,
+                /// carried into the plan for execution-time pruning. `None`
+                /// when the branch has no worktree entry at all, which is also
+                /// the only case with no sibling to check — a branch that has
+                /// one resolves to `Worktree` above, or, named as a `Branch`
+                /// target, errors.
                 pruned_from: Option<PathBuf>,
                 branch: String,
             },
         }
 
         let resolved = match target {
-            RemoveTarget::Branch(branch) => {
+            RemoveTarget::BranchOnly(branch) => {
                 // The caller established there was no worktree, so one here
                 // appeared in between. Falling through would remove it — the
                 // wrong operation, and on a worktree nobody named — so the
@@ -161,7 +156,7 @@ impl RepositoryCliExt for Repository {
                 // that does mean "remove that worktree".
                 if let Some(wt) = worktrees
                     .iter()
-                    .find(|wt| wt.branch.as_deref() == Some(branch))
+                    .find(|wt| wt.branch.as_deref() == Some(branch.as_str()))
                 {
                     let path = format_path_for_display(&wt.path);
                     bail!(cformat!(
@@ -171,18 +166,18 @@ impl RepositoryCliExt for Repository {
                 }
                 // Check the branch exists locally, so a typo or a remote-only
                 // name reports itself rather than deleting nothing.
-                let branch_handle = self.branch(branch);
+                let branch_handle = self.branch(&branch);
                 if !branch_handle.exists_locally()? {
                     let remotes = branch_handle.remotes()?;
                     if !remotes.is_empty() {
                         return Err(GitError::RemoteOnlyBranch {
-                            branch: branch.into(),
+                            branch,
                             remote: remotes[0].clone(),
                         }
                         .into());
                     }
                     return Err(GitError::BranchNotFound {
-                        branch: branch.into(),
+                        branch,
                         show_create_hint: false,
                         last_fetch_ago: None,
                         pr_mr_platform: None,
@@ -191,17 +186,13 @@ impl RepositoryCliExt for Repository {
                 }
                 Resolved::BranchOnly {
                     pruned_from: None,
-                    branch: branch.to_string(),
+                    branch,
                 }
             }
-            RemoveTarget::Current | RemoveTarget::Path(_) => {
-                let lookup_path = match target {
-                    RemoveTarget::Path(p) => p,
-                    _ => current_path.as_path(),
-                };
+            RemoveTarget::WorktreePath(lookup_path) => {
                 let wt = worktrees
                     .iter()
-                    .find(|wt| worktrunk::path::paths_match(&wt.path, lookup_path))
+                    .find(|wt| worktrunk::path::paths_match(&wt.path, &lookup_path))
                     .ok_or_else(|| {
                         anyhow::anyhow!("Worktree not found at {}", lookup_path.display())
                     })?;
@@ -224,28 +215,56 @@ impl RepositoryCliExt for Repository {
                     }
                     .into());
                 }
-                // Directory missing (e.g. external `rm -rf`): prune the stale
-                // metadata and fall back to branch-only deletion — the same
-                // handling the branch-targeted path applies. A detached
-                // worktree has no branch to fall back to, so it proceeds and
-                // surfaces the removal error.
+                // Directory missing (e.g. external `rm -rf`): fall back to
+                // branch-only deletion, recording the stale entry in the plan
+                // so execution unregisters it — planning stays a pure read
+                // (`wt step prune`'s scan doubles as `--dry-run`, and `wt
+                // remove` plans before its approval prompt). A detached
+                // worktree has no branch to fall back to, so an absent
+                // directory leaves it to the prunable arm below rather than
+                // here.
                 //
-                // The prune names this worktree rather than sweeping the repo,
-                // so a sibling whose directory is merely absent right now keeps
-                // its registration. `git worktree remove` refuses a locked
-                // worktree where a repo-wide prune ignored one, which needs no
-                // guard here: the lock check above already returned for every
-                // locked entry in this arm.
+                // The recorded prune names this worktree rather than sweeping
+                // the repo, so a sibling whose directory is merely absent
+                // right now keeps its registration. `git worktree remove`
+                // refuses a locked worktree where a repo-wide prune ignored
+                // one, which needs no guard here: the lock check above already
+                // returned for every locked entry in this arm.
+                //
+                // `exists()` is that cleanup's precondition rather than a
+                // proxy for health: `prune_worktree_entry` unregisters with
+                // `git worktree remove`, which skips its validation only while
+                // the directory is absent.
                 if let Some(branch) = wt.branch.as_deref()
                     && !wt.path.exists()
                 {
-                    self.prune_worktree_entry(&wt.path)?;
                     Resolved::BranchOnly {
                         pruned_from: Some(wt.path.clone()),
                         branch: branch.to_string(),
                     }
+                } else if wt.is_prunable() {
+                    // Still registered, but the directory no longer holds this
+                    // worktree. Two shapes reach here: one deleted and
+                    // recreated, which is what an interrupted `wt switch`
+                    // leaves behind; and a detached one simply deleted, which
+                    // the branch-only cleanup above cannot take because it has
+                    // no branch to fall back to. Neither route out of here
+                    // works: that cleanup wants a branch *and* an absent
+                    // directory, and for the recreated directory the removal
+                    // below walks into git's own validation a few calls later,
+                    // reaching the user as a raw `exit 128`. The hint names the
+                    // repo-wide `git worktree prune` because it is what clears
+                    // both; the detached one, whose directory is absent, a
+                    // targeted `git worktree remove <path>` would also clear.
+                    return Err(GitError::WorktreeMissing {
+                        branch: wt
+                            .branch
+                            .clone()
+                            .unwrap_or_else(|| wt.dir_name().to_string()),
+                    }
+                    .into());
                 } else {
-                    let is_current = wt.path == current_path;
+                    let is_current = worktrunk::path::paths_match(&wt.path, current_path);
                     Resolved::Worktree {
                         path: wt.path.clone(),
                         branch: wt.branch.clone(),
@@ -291,7 +310,7 @@ impl RepositoryCliExt for Repository {
                     return Ok(RemovalPlan::BranchOnly {
                         branch_name: branch,
                         deletion_mode: BranchDeletionMode::Keep,
-                        pruned: true,
+                        prune_entry: pruned_from,
                         target_branch: None,
                         integration_reason: None,
                         branch_checked_out_at: Some(shared),
@@ -309,7 +328,7 @@ impl RepositoryCliExt for Repository {
                 return Ok(RemovalPlan::BranchOnly {
                     branch_name: branch,
                     deletion_mode,
-                    pruned: pruned_from.is_some(),
+                    prune_entry: pruned_from,
                     target_branch,
                     integration_reason,
                     branch_checked_out_at: None,
@@ -325,6 +344,20 @@ impl RepositoryCliExt for Repository {
         // Phase 5: Remaining worktree-level validation.
         let target_wt = self.worktree_at(&worktree_path);
 
+        // Ownership first: `ensure_clean` below runs `git status` in the
+        // directory, so against a foreign occupant it reports that
+        // repository's dirt as this worktree's and points at `--force`, the
+        // one flag that would carry the removal through. Planning is also
+        // upstream of the "Removing …" announcement, so the refusal arrives
+        // before wt claims to be doing it.
+        //
+        // `stage_worktree_removal` asks again at the rename, and that is a
+        // genuine re-check rather than a repeat of this one: the gate reads the
+        // directory's `.git` entry every call, so a directory swapped in
+        // between — across the approval prompt and the `pre-remove` hook — is
+        // caught there.
+        target_wt.ensure_holds_this_worktree()?;
+
         if !force_worktree {
             target_wt.ensure_clean("remove worktree", branch_name.as_deref(), true)?;
         }
@@ -337,7 +370,7 @@ impl RepositoryCliExt for Repository {
         // changed_directory: whether the user needs to cd away from cwd.
         let changed_directory = is_current;
         let main_path = if worktree_path == primary_path {
-            current_path
+            current_path.to_path_buf()
         } else {
             primary_path
         };
@@ -403,25 +436,28 @@ impl RepositoryCliExt for Repository {
         })
     }
 
-    fn prepare_target_worktree(
+    fn ensure_no_target_conflicts(
         &self,
         target_worktree: Option<&PathBuf>,
         target_branch: &str,
-    ) -> anyhow::Result<Option<TargetWorktreeStash>> {
+    ) -> anyhow::Result<()> {
         let Some(wt_path) = target_worktree else {
-            return Ok(None);
+            return Ok(());
         };
 
+        // `-uall` lists individual files inside untracked directories — the
+        // default collapses them to a single `dir/` entry, which can never
+        // match a file path in the push range — and, being explicit, it
+        // overrides a user's `status.showUntrackedFiles=no`. `-z` handles
+        // filenames with spaces and renames ("XY path\0" for normal files,
+        // "XY new_path\0old_path\0" for renames/copies).
         let wt = self.worktree_at(wt_path);
-        if !wt.is_dirty()? {
-            return Ok(None);
+        let wt_status_output = wt.run_command(&["status", "--porcelain", "-z", "-uall"])?;
+        if wt_status_output.trim().is_empty() {
+            return Ok(());
         }
 
         let push_files = self.changed_files(target_branch, "HEAD")?;
-        // Use -z for NUL-separated output: handles filenames with spaces and renames correctly
-        // Format: "XY path\0" for normal files, "XY new_path\0old_path\0" for renames/copies
-        let wt_status_output = wt.run_command(&["status", "--porcelain", "-z"])?;
-
         let wt_files: Vec<String> = parse_porcelain_z(&wt_status_output);
 
         let overlapping: Vec<String> = push_files
@@ -439,56 +475,7 @@ impl RepositoryCliExt for Repository {
             .into());
         }
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let stash_name = format!(
-            "worktrunk autostash::{}::{}::{}",
-            target_branch,
-            process::id(),
-            nanos
-        );
-
-        eprintln!(
-            "{}",
-            progress_message(cformat!(
-                "Stashing changes in <bold>{}</>...",
-                format_path_for_display(wt_path)
-            ))
-        );
-
-        // Stash all changes including untracked files.
-        // Note: git stash push returns exit code 0 whether or not anything was stashed.
-        wt.run_command(&["stash", "push", "--include-untracked", "-m", &stash_name])?;
-
-        // Verify stash was created by checking the stash list for our entry.
-        let list_output = wt.run_command(&["stash", "list", "--format=%gd%x00%gs%x00"])?;
-        let mut parts = list_output.split('\0');
-        while let Some(id) = parts.next() {
-            if id.is_empty() {
-                continue;
-            }
-            if let Some(message) = parts.next()
-                && (message == stash_name || message.ends_with(&stash_name))
-            {
-                return Ok(Some(TargetWorktreeStash::new(wt_path, id.to_string())));
-            }
-        }
-
-        // Stash entry not found. Verify the worktree is now clean — if it's still
-        // dirty, stashing may have failed silently or our lookup missed the entry.
-        if wt.is_dirty()? {
-            bail!(cformat!(
-                "Failed to stash changes in {}; worktree still has uncommitted changes. \
-                 Expected stash entry: <bold>{}</>. Check <bold>git stash list</>.",
-                format_path_for_display(wt_path),
-                stash_name
-            ));
-        }
-
-        // Worktree is clean and no stash entry — nothing needed to be stashed
-        Ok(None)
+        Ok(())
     }
 
     fn is_rebased_onto(&self, target: &str) -> anyhow::Result<bool> {
@@ -623,8 +610,21 @@ pub(crate) fn check_not_default_branch(
 }
 
 /// Warn about untracked files that will be auto-staged.
-pub(crate) fn warn_about_untracked_files(status_output: &str) -> anyhow::Result<()> {
-    let files = parse_untracked_files(status_output);
+///
+/// Paths come from git's `normal` untracked mode, which overrides a
+/// `status.showUntrackedFiles=no` that would hide them and names a wholly
+/// untracked directory once as `dir/`. A directory of generated files then
+/// takes one row instead of pushing the paths beside it past the cap.
+///
+/// The listing has at most `MAX_ROWS` rows. Past that many paths, the last row
+/// is a hint counting the rest, which is always at least two paths.
+pub(crate) fn warn_about_untracked_files(wt: &WorkingTree) -> anyhow::Result<()> {
+    const MAX_ROWS: usize = 10;
+
+    let status = wt
+        .run_command(&["status", "--porcelain", "-z", "-unormal"])
+        .context("Failed to get status")?;
+    let files = parse_untracked_files(&status);
     if files.is_empty() {
         return Ok(());
     }
@@ -636,95 +636,102 @@ pub(crate) fn warn_about_untracked_files(status_output: &str) -> anyhow::Result<
         warning_message(format!("Auto-staging {count} untracked {path_word}:"))
     );
 
-    let joined_files = files.join("\n");
-    eprintln!("{}", format_with_gutter(&joined_files, None));
+    let listed = if count > MAX_ROWS {
+        MAX_ROWS - 1
+    } else {
+        count
+    };
+    eprintln!("{}", format_with_gutter(&files[..listed].join("\n"), None));
+    if listed < count {
+        let omitted = count - listed;
+        eprintln!("{}", hint_message(format!("… and {omitted} other paths")));
+    }
 
     Ok(())
-}
-
-/// Stash guard that auto-restores on drop.
-///
-/// Created by `prepare_target_worktree()` when the target worktree has changes
-/// that don't conflict with the push. Automatically restores the stash when
-/// dropped, ensuring cleanup happens in both success and error paths.
-#[must_use = "stash guard restores immediately if dropped; hold it until push completes"]
-pub(crate) struct TargetWorktreeStash {
-    /// Inner data wrapped in Option so we can take() in Drop.
-    /// None means already restored (or disarmed).
-    inner: Option<StashData>,
-}
-
-struct StashData {
-    path: PathBuf,
-    stash_ref: String,
-}
-
-impl StashData {
-    /// Restore the stash, printing progress and warning on failure.
-    fn restore(self) {
-        eprintln!(
-            "{}",
-            progress_message(cformat!(
-                "Restoring stashed changes in <bold>{}</>...",
-                format_path_for_display(&self.path)
-            ))
-        );
-
-        // Don't use --quiet so git shows conflicts if any
-        let success = Repository::current()
-            .ok()
-            .and_then(|repo| {
-                repo.worktree_at(&self.path)
-                    .run_command(&["stash", "pop", &self.stash_ref])
-                    .ok()
-            })
-            .is_some();
-
-        if !success {
-            eprintln!(
-                "{}",
-                warning_message(cformat!(
-                    "Failed to restore stash <bold>{stash_ref}</>; run <bold>git stash pop {stash_ref}</> in <bold>{path}</>",
-                    stash_ref = self.stash_ref,
-                    path = format_path_for_display(&self.path),
-                ))
-            );
-        }
-    }
-}
-
-impl Drop for TargetWorktreeStash {
-    fn drop(&mut self) {
-        if let Some(data) = self.inner.take() {
-            data.restore();
-        }
-    }
-}
-
-impl TargetWorktreeStash {
-    pub(crate) fn new(path: &Path, stash_ref: String) -> Self {
-        Self {
-            inner: Some(StashData {
-                path: path.to_path_buf(),
-                stash_ref,
-            }),
-        }
-    }
-
-    /// Explicitly restore the stash now, preventing Drop from restoring again.
-    ///
-    /// Use this when you need the restore to happen at a specific point
-    /// (e.g., before a success message). Drop handles errors/early returns.
-    pub(crate) fn restore_now(&mut self) {
-        if let Some(data) = self.inner.take() {
-            data.restore();
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use worktrunk::git::{BranchDeletionOutcome, execute_branch_deletion};
+    use worktrunk::testing::TestRepo;
+
+    /// A branch-only plan is only a snapshot of topology. If another process
+    /// checks the branch out before execution, the final safe-delete guard must
+    /// retain the ref so the new worktree's HEAD stays resolvable.
+    #[test]
+    fn branch_only_execution_rechecks_worktree_topology() {
+        let test = TestRepo::with_initial_commit();
+        test.create_branch("feature");
+        let repo = Repository::at(test.root_path()).unwrap();
+        let current_path = test.root_path().to_path_buf();
+
+        let plan = repo
+            .prepare_worktree_removal(
+                RemoveTarget::BranchOnly("feature".to_string()),
+                BranchDeletionMode::SafeDelete,
+                false,
+                &current_path,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(plan, RemovalPlan::BranchOnly { .. }));
+
+        let checkout = test.home_path().join("repo.feature-raced-checkout");
+        test.run_git(&["worktree", "add", checkout.to_str().unwrap(), "feature"]);
+
+        let result = execute_branch_deletion(&repo, "feature", "main", false).unwrap();
+        let BranchDeletionOutcome::RetainedCheckedOut { path } = result.outcome else {
+            panic!("safe deletion must report the checkout added after planning");
+        };
+        assert!(
+            worktrunk::path::paths_match(&path, &checkout),
+            "retention should name the checkout: {} != {}",
+            path.display(),
+            checkout.display()
+        );
+        assert!(
+            repo.run_command(&["rev-parse", "--verify", "refs/heads/feature"])
+                .is_ok(),
+            "the checked-out branch ref must survive"
+        );
+        assert!(
+            repo.worktree_at(&checkout)
+                .run_command(&["rev-parse", "--verify", "HEAD"])
+                .is_ok(),
+            "the new checkout must not be orphaned"
+        );
+    }
+
+    /// Duplicate checkout detection excludes the worktree being removed by
+    /// canonical path identity, not by its literal spelling, and still finds a
+    /// separate checkout of the same branch.
+    #[test]
+    fn duplicate_checkout_detection_compares_paths_canonically() {
+        let mut test = TestRepo::with_initial_commit();
+        let removed = test.add_worktree("feature");
+        let survivor = test.home_path().join("repo.feature-survivor");
+        test.run_git(&[
+            "worktree",
+            "add",
+            "--force",
+            survivor.to_str().unwrap(),
+            "feature",
+        ]);
+
+        let alias_anchor = removed.join("alias-anchor");
+        std::fs::create_dir(&alias_anchor).unwrap();
+        let removed_alias = alias_anchor.join("..");
+        let repo = Repository::at(test.root_path()).unwrap();
+        let worktrees = repo.list_worktrees().unwrap();
+
+        let found = live_sibling_checkout(worktrees, "feature", &removed_alias).unwrap();
+        assert!(
+            worktrunk::path::paths_match(&found.path, &survivor),
+            "only the canonical target path may be excluded"
+        );
+    }
 
     #[test]
     fn test_parse_porcelain_z_modified_staged() {
@@ -872,36 +879,5 @@ mod tests {
     fn test_parse_untracked_files_no_untracked() {
         // All files are tracked (modified, staged, etc.)
         assert!(parse_untracked_files(" M file1.txt\0M  file2.txt\0").is_empty());
-    }
-
-    #[test]
-    fn test_stash_guard_restore_now_clears_inner() {
-        // Create a guard - note: this doesn't actually create a stash since we're not
-        // in a real git repo with that stash ref. We're just testing the state machine.
-        let mut guard = TargetWorktreeStash::new(std::path::Path::new("/tmp"), "stash@{0}".into());
-
-        // Inner should be populated
-        assert!(guard.inner.is_some());
-
-        // restore_now() should clear inner (the restore itself will fail since no real repo,
-        // but that's expected - we're testing the state transition)
-        guard.restore_now();
-
-        // Inner should now be None
-        assert!(guard.inner.is_none());
-
-        // Calling restore_now() again is a no-op
-        guard.restore_now();
-        assert!(guard.inner.is_none());
-    }
-
-    #[test]
-    fn test_stash_guard_drop_clears_inner() {
-        // Test that Drop also consumes the inner
-        let guard = TargetWorktreeStash::new(std::path::Path::new("/tmp"), "stash@{0}".into());
-
-        // Just drop it - the restore will fail (no real repo) but Drop shouldn't panic
-        drop(guard);
-        // If we get here, Drop worked without panicking
     }
 }

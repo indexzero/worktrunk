@@ -1,7 +1,7 @@
-use crate::display::{format_relative_time_short, shorten_path, truncate_to_width};
+use crate::display::{format_relative_time_short, shorten_path};
 use anstyle::{Effects, Style};
 use unicode_width::UnicodeWidthStr;
-use worktrunk::styling::StyledLine;
+use worktrunk::styling::{DETACHED, StyledLine, truncate_visible};
 
 use super::columns::{ColumnKind, DiffVariant};
 use super::layout::{
@@ -232,6 +232,11 @@ impl LayoutConfig {
             }
         }
 
+        // Padding after the last cell places nothing. A row whose rightmost
+        // columns are empty carried up to 14 trailing spaces the header line
+        // never had, which a reader inherits the moment they select the row.
+        line.trim_end();
+
         let final_width = line.width();
         tracing::debug!(width = final_width, "Rendered line width: {}", final_width);
 
@@ -248,21 +253,9 @@ impl LayoutConfig {
         self.render_line(|column| {
             let mut cell = StyledLine::new();
             if !column.header.is_empty() {
-                // Diff columns have right-aligned values, so right-align headers too
-                let is_diff_column = matches!(column.format, ColumnFormat::Diff(_));
-
-                if is_diff_column {
-                    // Right-align header within column width
-                    let header_width = column.header.width();
-                    if header_width < column.width {
-                        let padding = column.width - header_width;
-                        cell.push_raw(" ".repeat(padding));
-                    }
-                }
-
                 cell.push_styled(column.header.to_string(), style);
             }
-            cell
+            column.aligned_cell(cell)
         })
     }
 
@@ -278,7 +271,7 @@ impl LayoutConfig {
     /// to [`PLACEHOLDER`] on the reveal tick. Non-progressive callers pass
     /// [`PLACEHOLDER`] directly.
     pub fn render_list_item_line(&self, item: &ListItem, placeholder: &str) -> StyledLine {
-        self.render_line(|column| column.render_cell(item, self, placeholder))
+        self.render_line(|column| column.render_cell(item, self, item.placeholder(placeholder)))
     }
 
     /// Render a skeleton row showing known data (branch, path) with placeholders for other columns.
@@ -286,14 +279,14 @@ impl LayoutConfig {
     /// Used for both worktrees and branch-only items; branch-only rows render an empty path
     /// and a blank gutter placeholder. See [`Self::render_list_item_line`] for `placeholder` semantics.
     pub fn render_skeleton_row(&self, item: &ListItem, placeholder: &str) -> StyledLine {
-        let branch = item.branch_name();
+        let branch = item.display_name();
         let shortened_path = item
             .worktree_path()
             .map(|p| shorten_path(p, &self.main_worktree_path))
             .unwrap_or_default();
 
         let dim = Style::new().dimmed();
-        let spinner = placeholder;
+        let spinner = item.placeholder(placeholder);
 
         self.render_line(|col| {
             let mut cell = StyledLine::new();
@@ -307,7 +300,7 @@ impl LayoutConfig {
                     // Branch scope is known at construction, so its sigil
                     // (`/`/`|`) renders immediately, dimmed to match the final
                     // render (and its Status-column twin) — no flash or flicker.
-                    match &item.kind {
+                    match item.kind() {
                         ItemKind::Worktree(_) => cell.push_styled(format!("{spinner} "), dim),
                         ItemKind::Branch(scope) => {
                             cell.push_styled(format!("{} ", scope.gutter_glyph()), dim)
@@ -315,9 +308,22 @@ impl LayoutConfig {
                     }
                 }
                 ColumnKind::Branch => {
-                    // Show actual branch name (no dim - start normal, gray out later if removable)
-                    cell.push_raw(branch.to_string());
+                    // Show actual branch name (no dim - start normal, gray out later if removable).
+                    // A detached row shows its abbreviated HEAD in the settled
+                    // row's `DETACHED` style, so the cell doesn't restyle as
+                    // the row fills in. Empty text goes unstyled for the reason
+                    // [`Self::render_text_cell`] gives.
+                    if item.branch().is_none() && !branch.is_empty() {
+                        cell.push_styled(branch.to_string(), DETACHED);
+                    } else {
+                        cell.push_raw(branch.to_string());
+                    }
+                    // Elide past the column's cap, matching the settled row —
+                    // `render_text_cell` truncates there, and a skeleton that
+                    // didn't would overflow into the next column.
+                    let mut cell = cell.truncate_to_width(col.width);
                     cell.pad_to(col.width);
+                    return cell;
                 }
                 ColumnKind::Path => {
                     // Show actual path (no dim - start normal, gray out later if removable)
@@ -325,11 +331,11 @@ impl LayoutConfig {
                     cell.pad_to(col.width);
                 }
                 ColumnKind::Commit => {
-                    // Show actual commit hash (empty for unborn branches with null OID)
-                    let head = item.head();
-                    if head != worktrunk::git::NULL_OID {
-                        let short_head = &head[..8.min(head.len())];
-                        cell.push_styled(short_head, dim);
+                    // git's own `%h`, folded in before the skeleton — so the cell
+                    // shows the hash from the first frame. Empty for unborn
+                    // branches (null OID, nothing to abbreviate).
+                    if !item.short_sha.is_empty() {
+                        cell.push_styled(&item.short_sha, dim);
                     }
                 }
                 ColumnKind::Custom(i) => {
@@ -379,26 +385,74 @@ impl LayoutConfig {
     }
 }
 
+/// Which edge a column's content sits against.
+#[derive(Clone, Copy, Debug)]
+enum CellAlignment {
+    /// Text, read from the left: Branch, Path, Message, …
+    Left,
+    /// A single value whose digits and unit only line up from the right —
+    /// Age (`now`, `4m`, `11mo`).
+    Right,
+    /// A diff field: two right-aligned halves either side of a separator
+    /// (`+999 -999`), so neither edge is the field's centre of gravity.
+    Split,
+}
+
 impl ColumnLayout {
-    /// Render a placeholder indicator (loading or skipped state).
-    /// Right-aligns for diff columns, left-aligns otherwise.
-    fn placeholder_cell(&self, symbol: &str) -> StyledLine {
-        let mut cell = StyledLine::new();
+    fn alignment(&self) -> CellAlignment {
         if matches!(self.format, ColumnFormat::Diff(_)) {
-            let padding = self.width.saturating_sub(symbol.width());
-            cell.push_raw(" ".repeat(padding));
+            CellAlignment::Split
+        } else if self.kind == ColumnKind::Time {
+            CellAlignment::Right
+        } else {
+            CellAlignment::Left
         }
-        cell.push_styled(symbol, Style::new().dimmed());
+    }
+
+    /// Place whole-cell content according to the column's value shape.
+    ///
+    /// A diff column is two right-aligned halves, so its own value renderer
+    /// places each half. Content that names or describes the whole field — its
+    /// header, loading state, or in-sync marker — sits over their separator.
+    /// Age is a single right-aligned value; everything else reads from the left.
+    fn aligned_cell(&self, content: StyledLine) -> StyledLine {
+        let leading = match self.alignment() {
+            CellAlignment::Left => return content,
+            CellAlignment::Right => self.width.saturating_sub(content.width()),
+            // A split column's value renderer owns the two halves. A loading
+            // or skipped marker describes the whole field, so it sits between
+            // them just like the header and the in-sync marker do.
+            CellAlignment::Split => self.width.saturating_sub(content.width()) / 2,
+        };
+        if leading == 0 {
+            return content;
+        }
+        let mut cell = StyledLine::new();
+        cell.push_raw(" ".repeat(leading));
+        cell.extend(content);
         cell
     }
 
+    /// Render a placeholder indicator (loading or skipped state).
+    fn placeholder_cell(&self, symbol: &str) -> StyledLine {
+        let mut cell = StyledLine::new();
+        cell.push_styled(symbol, Style::new().dimmed());
+        self.aligned_cell(cell)
+    }
+
     /// Render a text cell with optional style, truncated to column width.
+    ///
+    /// Styles only text that exists: an empty string wrapped
+    /// in a style is a bare escape pair around nothing, which a terminal renders
+    /// as an invisible artifact and a snapshot records verbatim. Every cell whose
+    /// text can be empty — the Commit column for an unborn branch, a detached
+    /// row's Branch column when the commit-details batch failed — relies on this
+    /// rather than repeating the check.
     fn render_text_cell(&self, text: &str, style: Option<Style>) -> StyledLine {
         let mut cell = StyledLine::new();
-        if let Some(s) = style {
-            cell.push_styled(text.to_string(), s);
-        } else {
-            cell.push_raw(text.to_string());
+        match style.filter(|_| !text.is_empty()) {
+            Some(s) => cell.push_styled(text.to_string(), s),
+            None => cell.push_raw(text.to_string()),
         }
         cell.truncate_to_width(self.width)
     }
@@ -448,8 +502,8 @@ impl ColumnLayout {
                 let mut cell = StyledLine::new();
                 // `glyph` + trailing space = the two-cell sigil; the bare glyph
                 // also feeds the picker's fuzzy-search text (`gutter_glyph`).
-                let sigil = format!("{} ", item.kind.gutter_glyph());
-                match &item.kind {
+                let sigil = format!("{} ", item.kind().gutter_glyph());
+                match item.kind() {
                     // Worktree rows are materialized on disk — render bright.
                     ItemKind::Worktree(_) => cell.push_raw(sigil),
                     // Branch rows are refs with no working copy — render dim.
@@ -458,8 +512,19 @@ impl ColumnLayout {
                 cell
             }
             ColumnKind::Branch => {
-                let text = item.branch.as_deref().unwrap_or("-");
-                self.render_text_cell(text, text_style)
+                // A detached worktree has no name for this cell, so it carries
+                // the abbreviated HEAD — the Commit column's value, repeated
+                // here because the column's question is "which ref is this?"
+                // and a SHA is the answer. `DETACHED` outranks `text_style`:
+                // the removable dim still reaches this row's Path and Message
+                // cells, while yellow keeps the SHA from reading as a branch
+                // that happens to be named like one.
+                let style = if item.branch().is_none() {
+                    Some(DETACHED)
+                } else {
+                    text_style
+                };
+                self.render_text_cell(item.display_name(), style)
             }
             ColumnKind::Status => {
                 // `render_with_mask` emits the placeholder glyph per
@@ -506,10 +571,10 @@ impl ColumnLayout {
                 }
             }
             ColumnKind::Path => {
-                let Some(data) = worktree_data else {
+                let Some(path) = item.worktree_path() else {
                     return StyledLine::new();
                 };
-                let path_str = shorten_path(&data.path, main_worktree_path);
+                let path_str = shorten_path(path, main_worktree_path);
                 self.render_text_cell(&path_str, text_style)
             }
             ColumnKind::Upstream => {
@@ -524,11 +589,8 @@ impl ColumnLayout {
                 // checking counts directly is simpler than threading the enum through.
                 if active.ahead == 0 && active.behind == 0 {
                     let mut cell = StyledLine::new();
-                    // Center the symbol in the column width
-                    let padding_left = (self.width.saturating_sub(1)) / 2;
-                    cell.push_raw(" ".repeat(padding_left));
                     cell.push_styled("|", Style::new().dimmed());
-                    return cell;
+                    return self.aligned_cell(cell);
                 }
                 self.render_diff_cell(active.ahead, active.behind)
             }
@@ -541,7 +603,9 @@ impl ColumnLayout {
                     format_relative_time_short(commit.timestamp),
                     Style::new().dimmed(),
                 );
-                cell
+                // `now` and `4m` are different lengths with the unit at the
+                // end, so they only line up from the right.
+                self.aligned_cell(cell)
             }
             ColumnKind::Url => {
                 // URL column: shows dev server URL from project config template
@@ -572,20 +636,14 @@ impl ColumnLayout {
                 }
             }
             ColumnKind::Commit => {
-                let head = item.head();
-                if head == worktrunk::git::NULL_OID {
-                    self.render_text_cell("", None)
-                } else {
-                    let short_head = &head[..8.min(head.len())];
-                    self.render_text_cell(short_head, Some(Style::new().dimmed()))
-                }
+                self.render_text_cell(&item.short_sha, Some(Style::new().dimmed()))
             }
             ColumnKind::Summary => match &item.summary {
                 None => self.placeholder_cell(placeholder),
                 Some(None) => StyledLine::new(),
                 Some(Some(summary)) => {
                     let mut cell = StyledLine::new();
-                    let msg = truncate_to_width(summary, max_summary_len);
+                    let msg = truncate_visible(summary, max_summary_len);
                     cell.push_styled(msg, Style::new());
                     cell
                 }
@@ -595,7 +653,7 @@ impl ColumnLayout {
                     return self.placeholder_cell(placeholder);
                 };
                 let mut cell = StyledLine::new();
-                let msg = truncate_to_width(&commit.commit_message, max_message_len);
+                let msg = truncate_visible(&commit.commit_message, max_message_len);
                 cell.push_styled(msg, Style::new().dimmed());
                 cell
             }
@@ -619,6 +677,7 @@ mod tests {
     use super::*;
     use crate::commands::list::layout::DiffDisplayConfig;
     use ansi_str::AnsiStr;
+    use insta::assert_snapshot;
     use std::path::PathBuf;
     use worktrunk::styling::{ADDITION, DELETION};
 
@@ -637,10 +696,79 @@ mod tests {
             main_worktree_path: PathBuf::from("/tmp"),
             max_message_len: 50,
             max_summary_len: 40,
-            hidden_column_count: 0,
+            hidden_columns: Vec::new(),
             status_position_mask: PositionMask::FULL,
             link_style: LinkStyle::Expanded,
         }
+    }
+
+    /// Alignment follows the shape of the value: text starts at the left,
+    /// scalar values end at the right, and labels or states for a split value
+    /// sit over its centre.
+    #[test]
+    fn test_alignment_policy_by_column_shape() {
+        let columns = [
+            ColumnLayout {
+                kind: ColumnKind::Branch,
+                header: std::borrow::Cow::Borrowed("Branch"),
+                start: 0,
+                width: 8,
+                format: ColumnFormat::Text,
+            },
+            ColumnLayout {
+                kind: ColumnKind::Time,
+                header: std::borrow::Cow::Borrowed("Age"),
+                start: 0,
+                width: 4,
+                format: ColumnFormat::Text,
+            },
+            ColumnLayout {
+                kind: ColumnKind::WorkingDiff,
+                header: std::borrow::Cow::Borrowed("HEAD±"),
+                start: 0,
+                width: 9,
+                format: ColumnFormat::Diff(DiffColumnConfig {
+                    positive_digits: 3,
+                    negative_digits: 3,
+                    total_width: 9,
+                    display: DiffDisplayConfig {
+                        variant: super::super::columns::DiffVariant::Signs,
+                        positive_style: ADDITION,
+                        negative_style: DELETION,
+                    },
+                }),
+            },
+        ];
+
+        let headers = columns
+            .iter()
+            .cloned()
+            .map(cell_layout)
+            .map(|layout| {
+                layout
+                    .render_header_line()
+                    .render()
+                    .ansi_strip()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        let placeholders = columns
+            .iter()
+            .map(|column| {
+                column
+                    .placeholder_cell(PLACEHOLDER)
+                    .render()
+                    .ansi_strip()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+
+        assert_snapshot!(format!("{headers}\n{placeholders}"), @"
+        Branch| Age|  HEAD±
+        ·|   ·|    ·
+        ");
     }
 
     #[test]
@@ -1342,7 +1470,7 @@ mod tests {
             main_worktree_path: PathBuf::from("/tmp"),
             max_message_len: 0,
             max_summary_len: 10,
-            hidden_column_count: 0,
+            hidden_columns: Vec::new(),
             status_position_mask: PositionMask::FULL,
             link_style,
         };
@@ -1411,7 +1539,7 @@ mod tests {
             main_worktree_path: PathBuf::from("/tmp"),
             max_message_len: 0,
             max_summary_len: 10,
-            hidden_column_count: 0,
+            hidden_columns: Vec::new(),
             status_position_mask: PositionMask::FULL,
             link_style: LinkStyle::Expanded,
         };
@@ -1485,7 +1613,7 @@ mod tests {
             main_worktree_path: PathBuf::from("/tmp"),
             max_message_len: 20,
             max_summary_len: 10,
-            hidden_column_count: 0,
+            hidden_columns: Vec::new(),
             status_position_mask: PositionMask::FULL,
             link_style: LinkStyle::Expanded,
         };
@@ -1523,7 +1651,7 @@ mod tests {
     #[test]
     fn test_working_diff_placeholder_when_not_loaded() {
         use super::super::layout::ColumnLayout;
-        use super::super::model::{ItemKind, ListItem};
+        use super::super::model::ListItem;
         use worktrunk::styling::{ADDITION, DELETION};
 
         let col = ColumnLayout {
@@ -1549,14 +1677,16 @@ mod tests {
         assert!(cell.render().is_empty(), "branch item should be blank");
 
         // Worktree item with working_tree_diff: None → placeholder
-        let mut wt_item = ListItem::new_branch("abc123".into(), "feat".into());
-        wt_item.kind = ItemKind::Worktree(Box::default());
+        let wt_item = ListItem::new_worktree(
+            worktrunk::git::WorktreeRef::new(".", Some("feat"), "abc123"),
+            Default::default(),
+        );
         let cell = col.render_cell(&wt_item, &cell_layout(col.clone()), PLACEHOLDER);
-        insta::assert_snapshot!(cell.render(), @"        [2m·[0m");
+        insta::assert_snapshot!(cell.render(), @"    [2m·[0m");
 
         // Stale placeholder
         let cell = col.render_cell(&wt_item, &cell_layout(col.clone()), "·");
-        insta::assert_snapshot!(cell.render(), @"        [2m·[0m");
+        insta::assert_snapshot!(cell.render(), @"    [2m·[0m");
     }
 
     #[test]
@@ -1586,7 +1716,7 @@ mod tests {
         let item = ListItem::new_branch("abc123".into(), "feat".into());
         assert!(item.upstream.is_none());
         let cell = col.render_cell(&item, &cell_layout(col.clone()), PLACEHOLDER);
-        insta::assert_snapshot!(cell.render(), @"      [2m·[0m");
+        insta::assert_snapshot!(cell.render(), @"   [2m·[0m");
 
         // upstream: Some(default) (loaded, no active upstream) → blank
         let mut item = ListItem::new_branch("abc123".into(), "feat".into());

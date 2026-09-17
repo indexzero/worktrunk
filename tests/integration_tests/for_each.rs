@@ -67,8 +67,32 @@ fn test_for_each_with_template(repo: TestRepo) {
     ));
 }
 
+/// A detached worktree leaves `{{ branch }}` unset, so `{% if branch %}` guards
+/// it and the loop visits every worktree (issue #4009).
 #[rstest]
 fn test_for_each_detached_branch_variable(mut repo: TestRepo) {
+    repo.add_worktree("detached-test");
+    repo.detach_head_in_worktree("detached-test");
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "step",
+        &[
+            "for-each",
+            "--",
+            "echo",
+            "Branch: [{% if branch %}{{ branch }}{% endif %}]",
+        ],
+        None,
+    ));
+}
+
+/// The unguarded form is an undefined-variable error in the detached worktree,
+/// the same as any other optional variable. Before #4009 it rendered the
+/// literal `HEAD` — a string git resolves as a ref, so the command ran against
+/// the wrong thing instead of saying so.
+#[rstest]
+fn test_for_each_detached_branch_variable_unguarded(mut repo: TestRepo) {
     repo.add_worktree("detached-test");
     repo.detach_head_in_worktree("detached-test");
 
@@ -249,6 +273,46 @@ fn test_for_each_aborts_on_signal_exit(repo: TestRepo) {
     assert!(
         stderr.contains("Interrupted"),
         "expected 'Interrupted' message in stderr, got: {stderr}"
+    );
+}
+
+/// An interrupted `--format=json` run still owes its consumer the results it
+/// collected before the signal: the machine-readable answer is emitted on the
+/// abort path too, not just on the completing one. Same in-child SIGTERM as
+/// the test above, for the same reason.
+#[rstest]
+#[cfg(unix)]
+fn test_for_each_json_emitted_on_signal_abort(repo: TestRepo) {
+    let output = repo
+        .wt_command()
+        .args([
+            "step",
+            "for-each",
+            "--format=json",
+            "--",
+            "sh",
+            "-c",
+            "kill -TERM $$",
+        ])
+        .output()
+        .expect("run wt step for-each");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(143),
+        "expected exit 143 (SIGTERM), got {:?}\nstderr: {stderr}",
+        output.status.code(),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("interrupted run must still emit JSON: {e}\nstdout: {stdout}"));
+    let items = json.as_array().expect("results are an array");
+    assert_eq!(
+        items.len(),
+        1,
+        "only the worktree visited before the signal is reported:\n{stdout}"
     );
 }
 
@@ -460,7 +524,7 @@ fn test_for_each_commit_detached_sibling_matches_per_worktree_head(repo: TestRep
             "for-each",
             "--",
             "echo",
-            "{{ branch }} {{ commit }}",
+            "[{% if branch %}{{ branch }}{% endif %}] {{ commit }}",
         ])
         .output()
         .expect("run wt step for-each");
@@ -476,15 +540,16 @@ fn test_for_each_commit_detached_sibling_matches_per_worktree_head(repo: TestRep
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    // Detached HEAD surfaces as `{{ branch }} == "HEAD"`. The sibling's commit
-    // must be its own HEAD, not the running worktree's.
-    let needle = format!("HEAD {feature_b_sha}");
+    // A detached worktree leaves `{{ branch }}` unset, so its row renders the
+    // empty guard. The sibling's commit must be its own HEAD, not the running
+    // worktree's.
+    let needle = format!("[] {feature_b_sha}");
     assert!(
         combined.contains(&needle),
         "expected detached sibling's {{{{ commit }}}} = {feature_b_sha} in output\noutput={combined}",
     );
     assert!(
-        !combined.contains(&format!("HEAD {main_sha}")),
+        !combined.contains(&format!("[] {main_sha}")),
         "detached sibling's {{{{ commit }}}} must not resolve to main's SHA {main_sha}\noutput={combined}",
     );
 }

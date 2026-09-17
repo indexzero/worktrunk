@@ -9,16 +9,15 @@ metadata:
 
 ## Shell Integration
 
-Worktrunk uses split file-based directive passing for shell integration:
+Worktrunk uses one file-based directive for shell integration:
 
-1. Shell wrapper creates two temp files via `mktemp` (cd and exec)
-2. Shell wrapper sets `WORKTRUNK_DIRECTIVE_CD_FILE` and `WORKTRUNK_DIRECTIVE_EXEC_FILE`
-3. wt writes a raw path to the CD file; shell commands to the EXEC file (for `--execute`)
-4. Shell wrapper reads the CD file with `cd -- "$(< file)"` (no shell parsing)
-5. Shell wrapper sources the EXEC file if non-empty
+1. Shell wrapper creates a temp file via `mktemp`
+2. Shell wrapper sets `WORKTRUNK_DIRECTIVE_CD_FILE`
+3. wt writes a raw path to the file
+4. Shell wrapper changes directory to that path after wt exits
 
-When neither directive env var is set (direct binary call), commands execute
-directly and shell integration hints are shown.
+`--execute` always launches its external program directly from wt, with the
+selected worktree as its working directory. It does not use a directive.
 
 ## Output Functions
 
@@ -48,19 +47,80 @@ use worktrunk::styling::{eprintln, println, stderr};
 // Status messages to stderr
 eprintln!("{}", success_message("Created worktree"));
 
-// Primary output to stdout (tables, JSON, pipeable)
+// Primary output to stdout (tables, shell code, pipeable)
 println!("{}", table_output);
 
 // Flush before interactive prompts
 stderr().flush()?;
 ```
 
+`src/` holds two crates, and the path differs between them: `worktrunk::styling`
+from the binary's modules — the ones `src/main.rs` declares (`commands`, `cli`,
+`display`, …), which the examples throughout this skill are written for — and
+`crate::styling` from the library's, the ones `src/lib.rs` declares (`git`,
+`config`, `shell_exec`, …), where `worktrunk::` does not resolve at all. The
+guard tests accept either, so the compiler is the only thing that tells you the
+path is wrong for the file.
+
+Which `println!` is in scope decides whether a closed pipe panics: std's
+panics on the `BrokenPipe` write error, anstream's drops it. `wt … | head`
+closes the pipe, so command code imports the `worktrunk::styling` one and no
+`std::println!` is left in `src/`.
+
+The stderr macros carry the same rule for a different consequence: anstream's
+`eprint!` / `eprintln!` strip ANSI when stderr isn't a terminal, std's keep it,
+so a file importing one but not the other writes escapes on one line of a
+message block and not the next under `wt … 2>log`. `eprint!` is the half that
+slips — it has no newline, so it gets reached for mid-block in a file that
+imported only `eprintln`. Every bare `eprint!` / `eprintln!` under `src/` must
+resolve to anstream's: import it, or qualify the call as
+`styling::eprintln!(…)`. `check_stderr_macros_come_from_styling` in
+`tests/integration_tests/output_system_guard.rs` holds that statically, since
+no snapshot can — the suite forces `CLICOLOR_FORCE=1`, so both printers emit
+color and a snapshot agrees whichever macro is in scope. Its
+`STD_STDERR_ALLOWED_PATHS` exempts whole files, not calls, so an entry is only
+right where std's macro is right throughout.
+
+A write that names no macro misses that scan entirely, since the scan looks for
+the name: `writeln!(std::io::stderr(), …)`, `std::io::stderr().write_all(…)`, a
+locked handle, a bound one. `check_raw_stderr_writes_go_through_anstream`
+refuses those shapes too, with its own `RAW_STDERR_ALLOWED_PATHS` — currently
+just `progress.rs`, whose spinner holds one lock across a frame (anstream's
+`stderr()` has none) and is tty-gated, so nothing of its output ever reaches a
+redirected stderr. The shape to watch for is a message rendered in one place
+and printed several layers below, where the printer has no idea it is handling
+narration: `Cmd::delayed_stream`'s progress line is the example, and a raw
+handle there made it the only colored line in a redirected `wt switch` log.
+
+**Output whose ANSI is already decided** declares that once at the top of the
+command with `worktrunk::styling::ColorChoice::Always.write_global()` and then
+prints through the same anstream macros — the statusline a shell prompt or
+Claude Code renders, and the `--help-page` document whose escapes the docs
+pipeline turns into HTML (`--plain` and `--help-md` declare `Never` the same
+way). Neither consumer is ever a tty, so without the declaration anstream
+would strip their color every time — and the test suite would not catch it,
+because it forces color with `CLICOLOR_FORCE=1`;
+`test_color_follows_the_consumer` pins the unforced behavior. Declare `Always`
+only when the pipe is a courier rather than the destination; anything a person
+reads directly stays on plain anstream, which is what strips color on a pipe
+and honors `NO_COLOR`.
+
+**`--format=json` answers** go through `crate::output::print_json`, never a
+hand-rolled `println!("{}", serde_json::to_string_pretty(&v)?)`. It serializes
+pretty with one trailing newline and prints through anstream, so no
+`--format=json` surface panics when its consumer stops reading. Before that,
+thirty call sites had open-coded those two lines, and whether any one of them
+panicked under `| head -3` came down to which `println!` its module happened to
+import. `wt switch --format=json` is the one non-caller: it emits its single
+result as one compact line (still through anstream's `println!`), because that
+is what a shell loop reads.
+
 **Shell integration functions** (`src/output/global.rs`):
 
 | Function | Purpose |
 |----------|---------|
 | `change_directory(path)` | Shell cd after wt exits (writes to directive file if set) |
-| `execute(command)` | Shell command after wt exits |
+| `execute(argv)` | Run an external program in the selected worktree |
 | `terminate_output()` | Reset ANSI state on stderr |
 | `is_shell_integration_active()` | Check if directive file set (rarely needed) |
 | `pre_hook_display_path(path)` | Compute display path for pre-hooks |
@@ -97,7 +157,7 @@ format_heading("USER CONFIG", Some("@ ~/.config/wt.toml"))
 
 - **stdout** → the answer, in whatever format the user selected. Data (tables, JSON, shell code, an expanded template) and `--dry-run` previews both qualify: a preview is the whole answer when nothing mutates. Human-formatted output belongs here too. Color strips automatically on a pipe (anstream), so `wt list | grep` stays safe.
 - **stderr** → narration about doing it: progress, success/warning/error messages, hints, interactive prompts, and `-v`/`-vv` diagnostics.
-- **directive file** → shell commands executed after wt exits (cd, exec).
+- **directive file** → the raw cd path consumed after wt exits.
 
 The same line can flip streams between modes. `wt config shell uninstall` deletes the file, so `✓ Removed … @ ~/.zshrc` only narrates a side effect that already happened → stderr (the edited file is the answer; stdout is empty). `wt config shell uninstall --dry-run` mutates nothing, so `○ Will remove … @ ~/.zshrc` is the only answer there is → stdout. What flips isn't the wording, it's whether a side effect exists to be the answer.
 
@@ -129,18 +189,13 @@ pager fails.
 
 ## Security
 
-The split-trust design enforces two trust levels:
-
 - `WORKTRUNK_DIRECTIVE_CD_FILE` holds a raw path (no shell parsing), so it's
   safe to pass through to alias/hook child processes — a body that writes to it
   can at worst redirect `cd`.
-- `WORKTRUNK_DIRECTIVE_EXEC_FILE` holds arbitrary shell that the wrapper
-  sources verbatim, so wt scrubs this env var from alias/hook child processes.
-  A hook body writing to it would inject shell into the parent session.
 
 All directive env vars are removed from spawned subprocesses by default via
 `shell_exec::scrub_directive_env_vars()`. `DirectivePassthrough::inherit_from_env()`
-re-adds only the CD file (and legacy compat file) for trusted contexts.
+re-adds the CD file where a nested command may redirect the parent shell.
 
 ## Windows Compatibility (Git Bash / MSYS2)
 
@@ -175,8 +230,8 @@ address the user. Imperatives like "Run", "Use", "Add" are fine — they're
 concise CLI idiom.
 
 ```rust
-// BAD - "Use 'wt merge' to rebase your changes onto main"
-// GOOD - "Use 'wt merge' to rebase onto main"
+// BAD - "To rebase your changes onto main, run wt merge"
+// GOOD - "To rebase onto main, run wt merge"
 ```
 
 **Avoid redundant parenthesized content:** Parenthesized text should add new
@@ -237,10 +292,10 @@ mentioned in the error message.
 ```rust
 // BAD - "it" refers to branch name in error message
 // Error: "Branch 'feature' not found"
-// Hint:  "Use --create to create it"
+// Hint:  "To create it, use --create"
 // GOOD - self-contained hint
 // Error: "Branch 'feature' not found"
-// Hint:  "Use --create to create a new branch"
+// Hint:  "To create a new branch, use --create"
 ```
 
 ## Heading Case
@@ -471,12 +526,13 @@ clearer:
 ```
 
 **Description + command in single message:** For warnings/errors that include a
-recovery command, join with semicolon. Use `<bold>` for commands in
+recovery command, join with semicolon, and order the recovery "To X, run Y" as
+hints do, so the command still ends the line. Use `<bold>` for commands in
 warnings/errors (only hints use `<underline>`):
 
 ```rust
 // Warning with inline recovery command (bold for commands)
-warning_message("Failed to restore stash; run <bold>git stash pop {ref}</> to restore manually")
+warning_message("Failed to restore stash; to restore manually, run <bold>git stash pop {ref}</>")
 warning_message("{tool} not authenticated; run <bold>{tool} auth login</>")
 
 // For longer suggestions, use separate hint message (underline for commands)
@@ -550,7 +606,12 @@ Specific rules:
 
 - **No leading/trailing blanks** — Start immediately, end cleanly
 - **Blank before prompts, not after** — Signal "pause, something interactive is
-  happening" before the prompt; once the user responds, output flows continuously
+  happening" before the prompt; once the user responds, output flows continuously.
+  The blank belongs to the narration it separates from, so the caller emits it
+  and `prompt_yes_no_preview` does not: a prompt that opens a command's output
+  (`wt config shell install`, `wt config plugins claude install`, the
+  commit-generation offer at the top of `wt merge`) starts flush, since a blank
+  there is a leading blank
 - **One blank between phases** — When a sub-operation completes and a different
   operation begins, add a blank line to visually separate them
 - **Never double blanks** — One blank line maximum between elements
@@ -569,14 +630,14 @@ Specific rules:
   ↳ To configure, run wt config shell install
   ```
 
-**Prompt spacing:** A blank line before the prompt signals "something different
-is about to happen" and gives the user's eye a natural stopping point before they
-need to read and respond. No blank line after — the user's input ends the
-interactive moment and subsequent output flows naturally from that decision.
+**Prompt spacing:** A blank line before a prompt that follows narration signals
+"something different is about to happen" and gives the user's eye a natural
+stopping point before they need to read and respond. No blank line after — the
+user's input ends the interactive moment and subsequent output flows naturally
+from that decision. A prompt with nothing above it, like the setup offer below
+at the top of `wt step commit`, has nothing to separate from and starts flush.
 
 ```
-◎ Detecting available LLM tools...
-
 ❯ Configure claude for commit messages? [y/N/?] y
 ✓ Added to user config:
    ┃ [commit.generation]
@@ -702,7 +763,7 @@ Use `eprintln!` with formatting functions. Use `cformat!` for inner styling:
 
 ```rust
 eprintln!("{}", success_message(cformat!("Created <bold>{branch}</> from <bold>{base}</>")));
-eprintln!("{}", hint_message(cformat!("Run <underline>wt merge</> to continue")));
+eprintln!("{}", hint_message(cformat!("To continue, run <underline>wt merge</>")));
 ```
 
 **color-print tags:** `<bold>`, `<dim>`, `<underline>`, `<bright-black>`, `<red>`,
@@ -729,11 +790,11 @@ Never quote commands or branch names. Use styling to make them stand out:
 
 ```rust
 // GOOD - bold in normal context
-eprintln!("{}", info_message(cformat!("Use <bold>wt merge</> to continue")));
+eprintln!("{}", info_message(cformat!("To continue, use <bold>wt merge</>")));
 // GOOD - underline for commands in hints
-eprintln!("{}", hint_message(cformat!("Run <underline>wt list</> to see worktrees")));
+eprintln!("{}", hint_message(cformat!("To see worktrees, run <underline>wt list</>")));
 // BAD - quoted commands
-eprintln!("{}", hint_message("Run 'wt list' to see worktrees"));
+eprintln!("{}", hint_message("To see worktrees, run 'wt list'"));
 ```
 
 ## Hyperlinks
@@ -1051,8 +1112,19 @@ eprintln!("{}", success_message(format!(
 
 ## Table Column Alignment
 
-- **Text columns** (Branch, Path): left-aligned
-- **Numeric columns** (HEAD±, main↕): right-aligned
+- **Text columns** (Branch, Path, Message): left-aligned
+- **Single-value numeric columns** (Age): right-aligned, so `now` and `4m` line
+  up on the unit
+- **Diff columns** (HEAD±, main↕): two right-aligned halves either side of a
+  separator (`+999 -999`); a state for the whole field, such as a loading or
+  in-sync marker, is centered
+
+A header follows its content, except over a diff column, where it centres:
+pushed to either edge it stands over one half and reads as that half's label,
+leaving a lone `+1` stranded left of `HEAD±`.
+
+Rows carry no trailing padding. Padding places a cell; past the last one it
+places nothing, and a reader who selects the row gets it anyway.
 
 ## Snapshot Testing
 
