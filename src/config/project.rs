@@ -285,7 +285,7 @@ impl ProjectConfig {
         // falling back to the file would silently change which config runs.
         let git_pairs = repo
             .worktrunk_config_git_pairs()
-            .map_err(|e| ConfigError(format!("Failed to read git config: {e}")))?;
+            .map_err(|e| ConfigError::Message(format!("Failed to read git config: {e}")))?;
         if !git_pairs.is_empty() {
             super::git_source::warn_superseded_project_file(repo);
             return Ok(Some(super::git_source::project_config_from_git(
@@ -295,13 +295,13 @@ impl ProjectConfig {
 
         let (contents, config_path) = match repo
             .project_config_path()
-            .map_err(|e| ConfigError(format!("Failed to get config path: {}", e)))?
+            .map_err(|e| ConfigError::Message(format!("Failed to get config path: {}", e)))?
         {
             Some(path) if path.exists() => {
                 // Load directly with toml crate to preserve insertion order
                 // (with preserve_order feature).
                 let contents = std::fs::read_to_string(&path).map_err(|e| {
-                    ConfigError(format!(
+                    ConfigError::Message(format!(
                         "Failed to read {}: {e}",
                         crate::path::format_path_for_display(&path)
                     ))
@@ -333,7 +333,7 @@ impl ProjectConfig {
             repo_for_hints,
             true, // emit_inline_warnings
         )
-        .map_err(|e| ConfigError(e.to_string()))?
+        .map_err(|e| ConfigError::Message(e.to_string()))?
         .migrated_content;
 
         // Warn about unknown fields, from every worktree. Unlike the
@@ -355,10 +355,12 @@ impl ProjectConfig {
 
         // Deserialize the structurally migrated content so deprecated keys
         // (e.g. `pre-start`/`post-start`) still load into their canonical fields.
-        let config: ProjectConfig = toml::from_str(&migrated).map_err(|e| LoadError::File {
-            path: config_path,
-            kind: super::ConfigFileKind::Project,
-            err: Box::new(e),
+        let config: ProjectConfig = toml::from_str(&migrated).map_err(|e| {
+            LoadError::File(super::ConfigParseError::new(
+                super::ConfigFileKind::Project,
+                &config_path,
+                e,
+            ))
         })?;
 
         Ok(Some(config))

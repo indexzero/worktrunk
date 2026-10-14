@@ -58,7 +58,8 @@ success: true
 exit_code: 0
 ----- stdout -----
 [36mUSER CONFIG[39m @ [TEST_CONFIG]
-[2m↳[22m [2mNot found; to create one, run [4mwt config create[24m[22m
+[2m○[22m Not found
+[2m↳[22m [2mTo create one, run [4mwt config create[24m[22m
 
 [36mPROJECT CONFIG[39m @ git config (worktrunk.config.*)
 [2m○[22m Identifier: [1m../origin[22m

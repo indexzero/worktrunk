@@ -130,7 +130,8 @@ pub fn redact_worktrunk_config_z(raw: &[u8]) -> Vec<u8> {
 /// nested tables — so that arm is a plain error passthrough.
 pub fn render_git_source_toml(pairs: &[(String, String)]) -> Result<String, ConfigError> {
     let table = pairs_to_table(pairs)?;
-    toml::to_string(&table).map_err(|e| ConfigError(format!("{GIT_CONFIG_SOURCE_LABEL}: {e}")))
+    toml::to_string(&table)
+        .map_err(|e| ConfigError::Message(format!("{GIT_CONFIG_SOURCE_LABEL}: {e}")))
 }
 
 /// Parse `worktrunk.config.*` pairs into a [`ProjectConfig`] tagged with
@@ -157,7 +158,7 @@ pub fn project_config_from_git(pairs: &[(String, String)]) -> Result<ProjectConf
             .iter()
             .map(|(key, _)| format!("{GIT_CONFIG_PREFIX}{key}"))
             .collect();
-        ConfigError(format!(
+        ConfigError::Message(format!(
             "{} from {GIT_CONFIG_SOURCE_LABEL} failed to parse:\n{e}\nFrom: {}",
             ConfigFileKind::Project.label(),
             keys.join(", "),
@@ -182,7 +183,7 @@ fn pairs_to_table(pairs: &[(String, String)]) -> Result<toml::Table, ConfigError
 fn insert_dotted(root: &mut toml::Table, key: &str, value: &str) -> Result<(), ConfigError> {
     let segments: Vec<&str> = key.split('.').collect();
     if segments.iter().any(|s| s.is_empty()) {
-        return Err(ConfigError(format!(
+        return Err(ConfigError::Message(format!(
             "Invalid git config key {GIT_CONFIG_PREFIX}{key}: empty key segment"
         )));
     }
@@ -198,7 +199,7 @@ fn insert_dotted(root: &mut toml::Table, key: &str, value: &str) -> Result<(), C
         {
             toml::Value::Table(t) => t,
             _ => {
-                return Err(ConfigError(format!(
+                return Err(ConfigError::Message(format!(
                     "Conflicting git config keys: {GIT_CONFIG_PREFIX}{walked} is a value, but {GIT_CONFIG_PREFIX}{key} needs it to be a table"
                 )));
             }
@@ -211,7 +212,7 @@ fn insert_dotted(root: &mut toml::Table, key: &str, value: &str) -> Result<(), C
             slot.insert(toml::Value::String(value.to_string()));
             Ok(())
         }
-        toml::map::Entry::Occupied(_) => Err(ConfigError(format!(
+        toml::map::Entry::Occupied(_) => Err(ConfigError::Message(format!(
             "Conflicting git config keys: {GIT_CONFIG_PREFIX}{key} is set both as a value and as a table"
         ))),
     }
@@ -338,7 +339,7 @@ mod tests {
             ("list.url", "http://localhost:3000"),
         ]))
         .unwrap_err();
-        assert!(err.0.contains("worktrunk.config.list"), "{}", err.0);
+        assert!(err.to_string().contains("worktrunk.config.list"), "{err}");
     }
 
     #[test]
@@ -348,13 +349,13 @@ mod tests {
             ("list", "oops"),
         ]))
         .unwrap_err();
-        assert!(err.0.contains("worktrunk.config.list"), "{}", err.0);
+        assert!(err.to_string().contains("worktrunk.config.list"), "{err}");
     }
 
     #[test]
     fn test_empty_segment_is_an_error() {
         let err = project_config_from_git(&pairs(&[("list..url", "x")])).unwrap_err();
-        assert!(err.0.contains("empty key segment"), "{}", err.0);
+        assert!(err.to_string().contains("empty key segment"), "{err}");
     }
 
     #[test]
@@ -363,7 +364,7 @@ mod tests {
         // it, and the error must surface rather than fall back to the file.
         let err = project_config_from_git(&pairs(&[("step.copy-ignored.exclude", "target")]))
             .unwrap_err();
-        assert!(err.0.contains(GIT_CONFIG_SOURCE_LABEL), "{}", err.0);
+        assert!(err.to_string().contains(GIT_CONFIG_SOURCE_LABEL), "{err}");
     }
 
     #[test]

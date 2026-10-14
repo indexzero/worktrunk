@@ -19,10 +19,12 @@
 pub mod approvals;
 mod commands;
 pub(crate) mod deprecation;
+mod error;
 mod expansion;
 mod git_source;
 mod hooks;
 mod project;
+mod template_analysis;
 #[cfg(test)]
 mod test;
 mod unknown_tree;
@@ -47,6 +49,19 @@ pub trait WorktrunkConfig:
     /// All valid top-level keys for this config type, derived from JsonSchema.
     fn valid_top_level_keys() -> &'static [String];
 
+    /// A top-level key whose entries are themselves schema-typed tables,
+    /// paired with the valid keys for one entry — `projects` in user config,
+    /// nothing in project config.
+    ///
+    /// A section inside such an entry serializes away when it equals its
+    /// default, exactly as a top-level section does, so the skeleton
+    /// `seed_schema_skeleton` builds has to reach one level further down for
+    /// it. Without that, `[projects."<id>".list]` — valid, and accepted on
+    /// load — reads back as an unknown field.
+    fn valid_scoped_keys() -> Option<(&'static str, &'static [String])> {
+        None
+    }
+
     /// Check if a key would be valid in this config type.
     fn is_valid_key(key: &str) -> bool {
         Self::valid_top_level_keys().iter().any(|k| k == key)
@@ -65,6 +80,10 @@ impl WorktrunkConfig for UserConfig {
         static VALID_KEYS: OnceLock<Vec<String>> = OnceLock::new();
         VALID_KEYS.get_or_init(user::valid_user_config_keys)
     }
+
+    fn valid_scoped_keys() -> Option<(&'static str, &'static [String])> {
+        Some(("projects", user_project_override_keys()))
+    }
 }
 
 impl WorktrunkConfig for ProjectConfig {
@@ -81,20 +100,7 @@ impl WorktrunkConfig for ProjectConfig {
     }
 }
 
-/// Configuration error type.
-///
-/// Replaces the `config` crate's `ConfigError` with a simple string wrapper.
-/// Every usage was `ConfigError::Message(String)` — no other variants were used.
-#[derive(Debug)]
-pub struct ConfigError(pub String);
-
-impl std::fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ConfigError {}
+pub use error::{ConfigError, ConfigParseError};
 
 /// Returns true if the given value equals `T::default()`.
 ///
@@ -143,30 +149,41 @@ pub(crate) fn schema_property_names<T: schemars::JsonSchema>() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The top-level fields of a `[projects."<id>"]` table (the
+/// [`UserProjectOverrides`] schema), including the serde aliases
+/// [`schema_top_level_keys`] adds.
+///
+/// Two callers share it: [`is_user_project_override_key`] for the "scope it to
+/// this repo" note, and `UserConfig::valid_scoped_keys` for the round-trip
+/// skeleton in `unknown_tree`.
+fn user_project_override_keys() -> &'static [String] {
+    use std::sync::OnceLock;
+    static KEYS: OnceLock<Vec<String>> = OnceLock::new();
+    KEYS.get_or_init(schema_top_level_keys::<UserProjectOverrides>)
+}
+
 /// Whether `key` is a top-level field of a `[projects."<id>"]` table (the
 /// [`UserProjectOverrides`] schema). Used to gate the "scope it to this repo"
 /// note: a misplaced user-config key only earns that advice when it can
 /// actually be placed under `[projects."<id>"]`. Root-only user settings such
 /// as `skip-shell-integration-prompt` are absent here and get no note.
 pub fn is_user_project_override_key(key: &str) -> bool {
-    use std::sync::OnceLock;
-    static KEYS: OnceLock<Vec<String>> = OnceLock::new();
-    KEYS.get_or_init(schema_top_level_keys::<UserProjectOverrides>)
-        .iter()
-        .any(|k| k == key)
+    user_project_override_keys().iter().any(|k| k == key)
 }
 
 /// Refuse to write a config file that is not valid TOML.
 ///
 /// wt can't load such a file: every later command skips user config with a
 /// warning, and the commands that need project config fail, until the user
-/// hand-edits it. Both writers of a config file the user owns check the
-/// content they are about to write: the `UserConfig` mutations and
-/// `wt config update`. Neither starts from invalid TOML, so this fires only when
-/// the edit itself broke the syntax, and the file on disk stays as it was.
+/// hand-edits it. `wt config update` runs this over the migration it computed,
+/// before either destination is written. A `UserConfig` mutation faces a
+/// stronger test of its own — that the file it is about to write loads back as
+/// the config the mutation asked for — so it needs no second, weaker one.
+/// Neither starts from invalid TOML, so this fires only when the migration
+/// itself broke the syntax, and the file on disk stays as it was.
 pub fn ensure_config_parses(content: &str) -> Result<(), ConfigError> {
     content.parse::<toml::Table>().map(|_| ()).map_err(|e| {
-        ConfigError(format!(
+        ConfigError::Message(format!(
             "Refusing to write a config file wt could not read back: {e}"
         ))
     })
@@ -196,17 +213,18 @@ pub use deprecation::{
 pub use deprecation::{DeprecationKind, Deprecations};
 pub use expansion::{
     ACTIVE_VARS, ALIAS_ARGS_KEY, EXEC_BASE_VARS, REPO_VARS, TemplateContext, TemplateExpandError,
-    ValidationScope, VarScope, VarsMode, alias_context_filter, base_vars, expand_template,
-    format_alias_variables, format_base_variables, format_hook_variables, redact_credentials,
-    referenced_vars_for_config, referenced_vars_for_templates, sanitize_branch_name, sanitize_db,
-    short_hash, template_environment, template_references_var, validate_list_column_template,
-    validate_template, validate_template_syntax, vars_available_in, vars_map_to_value,
+    ValidationScope, VarScope, VarsMode, alias_context_filter, base_vars, binds_cli_var,
+    expand_template, format_alias_variables, format_base_variables, format_hook_variables,
+    redact_credentials, referenced_vars_for_config, referenced_vars_for_templates,
+    sanitize_branch_name, sanitize_db, short_hash, template_environment, template_references_var,
+    validate_list_column_template, validate_template, validate_template_syntax, vars_available_in,
+    vars_map_to_value,
 };
 pub use git_source::{
     GIT_CONFIG_LIST_COMMAND, GIT_CONFIG_PREFIX, GIT_CONFIG_SOURCE_LABEL, redact_worktrunk_config_z,
     render_git_source_toml, superseded_project_file_label,
 };
-pub use hooks::HooksConfig;
+pub use hooks::{HookSource, HooksConfig};
 pub use project::{
     ProjectCiConfig, ProjectCommitConfig, ProjectCommitGenerationConfig, ProjectConfig,
     ProjectConfigSource, ProjectForgeConfig, ProjectListConfig, valid_project_config_keys,
@@ -220,8 +238,8 @@ pub use user::{
     CommitConfig, CommitGenerationConfig, CopyIgnoredConfig, ListColumnConfig, ListConfig,
     MergeConfig, RemoveConfig, ResolvedConfig, StageMode, StepConfig, SwitchConfig,
     SwitchPickerConfig, UserConfig, UserProjectOverrides, config_path, config_path_for_display,
-    default_config_path, default_system_config_path, require_config_path, set_config_overrides,
-    set_config_path, system_config_path, valid_user_config_keys,
+    default_config_path, require_config_path, set_config_overrides, set_config_path,
+    system_config_path, valid_user_config_keys,
 };
 
 #[cfg(test)]
@@ -242,7 +260,7 @@ mod tests {
         // comment rendered inside the brackets.
         let err =
             ensure_config_parses("[# why squash is off\nmerge ]\nsquash = true\n").unwrap_err();
-        assert!(err.0.contains("could not read back"), "{}", err.0);
+        assert!(err.to_string().contains("could not read back"), "{}", err);
         ensure_config_parses("# why squash is off\n[merge]\nsquash = true\n").unwrap();
     }
 
