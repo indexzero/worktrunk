@@ -136,6 +136,7 @@ url = "http://localhost:{{ branch | hash_port }}"
 
 #[rstest]
 fn test_list_json_url_fields(repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
     // Create project config with URL template
     repo.write_project_config(
         r#"[list]
@@ -170,6 +171,7 @@ url = "http://localhost:{{ branch | hash_port }}"
 
 #[rstest]
 fn test_list_json_no_url_without_template(repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
     // No project config means no URL template configured.
 
     let mut cmd = wt_command();
@@ -194,28 +196,10 @@ fn test_list_json_no_url_without_template(repo: TestRepo) {
 ///
 /// Only worktrees should have URLs - branches without worktrees can't have running dev servers.
 #[rstest]
-fn test_list_url_with_branches_flag(repo: TestRepo) {
+fn test_list_url_with_branches_flag(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
     // Remove fixture worktrees and their branches to isolate test (keep only main worktree)
-    for branch in &["feature-a", "feature-b", "feature-c"] {
-        let worktree_path = repo
-            .root_path()
-            .parent()
-            .unwrap()
-            .join(format!("repo.{}", branch));
-        if worktree_path.exists() {
-            let _ = repo
-                .git_command()
-                .args([
-                    "worktree",
-                    "remove",
-                    "--force",
-                    worktree_path.to_str().unwrap(),
-                ])
-                .run();
-        }
-        // Delete the branch after removing the worktree
-        let _ = repo.git_command().args(["branch", "-D", branch]).run();
-    }
+    repo.remove_fixture_worktrees();
 
     // Create a branch without a worktree
     repo.run_git(&["branch", "feature"]);
@@ -263,6 +247,7 @@ url = "http://localhost:{{ branch | hash_port }}"
 
 #[rstest]
 fn test_list_url_with_branch_variable(repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
     // Create project config with {{ branch }} in URL
     repo.write_project_config(
         r#"[list]
@@ -357,6 +342,61 @@ branches = "not-a-bool"
     });
 }
 
+/// A project config that doesn't parse must warn on stderr and still list.
+///
+/// `wt switch` and `wt hook` fail hard on the same file, but `wt list` reads
+/// project config only for decoration (`[list] url`, `[forge] platform`)
+/// through accessors that shrug the error off — so before this warning a
+/// broken `.config/wt.toml` left no trace on the command run most often, and
+/// could sit there indefinitely.
+///
+/// The snapshot pins the whole contract: the `▲` warning naming the file in
+/// the same shape the user-config layer uses, the parser's own output in a
+/// gutter, exit 0, and the table on stdout below it.
+#[rstest]
+fn test_list_malformed_project_config_warns_and_still_lists(repo: TestRepo) {
+    // Unclosed table header — the file cannot be parsed at all, so no part of
+    // it survives into the listing.
+    repo.write_project_config("[pre-merge\ntest = \"echo hi\"\n");
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.arg("list").current_dir(repo.root_path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
+/// Every project-config load failure degrades the listing, not only a parse
+/// error. A file that can't be read has no parser output to quote, so it warns
+/// with the message that names it instead of a header-plus-gutter pair.
+///
+/// Asserted rather than snapshotted: the OS's wording for "that's a directory"
+/// differs across the platforms the suite runs on.
+#[rstest]
+fn test_list_unreadable_project_config_warns_and_still_lists(repo: TestRepo) {
+    // A directory where the file belongs: the path exists, the read fails.
+    fs::create_dir_all(repo.root_path().join(".config").join("wt.toml")).unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.arg("list").current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "list must still succeed: {stderr}");
+    assert!(
+        stderr.contains('▲') && stderr.contains("Failed to read") && stderr.contains("skipping"),
+        "expected a warning naming the unreadable file, got: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("main"),
+        "table should still render"
+    );
+}
+
 /// When a WORKTRUNK_* env var override fails (e.g. a string value for a typed
 /// field), the warning must blame env vars — not the config file — and list
 /// the override vars currently set.
@@ -374,26 +414,26 @@ fn test_list_config_env_override_bad_value_warns_on_stderr(repo: TestRepo) {
     });
 }
 
-/// A *deprecated* env var is canonicalized before it is applied, so a
-/// type-mismatched value the deprecated name hid now surfaces.
-/// `WORKTRUNK__COMMIT_GENERATION__COMMAND=42` migrates to
-/// `commit.generation.command = 42`, which fails to deserialize (the field is a
-/// String), so the whole env layer is dropped with a `LoadError::Env` warning
-/// naming the var — the same contract as a bad value in a canonical env var.
-/// File config survives. (Pre-migration the unknown key was silently ignored.)
+/// A deprecated env var is canonicalized before its type is validated, so a
+/// numeric-looking value for a String field stays a string after migration.
 #[rstest]
-fn test_list_config_env_deprecated_type_mismatch_drops_layer(repo: TestRepo) {
+fn test_list_config_env_deprecated_numeric_string_field(repo: TestRepo) {
     fs::write(repo.test_config_path(), "[list]\nbranches = true\n").unwrap();
 
-    let settings = setup_snapshot_settings(&repo);
-    settings.bind(|| {
-        let mut cmd = wt_command();
-        repo.configure_wt_cmd(&mut cmd);
-        cmd.env("WORKTRUNK__COMMIT_GENERATION__COMMAND", "42");
-        cmd.arg("list").current_dir(repo.root_path());
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.env("WORKTRUNK__COMMIT_GENERATION__COMMAND", "42");
+    cmd.args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
 
-        assert_cmd_snapshot!(cmd);
-    });
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let config: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        config["user"]["config"]["commit"]["generation"]["command"],
+        "42"
+    );
+    assert!(output.stderr.is_empty());
 }
 
 /// Numeric-looking env var values for String fields must not break config
@@ -489,6 +529,197 @@ fn test_list_config_env_override_validation_failure(repo: TestRepo) {
 
         assert_cmd_snapshot!(cmd);
     });
+}
+
+#[rstest]
+fn test_list_config_bad_env_override_keeps_valid_overrides(repo: TestRepo) {
+    fs::write(
+        repo.test_config_path(),
+        "[list]\nbranches = true\ncolumns = [\"path\"]\n",
+    )
+    .unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.env("WORKTRUNK__LIST__COLUMNS", "oops")
+        .env("WORKTRUNK__LIST__FULL", "true")
+        .env("WORKTRUNK_WORKTREE_PATH", "/tmp/zzz")
+        .args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    let config = &config["user"]["config"];
+    assert_eq!(config["list"]["branches"], true);
+    assert_eq!(config["list"]["full"], true);
+    assert_eq!(config["list"]["columns"], serde_json::json!(["path"]));
+    assert_eq!(config["worktree-path"], "/tmp/zzz");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WORKTRUNK__LIST__COLUMNS"), "{stderr}");
+    assert!(!stderr.contains("WORKTRUNK__LIST__FULL"), "{stderr}");
+    assert!(!stderr.contains("WORKTRUNK_WORKTREE_PATH"), "{stderr}");
+}
+
+#[rstest]
+fn test_list_config_bad_env_override_keeps_repair_overrides(repo: TestRepo) {
+    fs::write(repo.test_config_path(), "worktree-path = \"\"\n").unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.env("WORKTRUNK__LIST__COLUMNS", "oops")
+        .env("WORKTRUNK__LIST__FULL", "true")
+        .env("WORKTRUNK_WORKTREE_PATH", "/tmp/zzz")
+        .arg("list")
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WORKTRUNK__LIST__COLUMNS"), "{stderr}");
+    assert!(!stderr.contains("WORKTRUNK__LIST__FULL"), "{stderr}");
+    assert!(!stderr.contains("WORKTRUNK_WORKTREE_PATH"), "{stderr}");
+}
+
+/// Independently valid file layers remain available while env settings discard
+/// invalid or retired overrides.
+#[rstest]
+fn test_env_validation_preserves_merged_file_layers(repo: TestRepo) {
+    let system_config = repo.root_path().join("system-config.toml");
+    fs::write(
+        &system_config,
+        "worktree-path = \"/from-system\"\n[list]\nbranches = true\ncolumns = [\"path\"]\n[merge]\nrebase = false\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.test_config_path(),
+        "worktree-path = \"/from-user\"\n[merge]\nsquash = false\n",
+    )
+    .unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.env("WORKTRUNK_SYSTEM_CONFIG_PATH", &system_config)
+        .env("WORKTRUNK__SELECT__OBSOLETE", "old")
+        .env("WORKTRUNK__LIST__COLUMNS", "oops")
+        .env("WORKTRUNK__LIST__FULL", "true")
+        .env("WORKTRUNK_WORKTREE_PATH", "/tmp/zzz")
+        .args(["config", "show", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let config = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    let config = &config["user"]["config"];
+    assert_eq!(config["list"]["branches"], true);
+    assert_eq!(config["list"]["columns"], serde_json::json!(["path"]));
+    assert_eq!(config["list"]["full"], true);
+    assert_eq!(config["merge"]["rebase"], false);
+    assert_eq!(config["merge"]["squash"], false);
+    assert_eq!(config["worktree-path"], "/tmp/zzz");
+    assert!(config.get("select").is_none());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WORKTRUNK__LIST__COLUMNS"), "{stderr}");
+    assert!(!stderr.contains("WORKTRUNK__SELECT__OBSOLETE"), "{stderr}");
+    assert!(!stderr.contains("WORKTRUNK__LIST__FULL"), "{stderr}");
+    assert!(!stderr.contains("WORKTRUNK_WORKTREE_PATH"), "{stderr}");
+}
+
+/// A bad project override must not undo a valid global override's repair,
+/// even when that project error was already present in the file layer.
+#[rstest]
+#[case::repair_only(false)]
+#[case::repair_with_invalid_override(true)]
+fn test_env_project_error_does_not_undo_global_repair(
+    repo: TestRepo,
+    #[case] invalid_project_override: bool,
+) {
+    repo.run_git(&["branch", "feature"]);
+    fs::write(
+        repo.test_config_path(),
+        "[list]\nbranches = true\n[projects.\"github.com/owner/repo\"]\nworktree-path = \"\"\n",
+    )
+    .unwrap();
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.env("WORKTRUNK_WORKTREE_PATH", "/tmp/zzz");
+    if invalid_project_override {
+        cmd.env(
+            "WORKTRUNK__PROJECTS__GITHUB.COM/OWNER/REPO__WORKTREE_PATH",
+            "",
+        );
+    }
+    cmd.args(["list", "--format=json"])
+        .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let list = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert!(
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["branch"] == "feature"),
+        "the file layer's branch-listing setting must survive: {list}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if invalid_project_override {
+        assert!(
+            stderr.contains("Ignoring env var overrides: WORKTRUNK__PROJECTS__GITHUB.COM/OWNER/REPO__WORKTREE_PATH="),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("Config validation warning"), "{stderr}");
+        assert!(!stderr.contains("WORKTRUNK_WORKTREE_PATH"), "{stderr}");
+    } else {
+        assert!(stderr.is_empty(), "{stderr}");
+    }
+}
+
+#[rstest]
+fn test_project_custom_column_env_fields_are_atomic(repo: TestRepo) {
+    repo.run_git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/owner/repo.git",
+    ]);
+    fs::write(repo.test_config_path(), "").unwrap();
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.env(
+        "WORKTRUNK__PROJECTS__GITHUB.COM/OWNER/REPO__LIST__CUSTOM_COLUMNS__TICKET__WIDTH",
+        "20",
+    )
+    .env(
+        "WORKTRUNK__PROJECTS__GITHUB.COM/OWNER/REPO__LIST__CUSTOM_COLUMNS__TICKET__TEMPLATE",
+        "{{ branch }}",
+    )
+    .args(["config", "show", "--format=json"])
+    .current_dir(repo.root_path());
+
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    let column = &config["user"]["config"]["projects"]["github.com/owner/repo"]["list"]["custom-columns"]
+        ["ticket"];
+    assert_eq!(column["template"], "{{ branch }}");
+    assert_eq!(column["width"], 20);
+    assert!(output.stderr.is_empty());
 }
 
 /// A `--config-set` override is the highest-priority layer: it wins over the
@@ -714,7 +945,10 @@ template = "{{ vars.ticket }}"
 fn test_list_custom_columns_json(repo: TestRepo) {
     fs::write(
         repo.test_config_path(),
-        r#"[list.custom-columns.Ticket]
+        r#"[list]
+json-schema = 1
+
+[list.custom-columns.Ticket]
 template = "{{ vars.ticket }}"
 "#,
     )
@@ -754,7 +988,10 @@ fn test_list_custom_column_git_branch(repo: TestRepo) {
     // git-native multi-line description is reduced to its first line.
     fs::write(
         repo.test_config_path(),
-        r#"[list.custom-columns.Jira]
+        r#"[list]
+json-schema = 1
+
+[list.custom-columns.Jira]
 template = "{{ git.branch.jira }}"
 
 [list.custom-columns.Summary]
@@ -820,7 +1057,10 @@ fn test_list_custom_column_worktree_identity(repo: TestRepo) {
     // directory name, a branch with no worktree falls back to an empty cell.
     fs::write(
         repo.test_config_path(),
-        r#"[list.custom-columns.Dir]
+        r#"[list]
+json-schema = 1
+
+[list.custom-columns.Dir]
 template = "{{ worktree_name }}"
 "#,
     )
@@ -1077,11 +1317,7 @@ fn test_list_json_ignores_columns_selection(repo: TestRepo) {
     fs::write(feature_dir.join("dirty.txt"), "uncommitted\n").unwrap();
 
     let run_json = |config: &str| -> serde_json::Value {
-        if config.is_empty() {
-            let _ = fs::remove_file(repo.test_config_path());
-        } else {
-            fs::write(repo.test_config_path(), config).unwrap();
-        }
+        fs::write(repo.test_config_path(), config).unwrap();
         let mut cmd = wt_command();
         repo.configure_wt_cmd(&mut cmd);
         cmd.args(["list", "--format=json"])
@@ -1106,7 +1342,7 @@ fn test_list_json_ignores_columns_selection(repo: TestRepo) {
 
     // Control: the default set emits the working_tree field, with the untracked
     // change visible.
-    let default = run_json("");
+    let default = run_json("[list]\njson-schema = 1\n");
     assert_eq!(
         working_tree_of(&default)["untracked"],
         serde_json::Value::Bool(true),
@@ -1117,6 +1353,7 @@ fn test_list_json_ignores_columns_selection(repo: TestRepo) {
     // change JSON output: working_tree stays exactly as the default set emits.
     let narrowed = run_json(
         r#"[list]
+json-schema = 1
 columns = ["branch", "age"]
 "#,
     );
@@ -1126,6 +1363,63 @@ columns = ["branch", "age"]
         "`--format json` must ignore `[list] columns` and emit working_tree regardless of the selection"
     );
 }
+
+/// A listed `ci` renders the CI column in the table without `--full` (asserted
+/// in `test_list_config_listed_column_overrides_full_gate`), but `--format
+/// json` plans off `--full` alone (#3787). Asserted on schema 2's
+/// `collected.ci`, which records what the plan requested rather than what a
+/// fetch returned — so this needs no forge and no `gh` on PATH.
+#[rstest]
+fn test_list_json_columns_selection_does_not_force_ci(repo: TestRepo) {
+    let collected = |config: &str, full: bool| -> serde_json::Value {
+        fs::write(repo.test_config_path(), config).unwrap();
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.args(["list", "--format=json"]);
+        if full {
+            cmd.arg("--full");
+        }
+        cmd.current_dir(repo.root_path());
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "exit code should be 0 for config {config:?} (full={full}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        json["collected"].clone()
+    };
+
+    // Control: no selection, no `--full` — nothing gated was requested.
+    assert_eq!(
+        collected(SCHEMA_2_ONLY, false)["ci"],
+        serde_json::Value::Bool(false),
+        "plain `--format json` should not request CI data"
+    );
+
+    // Listing `ci` shows the column in the table, but leaves JSON's plan alone.
+    assert_eq!(
+        collected(SCHEMA_2_WITH_CI_COLUMN, false)["ci"],
+        serde_json::Value::Bool(false),
+        "a listed `ci` column must not force the forge fetch on for `--format json`"
+    );
+
+    // `--full` is the switch that does turn it on, listed or not.
+    assert_eq!(
+        collected(SCHEMA_2_WITH_CI_COLUMN, true)["ci"],
+        serde_json::Value::Bool(true),
+        "`--full` should still request CI data for `--format json`"
+    );
+}
+
+const SCHEMA_2_ONLY: &str = r#"[list]
+json-schema = 2
+"#;
+
+const SCHEMA_2_WITH_CI_COLUMN: &str = r#"[list]
+json-schema = 2
+columns = ["branch", "ci"]
+"#;
 
 /// TODO(list-columns-env): `WORKTRUNK__LIST__COLUMNS` is not wired up yet. The
 /// env overlay can only deliver a scalar, which the `Vec<String>` field rejects,

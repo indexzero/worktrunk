@@ -83,6 +83,13 @@ struct TempRelocation {
     original_path: PathBuf,
 }
 
+/// Where the user's shell stands: its cwd and the pending worktree holding it.
+#[derive(Clone, Copy)]
+struct ShellPosition<'a> {
+    cwd: &'a Path,
+    index: usize,
+}
+
 /// A worktree that was successfully relocated.
 pub struct RelocatedEntry {
     pub branch: String,
@@ -165,12 +172,12 @@ pub fn gather_candidates(
         for arg in filter_branches {
             let path = repo.require_worktree(arg)?;
             let Some(wt) = worktrees.iter().find(|wt| paths_match(&path, &wt.path)) else {
-                // Resolved, but pruned out above: its directory is gone, so
-                // there is nothing to move.
+                // Resolved, but pruned out above: its directory or `.git` is
+                // gone, so there is nothing to move.
                 bail!(
                     "{}",
                     cformat!(
-                        "Cannot relocate worktree @ {} — its directory is gone; run <bold>wt step prune</> to clear the entry",
+                        "Cannot relocate worktree @ {} — it is stale; to clear the entry, run <bold>wt step prune</>",
                         format_path_for_display(&path)
                     )
                 );
@@ -292,7 +299,7 @@ pub fn validate_candidates(
         // along with the worktree, so for linked worktrees we don't need to
         // require a clean state. The main worktree is different: it can't be
         // moved with `git worktree move`, and the fallback path runs
-        // `git checkout <default-branch>` which refuses to switch over
+        // `git switch <default-branch>` which refuses to switch over
         // uncommitted changes — so we still skip dirty main worktrees unless
         // `--commit` was passed.
         let worktree = repo.worktree_at(&candidate.wt.path);
@@ -475,6 +482,11 @@ impl<'a> RelocationExecutor<'a> {
 
     /// Execute all relocations in dependency order.
     pub fn execute(&mut self, default_branch: &str, cwd: Option<&Path>) -> anyhow::Result<()> {
+        let shell = cwd
+            .map(|cwd| self.shell_position(cwd))
+            .transpose()?
+            .flatten();
+
         // Process until all pending are moved or in temp
         loop {
             let mut made_progress = false;
@@ -487,7 +499,7 @@ impl<'a> RelocationExecutor<'a> {
 
                 match self.is_target_empty(i) {
                     Some(true) => {
-                        self.move_worktree(i, default_branch, cwd)?;
+                        self.move_worktree(i, default_branch, shell)?;
                         made_progress = true;
                     }
                     Some(false) => {
@@ -542,7 +554,7 @@ impl<'a> RelocationExecutor<'a> {
         }
 
         // Move temp-relocated worktrees to final destinations
-        self.finalize_temp_relocations()?;
+        self.finalize_temp_relocations(shell)?;
 
         // Clean up temp directory if empty
         if self.temp_dir.exists() {
@@ -550,6 +562,25 @@ impl<'a> RelocationExecutor<'a> {
         }
 
         Ok(())
+    }
+
+    /// Find the pending worktree the user's shell stands in, if any.
+    ///
+    /// The owner is the worktree whose path is the longest prefix of `cwd`, so
+    /// a shell inside a worktree nested under another (the
+    /// `.worktrees/{{ branch }}` layout nests every linked worktree under the
+    /// main one) belongs to the inner worktree, not the outer.
+    fn shell_position<'c>(&self, cwd: &'c Path) -> anyhow::Result<Option<ShellPosition<'c>>> {
+        let owner = self
+            .repo
+            .list_worktrees()?
+            .iter()
+            .map(|wt| wt.path.as_path())
+            .filter(|path| cwd.starts_with(path))
+            .max_by_key(|path| path.components().count());
+        Ok(owner
+            .and_then(|owner| self.pending.iter().position(|c| c.wt.path == owner))
+            .map(|index| ShellPosition { cwd, index }))
     }
 
     /// Check if target path is empty (not occupied by a pending worktree).
@@ -601,7 +632,7 @@ impl<'a> RelocationExecutor<'a> {
         &mut self,
         idx: usize,
         default_branch: &str,
-        cwd: Option<&Path>,
+        shell: Option<ShellPosition<'_>>,
     ) -> anyhow::Result<()> {
         // Extract data we need before any mutable borrows
         let branch = self.pending[idx].branch().to_string();
@@ -626,19 +657,7 @@ impl<'a> RelocationExecutor<'a> {
         let msg = cformat!("Relocated <bold>{branch}</>: {src_display} → {dest_display}");
         eprintln!("{}", success_message(msg));
 
-        // Update shell if user is inside this worktree, preserving their
-        // subdirectory position via the same helper as `switch`/`remove` so
-        // every path-switching command behaves identically.
-        if let Some(cwd_path) = cwd
-            && cwd_path.starts_with(&src_path)
-        {
-            let cd_target = crate::output::handlers::resolve_subdir_in_target(
-                &dest_path,
-                Some(&src_path),
-                cwd_path,
-            );
-            crate::output::change_directory(cd_target)?;
-        }
+        follow_shell(shell, idx, &src_path, &dest_path)?;
 
         self.moved.insert(idx);
         self.relocated_entries.push(RelocatedEntry {
@@ -651,7 +670,7 @@ impl<'a> RelocationExecutor<'a> {
 
     /// Main worktree can't use `git worktree move`; must create new + switch.
     ///
-    /// If `worktree add` fails after the initial checkout, the main worktree
+    /// If `worktree add` fails after the initial switch, the main worktree
     /// is left on `default_branch` rather than the original branch — the user
     /// can recover with `git switch -`. Restoring it here would be best-effort
     /// (no error surface) and the failure modes for `worktree add` (invalid
@@ -667,8 +686,8 @@ impl<'a> RelocationExecutor<'a> {
         let main_wt = self.repo.worktree_at(self.repo.repo_path()?);
 
         main_wt
-            .run_command(&["checkout", "--end-of-options", default_branch])
-            .with_context(|| format!("Failed to checkout default branch '{default_branch}'"))?;
+            .run_command(&["switch", "--end-of-options", default_branch])
+            .with_context(|| format!("Failed to switch to default branch '{default_branch}'"))?;
 
         let dest = candidate.expected_path.to_string_lossy();
         main_wt
@@ -703,9 +722,11 @@ impl<'a> RelocationExecutor<'a> {
         // Create temp directory if needed
         std::fs::create_dir_all(&self.temp_dir)?;
 
-        // Sanitize branch name for temp path (feature/foo -> feature-foo)
+        // Prefix with the candidate index because sanitize_for_filename's
+        // short hash can collide for distinct branch names. Multiple cycles
+        // keep their temporary worktrees alive until finalization.
         let safe_branch = worktrunk::path::sanitize_for_filename(branch);
-        let temp_path = self.temp_dir.join(&safe_branch);
+        let temp_path = self.temp_dir.join(format!("{i}-{safe_branch}"));
 
         let msg = cformat!("Moving <bold>{branch}</> to temporary location...");
         eprintln!("{}", progress_message(msg));
@@ -736,7 +757,10 @@ impl<'a> RelocationExecutor<'a> {
     }
 
     /// Move worktrees from temp locations to their final destinations.
-    fn finalize_temp_relocations(&mut self) -> anyhow::Result<()> {
+    fn finalize_temp_relocations(
+        &mut self,
+        shell: Option<ShellPosition<'_>>,
+    ) -> anyhow::Result<()> {
         for temp in std::mem::take(&mut self.temp_relocated) {
             let candidate = &self.pending[temp.index];
             let branch = candidate.branch();
@@ -754,6 +778,9 @@ impl<'a> RelocationExecutor<'a> {
             let msg = cformat!("Relocated <bold>{branch}</>: {src_display} → {dest_display}");
             eprintln!("{}", success_message(msg));
 
+            let (from, to) = (&temp.original_path, &candidate.expected_path);
+            follow_shell(shell, temp.index, from, to)?;
+
             self.relocated_entries.push(RelocatedEntry {
                 branch: branch.to_string(),
                 from: temp.original_path,
@@ -763,6 +790,32 @@ impl<'a> RelocationExecutor<'a> {
 
         Ok(())
     }
+}
+
+/// Send the shell to the worktree's new path if it stood in the worktree that
+/// just moved from `src_path` to `dest_path`, preserving its subdirectory
+/// position via the same helper as `switch`/`remove` so every path-switching
+/// command behaves identically.
+fn follow_shell(
+    shell: Option<ShellPosition<'_>>,
+    index: usize,
+    src_path: &Path,
+    dest_path: &Path,
+) -> anyhow::Result<()> {
+    let Some(shell) = shell.filter(|shell| shell.index == index) else {
+        return Ok(());
+    };
+    let cd_target =
+        crate::output::handlers::resolve_subdir_in_target(dest_path, Some(src_path), shell.cwd);
+    crate::output::change_directory(cd_target)?;
+    if crate::output::retired_shell_wrapper_active() {
+        eprintln!(
+            "{}",
+            warning_message("Cannot change directory — shell wrapper is out of date")
+        );
+        crate::output::print_outdated_shell_wrapper_hint_once();
+    }
+    Ok(())
 }
 
 // ============================================================================

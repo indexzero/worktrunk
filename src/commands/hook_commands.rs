@@ -11,24 +11,27 @@ use color_print::cformat;
 use strum::IntoEnumIterator;
 use worktrunk::HookType;
 use worktrunk::config::{
-    ALIAS_ARGS_KEY, Approvals, CommandConfig, ProjectConfig, UserConfig, referenced_vars_for_config,
+    ALIAS_ARGS_KEY, Approvals, CommandConfig, ProjectConfig, UserConfig, binds_cli_var,
+    referenced_vars_for_config,
 };
 use worktrunk::git::Repository;
 use worktrunk::path::format_path_for_display;
 use worktrunk::styling::{
-    INFO_SYMBOL, PROMPT_SYMBOL, eprintln, format_bash_with_gutter, format_heading, hint_message,
-    info_message, println, warning_message,
+    INFO_SYMBOL, PROMPT_SYMBOL, eprintln, format_bash_with_gutter, format_heading, info_message,
+    println, warning_message,
 };
+
+use crate::output::print_json;
 
 use super::command_approval::approve_hooks_filtered;
 use super::command_executor::{
     CommandContext, FailureStrategy, PreparedStep, prepare_steps, render_template_preview,
 };
 use super::context::CommandEnv;
-use super::hook_filter::HookSource;
 use super::hooks::{HookAnnouncer, prepare_and_check, run_hooks_foreground};
 use super::project_config::command_label;
 use super::template_vars::TemplateVars;
+use worktrunk::config::HookSource;
 
 fn run_post_hook(
     ctx: &CommandContext,
@@ -77,16 +80,27 @@ fn run_post_hook(
 ///
 /// When hooks run during real operations (switch, merge, remove), each call site
 /// builds precise vars from the actual source/destination context. When invoked
-/// manually via `wt hook <type>`, we only have the current worktree — so we
-/// provide reasonable defaults: the current branch as both base and target, and
-/// the current worktree path for directional path vars.
+/// manually via `wt hook <type>`, we only have the current worktree — so each
+/// hook type gets the directional vars its real call site sets, filled in from
+/// that worktree. The merge and remove hooks bind `target` and
+/// `target_worktree_path` to it; the switch and start hooks also bind `base`
+/// and `base_worktree_path`, naming the source a real switch starts from,
+/// which manually is that same worktree; the commit hooks bind `target` to the
+/// default branch as a stand-in for the target their real callers pass — the
+/// merge target from `wt merge`, the integration target from `wt step squash`
+/// — since `wt step commit` itself passes none.
+///
+/// The directional *path* vars apply either way, since the worktree exists
+/// whether or not it is on a branch. The directional *branch* vars follow
+/// `branch` itself: a detached worktree leaves them unset rather than naming
+/// the literal `HEAD` (issue #4009).
 ///
 /// This is the single source of truth for manual hook context — both `run_hook`
 /// (execution + dry-run) and [`hook_command_rows`] (`hook show --expanded`) use
 /// this function. Returns a `TemplateVars` so callers can extend with
 /// additional bindings (e.g. CLI shorthand) before materializing.
 fn build_manual_hook_template_vars(ctx: &CommandContext, hook_type: HookType) -> TemplateVars {
-    let branch = ctx.branch_or_head();
+    let branch = ctx.branch;
     let worktree_path = ctx.worktree_path;
     match hook_type {
         // Merge/commit hooks: target = merge target (default branch for commit,
@@ -98,18 +112,18 @@ fn build_manual_hook_template_vars(ctx: &CommandContext, hook_type: HookType) ->
             .default_branch()
             .map_or_else(TemplateVars::new, |t| TemplateVars::new().with_target(&t)),
         HookType::PreMerge | HookType::PostMerge => TemplateVars::new()
-            .with_target(branch)
+            .with_target_opt(branch)
             .with_target_worktree_path(worktree_path),
         // Switch hooks: base = current (we're "switching from" here)
         HookType::PreSwitch | HookType::PreCreate | HookType::PostCreate | HookType::PostSwitch => {
             TemplateVars::new()
                 .with_base(branch, worktree_path)
-                .with_target(branch)
+                .with_target_opt(branch)
                 .with_target_worktree_path(worktree_path)
         }
         // Remove hooks: target = where user ends up (current worktree is the best guess)
         HookType::PreRemove | HookType::PostRemove => TemplateVars::new()
-            .with_target(branch)
+            .with_target_opt(branch)
             .with_target_worktree_path(worktree_path),
     }
 }
@@ -175,7 +189,8 @@ pub struct HookCliArgs<'a> {
 /// When explicitly invoking hooks, ALL hooks run (both user and project).
 /// There's no skip flag - if you explicitly run hooks, all configured hooks run.
 ///
-/// Works in detached HEAD state - `{{ branch }}` template variable will be "HEAD".
+/// Works in detached HEAD state - the `{{ branch }}` template variable (and the
+/// `{{ base }}` / `{{ target }}` names derived from it) is simply unset there.
 ///
 /// Template variables come from three sources in [`HookCliArgs`], routed per
 /// alias semantics:
@@ -203,8 +218,9 @@ pub fn run_hook(
         shorthand_vars,
         forwarded_args,
     } = cli;
-    // Derive context from current environment (branch-optional for CI compatibility)
-    let env = CommandEnv::for_action_branchless()?;
+    // Derive context from the current environment; `config` isn't in hand here,
+    // so let the repository supply its cached load.
+    let env = CommandEnv::for_action_loading_config()?;
     let repo = &env.repo;
     let ctx = env.context(yes);
 
@@ -244,7 +260,7 @@ pub fn run_hook(
     let mut args: Vec<String> = Vec::new();
     for raw in shorthand_vars {
         let (canon_key, orig_key, value) = parse_shorthand_token(raw)?;
-        if referenced.contains(&canon_key) {
+        if binds_cli_var(&canon_key, &referenced) {
             bindings.push((canon_key, value));
         } else {
             args.push(format!("--{orig_key}={value}"));
@@ -324,7 +340,7 @@ pub fn run_hook(
             hook_type,
             &extra_vars,
             name_filters,
-            FailureStrategy::default_for(hook_type),
+            FailureStrategy::FailFast,
         )
     } else {
         run_post_hook(
@@ -349,9 +365,8 @@ pub fn handle_hook_show(
 
     let repo = Repository::current().context("Failed to show hooks")?;
     let config: &UserConfig = repo.user_config();
-    let project_config: Option<&ProjectConfig> = repo
-        .project_config()
-        .context("Failed to load project config")?;
+    // Preserve the loader's typed source diagnosis through command context.
+    let project_config: Option<&ProjectConfig> = repo.project_config()?;
     let approvals = Approvals::load().context("Failed to load approvals")?;
     let project_id = repo.project_identifier().ok();
 
@@ -362,11 +377,12 @@ pub fn handle_hook_show(
         .map(crate::cli::parse_hook_type)
         .transpose()?;
 
-    // Build context for template expansion (only used if --expanded)
-    // Need to keep CommandEnv alive for the lifetime of ctx
-    // Uses branchless mode - template expansion uses "HEAD" in detached HEAD state
+    // Build context for template expansion (only used if --expanded).
+    // Need to keep CommandEnv alive for the lifetime of ctx. Detached HEAD is
+    // fine: `{{ branch }}` is unset there, and `--expanded` renders the
+    // guarded form the way any other unset variable renders.
     let env = if expanded {
-        Some(CommandEnv::for_action_branchless()?)
+        Some(CommandEnv::for_action_loading_config()?)
     } else {
         None
     };
@@ -407,7 +423,7 @@ pub fn handle_hook_show(
         ctx.as_ref(),
     )?;
 
-    show_help_in_pager(&output, true);
+    show_help_in_pager(&output, true)?;
 
     Ok(())
 }
@@ -475,7 +491,7 @@ fn emit_hook_show_json(
         }
     }
 
-    println!("{}", serde_json::to_string_pretty(&entries)?);
+    print_json(&entries)?;
     Ok(())
 }
 
@@ -532,21 +548,27 @@ fn render_project_hooks(
     filter: Option<HookType>,
     ctx: Option<&CommandContext>,
 ) -> anyhow::Result<()> {
-    let config_path = repo
-        .project_config_path()?
-        .context("Cannot determine project config location — no worktree found")?;
+    // Git-config-sourced config has no file path; name the source instead.
+    let source_label = match project_config {
+        Some(config) if config.source == worktrunk::config::ProjectConfigSource::GitConfig => {
+            format!("@ {}", worktrunk::config::GIT_CONFIG_SOURCE_LABEL)
+        }
+        _ => {
+            let config_path = repo
+                .project_config_path()?
+                .context("Cannot determine project config location — no worktree found")?;
+            format!("@ {}", format_path_for_display(&config_path))
+        }
+    };
 
     writeln!(
         out,
         "{}",
-        format_heading(
-            "PROJECT HOOKS",
-            Some(&format!("@ {}", format_path_for_display(&config_path)))
-        )
+        format_heading("PROJECT HOOKS", Some(&source_label))
     )?;
 
     let Some(config) = project_config else {
-        writeln!(out, "{}", hint_message("(not found)"))?;
+        writeln!(out, "{}", info_message("Not found"))?;
         return Ok(());
     };
 
@@ -567,7 +589,7 @@ fn render_project_hooks(
 }
 
 /// Render a section's body: every hook that survives `filter`, or
-/// `(none configured)` when that leaves the section with nothing.
+/// a neutral "No hooks configured" state when nothing remains.
 ///
 /// The fallback keys off what was printed, not off what the config declared —
 /// a hook type carrying an empty command list (`post-switch = []`) has an entry
@@ -594,7 +616,7 @@ fn render_hook_section(
     }
 
     if !has_any {
-        writeln!(out, "{}", hint_message("(none configured)"))?;
+        writeln!(out, "{}", info_message("No hooks configured"))?;
     }
 
     Ok(())

@@ -35,26 +35,22 @@
 //! merging into a single `CommandConfig`, so per-source policy can be applied
 //! step-by-step without un-merging. Steps are tagged with their source
 //! (`HookSource::User` / `Project`), and `sourced_steps_to_foreground`
-//! applies per-step `DirectivePassthrough`: the CD directive file is passed
-//! through to every step so inner `wt` invocations can redirect the parent
-//! shell's cwd; the EXEC directive file passes through user-source steps but
-//! is scrubbed for project-source steps. When the same name is defined in
-//! both configs, the user's own steps still get the EXEC relaxation — the
-//! decision is per-step, so the project side scrubbing doesn't bleed back
-//! into the user steps. See issue #2101.
+//! applies `DirectivePassthrough`: the CD directive file is passed through so
+//! inner `wt` invocations can redirect the parent shell's cwd.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use anyhow::{Context, bail};
 use color_print::cformat;
 use worktrunk::config::{
     ALIAS_ARGS_KEY, CommandConfig, ProjectConfig, UserConfig, VarScope, alias_context_filter,
-    format_alias_variables, referenced_vars_for_config,
+    binds_cli_var, format_alias_variables, referenced_vars_for_config,
 };
-use worktrunk::git::Repository;
+use worktrunk::git::{CommandError, Repository, WorktrunkError};
 use worktrunk::styling::{
-    eprintln, format_with_gutter, hint_message, info_message, progress_message, verbosity,
-    warning_message,
+    eprintln, error_message, format_with_gutter, hint_message, info_message, progress_message,
+    verbosity, warning_message,
 };
 use worktrunk::trace::Span;
 
@@ -66,8 +62,9 @@ use crate::commands::command_executor::{
 use crate::commands::hook_announcement::{
     SourcedStep, format_pipeline_summary_from_names, step_names_from_config,
 };
-use crate::commands::hooks::{HookSource, sourced_steps_to_foreground};
+use crate::commands::hooks::sourced_steps_to_foreground;
 use crate::commands::{build_invalid_subcommand_error, similar_subcommands};
+use worktrunk::config::HookSource;
 
 /// Built-in `wt step` subcommand names. Aliases with these names are
 /// reachable via `wt <name>` (top-level) but shadowed via `wt step <name>`.
@@ -86,14 +83,22 @@ const BUILTIN_STEP_COMMANDS: &[&str] = &[
     "tether",
 ];
 
-/// Built-in top-level `wt` subcommand names — visible and hidden. Aliases
-/// with these names are fully unreachable: clap matches the built-in before
-/// alias dispatch sees the name, so `wt list` always runs the built-in even
-/// if `[aliases] list = …` is configured. Kept in sync with `Cli` via
-/// `test_top_level_builtins_match_clap`.
-pub(crate) const TOP_LEVEL_BUILTINS: &[&str] = &[
-    "config", "hook", "list", "merge", "remove", "select", "step", "switch",
-];
+/// Whether clap matches a visible or hidden top-level built-in before alias
+/// dispatch can see the name. Derive discovery from the same command schema
+/// as dispatch, so adding a hidden command also makes its shadowing visible.
+pub(crate) fn is_top_level_builtin(name: &str) -> bool {
+    static NAMES: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
+        use clap::CommandFactory;
+
+        crate::cli::Cli::command()
+            .get_subcommands()
+            .map(|command| command.get_name())
+            .filter(|name| *name != "help")
+            .map(str::to_owned)
+            .collect()
+    });
+    NAMES.contains(name)
+}
 
 /// Whether `--help` or `-h` appears in `args` before any `--` literal-forward
 /// terminator. Aliases have no clap-style help page — the template *is* the
@@ -178,7 +183,20 @@ impl AliasOptions {
     /// instead. The parser raises an actionable error pointing at the new
     /// subcommand rather than silently forwarding the flag into `{{ args }}`.
     /// The bail fires only outside `literal_mode`, so `wt alias -- --dry-run`
-    /// still forwards `--dry-run` as a positional.
+    /// still forwards `--dry-run` as a positional. A template that references
+    /// `dry_run` owns the flag's value-taking spellings — the same deference
+    /// `--help` gets in `try_intercept_alias_help` and `--yes` gets from the
+    /// `--KEY` rule above — so `--dry-run <value>` and `--dry-run=<value>`
+    /// bind there rather than erroring. Only the `=` form used to bind, since
+    /// the bail matches the whole token, so one flag behaved two ways.
+    ///
+    /// A bare `--dry-run` at end of args bails either way. The general `--KEY`
+    /// rule would forward it into `{{ args }}` with `dry_run` left unset, so a
+    /// `{% if dry_run %}` template would run the live command with nothing on
+    /// stderr — the silent forward this bail exists to prevent, on the one flag
+    /// whose purpose is not doing the thing. The referenced case gets its own
+    /// message naming `--dry-run=1`, because `wt config alias dry-run <name>`
+    /// previews the alias instead of passing the value the user is after.
     ///
     /// Hyphens in variable names are canonicalized to underscores before
     /// lookup and storage (minijinja parses `{{ my-var }}` as subtraction),
@@ -217,9 +235,16 @@ impl AliasOptions {
                 continue;
             }
             if arg == "--dry-run" {
-                bail!(
-                    "--dry-run is no longer supported; use `wt config alias dry-run {name}` instead"
-                );
+                if !referenced_vars.contains("dry_run") {
+                    bail!(
+                        "--dry-run is no longer supported; use `wt config alias dry-run {name}` instead"
+                    );
+                }
+                if i + 1 == args.len() {
+                    bail!(
+                        "--dry-run at the end of the command binds nothing, leaving `dry_run` unset in {name}; pass `--dry-run=1` instead"
+                    );
+                }
             }
             if let Some(rest) = arg.strip_prefix("--") {
                 if let Some((key, value)) = rest.split_once('=') {
@@ -227,7 +252,7 @@ impl AliasOptions {
                         bail!("invalid KEY=VALUE: key cannot be empty");
                     }
                     let canon = key.replace('-', "_");
-                    if referenced_vars.contains(&canon) {
+                    if binds_cli_var(&canon, referenced_vars) {
                         vars.push((canon, value.to_string()));
                     } else {
                         positional_args.push(arg.clone());
@@ -241,7 +266,7 @@ impl AliasOptions {
                 // At end of args, forward `--KEY` alone.
                 let canon = rest.replace('-', "_");
                 if let Some(next) = args.get(i + 1) {
-                    if referenced_vars.contains(&canon) {
+                    if binds_cli_var(&canon, referenced_vars) {
                         // Warn on the footgun case: `--KEY --VALUE` with KEY
                         // referenced binds VALUE as the value. Almost always
                         // a typo — the user probably meant `--KEY=--VALUE`.
@@ -335,8 +360,9 @@ fn format_alias_announcement(name: &str, entry: &AliasEntry) -> Option<String> {
 /// `load_aliases` returns (a name only appears in the map if some source
 /// defines it). When both are set, both bodies run — user first, then
 /// project — and each runs under its own trust regime: user steps skip
-/// approval and pass EXEC through (issue #2101); project steps require
-/// approval and scrub EXEC.
+/// approval, project steps require it. Directive passthrough no longer
+/// varies by source: the EXEC directive file is retired (#3977), so every
+/// child scrubs it and only the CD file is passed through.
 pub(crate) struct AliasEntry {
     pub user: Option<CommandConfig>,
     pub project: Option<CommandConfig>,
@@ -433,15 +459,21 @@ fn referenced_vars_for_entry(name: &str, entry: &AliasEntry) -> anyhow::Result<B
 /// `global_yes` is the top-level `--yes`/`-y` flag, passed through to
 /// `run_alias`.
 ///
-/// Alias execution needs a git repository; without one this returns `Ok(None)`
-/// so the caller falls through to PATH lookup. Config load errors propagate —
+/// Alias execution needs a git repository. Without one this returns `Ok(None)`
+/// for names that aren't user-config aliases, so the caller falls through to
+/// PATH lookup; a name that IS a user-config alias ends here with the
+/// alias-needs-repository error (see [`alias_needs_repo_error`]) — dispatch
+/// never reaches the `wt-<name>` PATH lookup for it. Discovery failures git
+/// didn't answer for (a spawn error) propagate, and config load errors
+/// propagate —
 /// a broken `wt.toml` should fail loudly here just as it does for `wt list`,
 /// rather than silently turning into an "unrecognized subcommand" once we
 /// fall through to PATH lookup.
 pub fn try_alias(name: String, rest: Vec<String>, global_yes: bool) -> anyhow::Result<Option<()>> {
     let _span = Span::new(format!("try_alias:{}", name));
-    let Ok(repo) = Repository::current() else {
-        return Ok(None);
+    let repo = match Repository::current() {
+        Ok(repo) => repo,
+        Err(err) => return alias_needs_repo_error(&name, err),
     };
     let user_config = repo.user_config();
     let project_config = repo.project_config()?;
@@ -554,6 +586,64 @@ pub fn alias_names_for_suggestions() -> Vec<String> {
     load_aliases(Some(&repo), &user_config, project_config.as_ref())
         .into_keys()
         .collect()
+}
+
+/// Outside a git repository an alias cannot run (execution resolves the
+/// current worktree), yet `wt --help` still lists user-config aliases and
+/// the typo suggestions still include them. When `name` is one of those and
+/// repository discovery died in git, print the alias-needs-repository error
+/// and return it — a configured alias isn't "unrecognized", and the caller's
+/// clap-style fallback would suggest the very name the user typed as its own
+/// "did you mean". Otherwise `Ok(None)`: not an alias here, the caller falls
+/// through to the `wt-<name>` PATH lookup — whatever git did. Best-effort —
+/// a config that fails to load reads as no aliases.
+///
+/// A 128 exit is the closest structured signal git offers, not a dedicated
+/// "not a repository" code: `git rev-parse` dies with 128 for any fatal
+/// error, so a `safe.directory` violation or an unsupported
+/// `core.repositoryformatversion` reaches this message too, inside a real
+/// repository. That is why the message states what aliases require and
+/// quotes git's own line for what went wrong, instead of asserting a cause
+/// the exit code doesn't carry. Failures that exit some other way (a spawn
+/// error from a bad `-C` path) propagate as themselves, the way they do for
+/// every other command.
+fn alias_needs_repo_error(name: &str, err: anyhow::Error) -> anyhow::Result<Option<()>> {
+    worktrunk::config::suppress_warnings();
+    let is_alias = UserConfig::load()
+        .map(|uc| uc.aliases(None).contains_key(name))
+        .unwrap_or(false);
+    if !is_alias {
+        return Ok(None);
+    }
+    // `git rev-parse` exits 128 when discovery fails fatally — the structured
+    // channel, per "Structured Output Over Error-Message Parsing", though not
+    // one specific to "not a repository"; see the docstring.
+    let Some(git_err) = CommandError::find_in(&err).filter(|e| e.exit_code == Some(128)) else {
+        return Err(err);
+    };
+    eprintln!(
+        "{}",
+        error_message(cformat!(
+            "<bold>{name}</> is an alias, but aliases only run inside a git repository"
+        ))
+    );
+    // git's own line says which fatal error this was — "not a git repository"
+    // in the common case, dubious ownership or an unreadable config in the
+    // others, where the alias message alone would misreport the cause.
+    let git_output = git_err.combined_output();
+    if !git_output.is_empty() {
+        eprintln!("{}", format_with_gutter(&git_output, None));
+    }
+    // Built with `format!` so `-C <path>` stays out of the `cformat!`
+    // literal, which is what color-print's tag parser reads.
+    let targeted = format!("wt -C <path> {name}");
+    eprintln!(
+        "{}",
+        hint_message(cformat!(
+            "Run wt inside a repository, or to target one, run <underline>{targeted}</>"
+        ))
+    );
+    Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into())
 }
 
 /// Execute the alias body for `opts.name`. Caller must have already verified
@@ -734,11 +824,6 @@ fn render_aliases_help_section(
 ) -> String {
     use std::fmt::Write as _;
 
-    let shadowed_names: &[&str] = match context {
-        HelpContext::TopLevel => TOP_LEVEL_BUILTINS,
-        HelpContext::Step => BUILTIN_STEP_COMMANDS,
-    };
-
     // `entries` is sorted by (name, source); collapse user/project duplicates.
     let mut names: Vec<&str> = Vec::new();
     for (name, _, _) in entries {
@@ -756,7 +841,11 @@ fn render_aliases_help_section(
     let list = names
         .iter()
         .map(|&name| {
-            let styled = if shadowed_names.contains(&name) {
+            let shadowed = match context {
+                HelpContext::TopLevel => is_top_level_builtin(name),
+                HelpContext::Step => BUILTIN_STEP_COMMANDS.contains(&name),
+            };
+            let styled = if shadowed {
                 cformat!("<bold><cyan>{name}</></> <yellow>(shadowed by built-in)</>")
             } else {
                 cformat!("<bold><cyan>{name}</></>")
@@ -785,9 +874,10 @@ fn render_aliases_help_section(
 /// Callers (`augment_help`, `wt config alias show` with no name) latch
 /// `suppress_warnings()` before reaching here so the standard `UserConfig::load()`
 /// stays quiet: no deprecation warnings, no `.new` file writes, no
-/// approved-commands copy. Project config is parsed directly from TOML rather
-/// than via `ProjectConfig::load` because the `aliases` table has no deprecated
-/// forms — skipping the migration avoids the unrelated warnings entirely.
+/// approved-commands copy. Project config goes through `ProjectConfig::load`
+/// so this listing reflects the same source selection as execution — in
+/// particular the git-config source (`worktrunk.config.*`), whose aliases
+/// must appear here exactly when dispatch would run them.
 ///
 /// Tolerates missing or unloadable config: this is a discovery surface, not
 /// an execution surface, so we'd rather show the built-in commands than
@@ -823,17 +913,14 @@ pub(crate) fn load_aliases_for_listing() -> Vec<(String, CommandConfig, HookSour
     entries
 }
 
-/// Parse `.config/wt.toml` directly, extracting just `aliases`, without
-/// triggering `ProjectConfig::load`'s deprecation warning and hint-writing
-/// side effects. See `load_aliases_for_listing` for why.
+/// Load project aliases through the standard source selector, tolerating
+/// discovery-time errors. Callers latch `suppress_warnings()` (see
+/// `load_aliases_for_listing`), which keeps `ProjectConfig::load` quiet.
 fn load_project_aliases_silent(repo: &Repository) -> Option<BTreeMap<String, CommandConfig>> {
-    let path = repo.project_config_path().ok().flatten()?;
-    if !path.exists() {
-        return None;
-    }
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let config: ProjectConfig = toml::from_str(&contents).ok()?;
-    Some(config.aliases)
+    ProjectConfig::load(repo, false)
+        .ok()
+        .flatten()
+        .map(|config| config.aliases)
 }
 
 #[cfg(test)]
@@ -1238,6 +1325,26 @@ cmd = [
     }
 
     #[test]
+    fn test_parse_reserved_keys_forward_even_when_referenced() {
+        use insta::assert_debug_snapshot;
+        // `args` and `vars` are set by the runtime after CLI bindings, so a
+        // binding would be overwritten and the token lost. Both forms forward
+        // into `{{ args }}` instead, even though the template references them.
+        assert_debug_snapshot!(parse_with(&["deploy", "--args=x", "--vars", "y", "z"], &["args", "vars"]).unwrap(), @r#"
+        AliasOptions {
+            name: "deploy",
+            vars: [],
+            positional_args: [
+                "--args=x",
+                "--vars",
+                "y",
+                "z",
+            ],
+        }
+        "#);
+    }
+
+    #[test]
     fn test_parse_literal_forward_escape() {
         use insta::assert_debug_snapshot;
         // After `--`, every token is positional regardless of whether it
@@ -1414,6 +1521,63 @@ cmd = [
         assert_snapshot!(parse(&["deploy", "--dry-run"]).unwrap_err(), @"--dry-run is no longer supported; use `wt config alias dry-run deploy` instead");
     }
 
+    /// A template that references `{{ dry_run }}` owns the flag's value-taking
+    /// spellings: the retired-flag bail steps aside and both bind, matching
+    /// `--help`'s deference to a `help` binding and `--yes`'s to a `yes` one.
+    /// A bare `--dry-run` at end of args still errors — see
+    /// `test_parse_dry_run_bare_errors_when_referenced`.
+    #[test]
+    fn test_parse_dry_run_binds_when_referenced() {
+        use insta::assert_debug_snapshot;
+        assert_debug_snapshot!(parse_with(&["deploy", "--dry-run", "1"], &["dry_run"]).unwrap(), @r#"
+        AliasOptions {
+            name: "deploy",
+            vars: [
+                (
+                    "dry_run",
+                    "1",
+                ),
+            ],
+            positional_args: [],
+        }
+        "#);
+        // The `=` form already bound before this — the bail matches the whole
+        // token — so the two spellings agree either way.
+        assert_debug_snapshot!(parse_with(&["deploy", "--dry-run=1"], &["dry_run"]).unwrap(), @r#"
+        AliasOptions {
+            name: "deploy",
+            vars: [
+                (
+                    "dry_run",
+                    "1",
+                ),
+            ],
+            positional_args: [],
+        }
+        "#);
+    }
+
+    /// The general `--KEY` end-of-args rule would forward a bare `--dry-run`
+    /// into `{{ args }}` with `dry_run` unset, so `{% if dry_run %}` would run
+    /// the live command silently. The bail holds there for a referenced
+    /// template too, with a message naming the spelling that does bind.
+    #[test]
+    fn test_parse_dry_run_bare_errors_when_referenced() {
+        use insta::{assert_debug_snapshot, assert_snapshot};
+        assert_snapshot!(parse_with(&["deploy", "--dry-run"], &["dry_run"]).unwrap_err(), @"--dry-run at the end of the command binds nothing, leaving `dry_run` unset in deploy; pass `--dry-run=1` instead");
+        // A value-taking spelling is unaffected, and `--` still forwards the
+        // token verbatim rather than erroring.
+        assert_debug_snapshot!(parse_with(&["deploy", "--", "--dry-run"], &["dry_run"]).unwrap(), @r#"
+        AliasOptions {
+            name: "deploy",
+            vars: [],
+            positional_args: [
+                "--dry-run",
+            ],
+        }
+        "#);
+    }
+
     /// `referenced_vars_for_config` unions across pipeline steps so a var
     /// referenced in any one command is a binding candidate for the whole
     /// alias.
@@ -1468,38 +1632,29 @@ cmd = [
         }
     }
 
-    /// Verify TOP_LEVEL_BUILTINS stays in sync with the actual `Cli` enum.
-    ///
-    /// Hidden subcommands like `select` count — clap still matches them
-    /// before falling through to alias dispatch, so they shadow aliases of
-    /// the same name. Only `help` (clap-internal) and custom subcommands
-    /// are excluded.
+    /// Shadowing discovery agrees with actual clap dispatch for visible and
+    /// hidden commands, while step-only and unknown names reach aliases.
     #[test]
-    fn test_top_level_builtins_match_clap() {
-        use crate::cli::Cli;
-        use clap::CommandFactory;
+    fn test_top_level_shadowing_matches_clap_dispatch() {
+        use crate::cli::{Cli, Commands};
+        use clap::Parser;
 
-        let app = Cli::command();
-        let clap_names: Vec<&str> = app
-            .get_subcommands()
-            .map(|s| s.get_name())
-            .filter(|n| *n != "help")
-            .collect();
-
-        for name in &clap_names {
-            assert!(
-                TOP_LEVEL_BUILTINS.contains(name),
-                "Top-level subcommand '{name}' is missing from TOP_LEVEL_BUILTINS. \
-                 Add it so the help splice annotates aliases unreachable at the top level."
+        for (args, builtin) in [
+            (vec!["wt", "list"], true),
+            (vec!["wt", "select"], true),
+            (vec!["wt", "commit"], false),
+            (vec!["wt", "deploy"], false),
+        ] {
+            assert_eq!(is_top_level_builtin(args[1]), builtin, "{}", args[1]);
+            let parsed = Cli::try_parse_from(&args).unwrap();
+            assert_eq!(
+                !matches!(parsed.command, Some(Commands::Custom(_))),
+                builtin,
+                "{}",
+                args[1]
             );
         }
-        for name in TOP_LEVEL_BUILTINS {
-            assert!(
-                clap_names.contains(name),
-                "TOP_LEVEL_BUILTINS contains '{name}' but no such top-level subcommand exists. \
-                 Remove it from the list."
-            );
-        }
+        assert!(!is_top_level_builtin("help"));
     }
 
     #[test]

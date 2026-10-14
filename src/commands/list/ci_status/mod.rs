@@ -12,13 +12,11 @@ mod github;
 mod gitlab;
 mod platform;
 
-use std::process::Output;
-
 use super::layout::LinkStyle;
 use anstyle::{AnsiColor, Color, Style};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use worktrunk::git::{BranchRef, Repository, parse_owner_repo};
+use worktrunk::git::{BranchRef, GitRemoteUrl, RefType, Repository, parse_owner_repo};
 use worktrunk::shell_exec::Cmd;
 use worktrunk::utils::epoch_now;
 
@@ -80,6 +78,24 @@ impl CiBranchName {
     pub fn has_upstream(&self, repo: &Repository) -> bool {
         self.is_remote() || repo.branch(&self.name).upstream().ok().flatten().is_some()
     }
+
+    /// Whether `local_head` is on a remote, so a forge lookup by commit SHA can
+    /// find it. A remote branch's head is; a local branch's is when any
+    /// remote-tracking ref contains it. A commit that only exists locally gets
+    /// no lookup by SHA, which the forge would answer with an error.
+    pub(super) fn head_on_remote(&self, repo: &Repository, local_head: &str) -> bool {
+        self.is_remote()
+            || repo
+                .run_command(&[
+                    "for-each-ref",
+                    "--count=1",
+                    "--format=%(refname)",
+                    "--contains",
+                    local_head,
+                    "refs/remotes/",
+                ])
+                .is_ok_and(|out| !out.trim().is_empty())
+    }
 }
 
 // Re-export public types
@@ -120,8 +136,8 @@ pub(crate) fn non_interactive_cmd(program: &str) -> Cmd {
 
 /// Check if a CLI tool is available
 ///
-/// On Windows, CreateProcessW (via Cmd) searches PATH for .exe files.
-/// We provide .exe mocks in tests via mock-stub, so this works consistently.
+/// On Windows, `Cmd` also finds a `.cmd`/`.bat` launcher such as Azure CLI's
+/// `az.cmd`. Tests provide `.exe` mocks via `testing::mock_commands`.
 pub(crate) fn tool_available(tool: &str, args: &[&str]) -> bool {
     Cmd::new(tool)
         .args(args.iter().copied())
@@ -137,26 +153,6 @@ fn parse_json<T: DeserializeOwned>(stdout: &[u8], command: &str, branch: &str) -
         .ok()
 }
 
-/// Combine stderr and stdout for retriable-error sniffing.
-///
-/// Some CLIs (notably `tea`) report API errors as JSON on stdout while
-/// transport errors land on stderr — checking both avoids missing retriable
-/// errors when the tool routes them differently.
-fn output_error_text(output: &Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    )
-}
-
-/// If a non-success `Output` indicates a retriable failure, surface it as a
-/// PR-status warning. Returns `None` for non-retriable failures so callers
-/// can `?` it to fall through to "no CI status".
-fn retriable_pr_error(output: &Output) -> Option<PrStatus> {
-    is_retriable_error(&output_error_text(output)).then(PrStatus::error)
-}
-
 /// Resolve `(owner, repo)` for a branch's effective remote.
 ///
 /// Thin wrapper over [`branch_remote_url`] + [`parse_owner_repo`]. The
@@ -168,6 +164,13 @@ fn retriable_pr_error(output: &Output) -> Option<PrStatus> {
 /// `git.mycompany.com` for self-hosted GHE).
 fn branch_owner_repo(repo: &Repository, branch: &CiBranchName) -> Option<(String, String)> {
     parse_owner_repo(&branch_remote_url(repo, branch)?)
+}
+
+/// The host a forge CLI authenticates against for `remote_url`: the configured
+/// `forge.hostname` when set, else the URL's host.
+pub(crate) fn auth_host(repo: &Repository, remote_url: Option<String>) -> Option<String> {
+    repo.forge_hostname()
+        .or_else(|| Some(GitRemoteUrl::parse(&remote_url?)?.host().to_string()))
 }
 
 /// Resolve the effective URL for a branch's remote without parsing.
@@ -192,81 +195,6 @@ fn branch_remote_url(repo: &Repository, branch: &CiBranchName) -> Option<String>
             let remote = repo.primary_remote().ok()?;
             repo.effective_remote_url(&remote)
         })
-    }
-}
-
-/// Check if stderr indicates a retriable error (rate limit, network issues)
-fn is_retriable_error(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    [
-        "rate limit",
-        "api rate",
-        "403",
-        "429",
-        "timeout",
-        "connection",
-        "network",
-    ]
-    .iter()
-    .any(|p| lower.contains(p))
-}
-
-/// Status of CI tools availability
-#[derive(Debug, Clone, Copy)]
-pub struct CiToolsStatus {
-    /// gh is installed (can run --version)
-    pub gh_installed: bool,
-    /// gh is installed and authenticated
-    pub gh_authenticated: bool,
-    /// glab is installed (can run --version)
-    pub glab_installed: bool,
-    /// glab is installed and authenticated
-    pub glab_authenticated: bool,
-    /// tea is installed (can run --version)
-    pub tea_installed: bool,
-    /// tea is installed and has a login configured
-    pub tea_authenticated: bool,
-    /// az is installed (can run --version)
-    pub az_installed: bool,
-    /// az is installed and authenticated (logged in)
-    pub az_authenticated: bool,
-}
-
-impl CiToolsStatus {
-    /// Check which CI tools are available
-    ///
-    /// If `gitlab_host` is provided, checks glab auth status against that specific
-    /// host instead of the default. This is important for self-hosted GitLab instances
-    /// where the default host (gitlab.com) may be unreachable.
-    pub fn detect(gitlab_host: Option<&str>) -> Self {
-        let gh_installed = tool_available("gh", &["--version"]);
-        let gh_authenticated = gh_installed && tool_available("gh", &["auth", "status"]);
-        let glab_installed = tool_available("glab", &["--version"]);
-        let glab_authenticated = glab_installed
-            && if let Some(host) = gitlab_host {
-                tool_available("glab", &["auth", "status", "--hostname", host])
-            } else {
-                tool_available("glab", &["auth", "status"])
-            };
-        let tea_installed = tool_available("tea", &["--version"]);
-        // `tea` stores logins in its config file; reading it (rather than
-        // invoking `tea`) avoids the OAuth-refresh side effect a `tea` lookup
-        // can trigger. See `git::remote_ref::gitea`.
-        let tea_authenticated = tea_installed && worktrunk::git::remote_ref::gitea::has_any_login();
-        let az_installed = tool_available("az", &["--version"]);
-        // `az account show` exits non-zero when logged out — works whether or not
-        // the azure-devops extension is installed.
-        let az_authenticated = az_installed && tool_available("az", &["account", "show"]);
-        Self {
-            gh_installed,
-            gh_authenticated,
-            glab_installed,
-            glab_authenticated,
-            tea_installed,
-            tea_authenticated,
-            az_installed,
-            az_authenticated,
-        }
     }
 }
 
@@ -307,25 +235,43 @@ pub enum CiSource {
     Branch,
 }
 
-/// A PR/MR reference: number plus the forge's display sigil.
+/// A PR/MR reference: number plus its resolved reference type.
 ///
 /// Displays as `#3035` (GitHub, Gitea, Azure DevOps) or `!3035` (GitLab).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PrRef {
     pub number: u64,
-    /// Display sigil: `#` (GitHub, Gitea, Azure DevOps) or `!` (GitLab)
-    pub sigil: char,
+    /// The CI cache represents the type under the `sigil` key.
+    #[serde(rename = "sigil", with = "ref_type_sigil")]
+    ref_type: RefType,
 }
 
 impl PrRef {
     /// A pull-request reference: `#3035` (GitHub, Gitea, Azure DevOps).
     pub fn pr(number: u64) -> Self {
-        Self { number, sigil: '#' }
+        Self {
+            number,
+            ref_type: RefType::Pr,
+        }
     }
 
     /// A merge-request reference: `!3035` (GitLab).
     pub fn mr(number: u64) -> Self {
-        Self { number, sigil: '!' }
+        Self {
+            number,
+            ref_type: RefType::Mr,
+        }
+    }
+
+    pub fn ref_type(self) -> RefType {
+        self.ref_type
+    }
+
+    pub fn sigil(self) -> char {
+        match self.ref_type {
+            RefType::Pr => '#',
+            RefType::Mr => '!',
+        }
     }
 
     /// Rendered width in terminal columns (sigil + digits).
@@ -336,7 +282,35 @@ impl PrRef {
 
 impl std::fmt::Display for PrRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}{}", self.sigil, self.number)
+        write!(f, "{}{}", self.sigil(), self.number)
+    }
+}
+
+mod ref_type_sigil {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use worktrunk::git::RefType;
+
+    pub fn serialize<S>(ref_type: &RefType, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_char(match ref_type {
+            RefType::Pr => '#',
+            RefType::Mr => '!',
+        })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<RefType, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match char::deserialize(deserializer)? {
+            '#' => Ok(RefType::Pr),
+            '!' => Ok(RefType::Mr),
+            sigil => Err(serde::de::Error::custom(format_args!(
+                "unknown PR/MR sigil {sigil:?}"
+            ))),
+        }
     }
 }
 
@@ -536,7 +510,7 @@ impl PrStatus {
         }
     }
 
-    /// Create an error status for retriable failures (rate limit, network errors)
+    /// The status for a forge CLI call that failed.
     fn error() -> Self {
         Self {
             ci_status: CiStatus::Error,
@@ -644,7 +618,9 @@ impl PrStatus {
     /// Platform is determined from project config (`forge.platform`), falling
     /// back to the remote URL host. Returns `None` if the platform cannot be
     /// determined (user should set `forge.platform` for non-standard hostnames).
-    /// PR/MR detection always runs. Workflow/pipeline fallback only runs if `has_upstream`.
+    /// PR/MR detection runs when the branch may head one (`may_head_pr`: skipped
+    /// for a branch that was never pushed). Workflow/pipeline fallback only runs
+    /// if `has_upstream`.
     fn detect_uncached(
         repo: &Repository,
         branch: &CiBranchName,
@@ -681,7 +657,7 @@ impl PrStatus {
 /// Rows with no usable cache entry are left `None` (pending): the live task
 /// fills them, so they must not be resolved to "no PR" here.
 ///
-/// `item.branch` is the cache key for every row shape: local worktrees and
+/// `ListItem::branch()` is the cache key for every row shape: local worktrees and
 /// branches cache under the bare name, remote rows under `origin/...` —
 /// the same `full_name` the `CiStatus` task writes.
 pub(crate) fn populate_from_cache(repo: &Repository, items: &mut [super::model::ListItem]) {
@@ -695,13 +671,13 @@ pub(crate) fn populate_from_cache(repo: &Repository, items: &mut [super::model::
     };
     let now_secs = epoch_now();
     for item in items.iter_mut() {
-        let Some(branch) = item.branch.as_deref() else {
+        let Some(branch) = item.branch() else {
             continue;
         };
         let Some(cached) = CachedCiStatus::read(repo, branch) else {
             continue;
         };
-        if cached.is_valid(&item.head, now_secs, &repo_path) {
+        if cached.is_valid(item.head(), now_secs, &repo_path) {
             item.pr_status = Some(cached.status);
         } else if let Some(stale) = cached.status.filter(|s| s.number.is_some()) {
             // Show the number now, but render it neutral-dim: the cached color
@@ -722,30 +698,6 @@ mod tests {
     use super::super::model::ListItem;
     use super::*;
     use worktrunk::testing::TestRepo;
-
-    #[test]
-    fn test_is_retriable_error() {
-        // Rate limit errors
-        assert!(is_retriable_error("API rate limit exceeded"));
-        assert!(is_retriable_error("rate limit exceeded for requests"));
-        assert!(is_retriable_error("Error 403: forbidden"));
-        assert!(is_retriable_error("HTTP 429 Too Many Requests"));
-
-        // Network errors
-        assert!(is_retriable_error("connection timed out"));
-        assert!(is_retriable_error("network error"));
-        assert!(is_retriable_error("timeout waiting for response"));
-
-        // Case insensitivity
-        assert!(is_retriable_error("RATE LIMIT"));
-        assert!(is_retriable_error("Connection Reset"));
-
-        // Non-retriable errors
-        assert!(!is_retriable_error("branch not found"));
-        assert!(!is_retriable_error("invalid credentials"));
-        assert!(!is_retriable_error("permission denied"));
-        assert!(!is_retriable_error(""));
-    }
 
     #[test]
     fn test_ci_status_color() {
@@ -857,6 +809,25 @@ mod tests {
         };
         assert_snapshot!(error.format_cell(usize::MAX, LinkStyle::Unlinked), @"[33m⚠[0m");
 
+        // A PR or MR without CI still keeps its forge reference
+        let no_ci_pr = PrStatus {
+            ci_status: CiStatus::NoCI,
+            ..pr.clone()
+        };
+        assert_snapshot!(
+            no_ci_pr.format_cell(usize::MAX, LinkStyle::Unlinked),
+            @"[90m#123[0m"
+        );
+        let no_ci_mr = PrStatus {
+            ci_status: CiStatus::NoCI,
+            number: Some(PrRef::mr(7)),
+            ..pr.clone()
+        };
+        assert_snapshot!(
+            no_ci_mr.format_cell(usize::MAX, LinkStyle::Unlinked),
+            @"[90m!7[0m"
+        );
+
         // GitLab sigil
         let mr = PrStatus {
             number: Some(PrRef::mr(7)),
@@ -872,8 +843,14 @@ mod tests {
         assert_eq!(pr_ref_width(10), 3);
         assert_eq!(pr_ref_width(3035), 5);
         assert_eq!(pr_ref_width(99999), 6);
-        assert_eq!(PrRef::mr(3035).to_string(), "!3035");
-        assert_eq!(PrRef::mr(3035).width(), 5);
+        let mr = PrRef::mr(3035);
+        assert_eq!(mr.ref_type(), RefType::Mr);
+        assert_eq!(mr.to_string(), "!3035");
+        assert_eq!(mr.width(), 5);
+
+        let cached = serde_json::to_value(mr).unwrap();
+        assert_eq!(cached, serde_json::json!({ "number": 3035, "sigil": "!" }));
+        assert_eq!(serde_json::from_value::<PrRef>(cached).unwrap(), mr);
     }
 
     #[test]
@@ -908,11 +885,8 @@ mod tests {
 
     #[test]
     fn test_ci_branch_name_from_detached_head() {
-        let detached = BranchRef {
-            full_ref: None,
-            commit_sha: "abc123".to_string(),
-            worktree_path: None,
-        };
+        let detached =
+            worktrunk::git::WorktreeRef::new("/tmp/detached", None, "abc123").into_branch_ref();
         assert!(CiBranchName::from_branch_ref(&detached).is_none());
     }
 
@@ -1027,54 +1001,6 @@ mod tests {
                 .fg_color(Some(Color::Ansi(AnsiColor::Green)))
                 .dimmed()
         );
-    }
-
-    /// Build a synthetic non-success `Output` with the given stderr/stdout
-    /// bodies — `Command::output()` is the only "real" constructor and
-    /// would require spawning a process. Status uses `ExitStatus::default()`
-    /// (success), but the retriable-error helpers ignore status and only
-    /// look at the bytes.
-    fn fake_output(stderr: &str, stdout: &str) -> Output {
-        Output {
-            status: Default::default(),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        }
-    }
-
-    /// `output_error_text` must combine both streams — `tea` routes API
-    /// errors to stdout while transport errors land on stderr, so a
-    /// stderr-only sniff would miss rate-limit messages from the JSON body.
-    #[test]
-    fn test_output_error_text_combines_streams() {
-        let out = fake_output("transport: connection reset", r#"{"message":"rate limit"}"#);
-        let text = output_error_text(&out);
-        assert!(text.contains("transport: connection reset"));
-        assert!(text.contains("rate limit"));
-    }
-
-    /// `retriable_pr_error` returns `Some(PrStatus::error())` when either
-    /// stream contains a retriable marker, and `None` otherwise — the
-    /// fall-through case where `?` propagates "no CI status".
-    #[test]
-    fn test_retriable_pr_error_routing() {
-        // Retriable from stderr.
-        let out = fake_output("HTTP 429 Too Many Requests", "");
-        let status = retriable_pr_error(&out).expect("retriable should yield Some");
-        assert_eq!(status.ci_status, CiStatus::Error);
-
-        // Retriable from stdout — a tool that copies the server's error body
-        // through rather than writing its own message to stderr.
-        let out = fake_output("", r#"{"message":"rate limit exceeded"}"#);
-        assert!(retriable_pr_error(&out).is_some());
-
-        // Non-retriable failure → None, so caller's `?` falls through.
-        let out = fake_output("not found", "");
-        assert!(retriable_pr_error(&out).is_none());
-
-        // No body at all → None.
-        let out = fake_output("", "");
-        assert!(retriable_pr_error(&out).is_none());
     }
 
     fn passed_pr_status(number: Option<u64>) -> PrStatus {

@@ -9,6 +9,13 @@ info:
     CLICOLOR_FORCE: "1"
     COLUMNS: "500"
     GIT_ALLOW_PROTOCOL: file
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_GLOBAL: /nonexistent/wt/gitconfig
+    GIT_CONFIG_KEY_0: user.useConfigOnly
+    GIT_CONFIG_KEY_1: rerere.enabled
+    GIT_CONFIG_SYSTEM: /nonexistent/wt/gitconfig
+    GIT_CONFIG_VALUE_0: "true"
+    GIT_CONFIG_VALUE_1: "false"
     LANG: C
     LC_ALL: C
     LLVM_PROFILE_FILE: "[LLVM_PROFILE_FILE]"
@@ -28,13 +35,14 @@ info:
     WORKTRUNK_TEST_PARENT_SHELL: ""
     WORKTRUNK_TEST_POWERSHELL_ENV: "0"
     WORKTRUNK_TEST_POWERSHELL_INSTALLED: "0"
+    WORKTRUNK_TEST_PROBE_TIMEOUT_MS: "60000"
     WORKTRUNK_TEST_SKIP_URL_HEALTH_CHECK: "1"
     WORKTRUNK_TEST_ZSH_INSTALLED: "0"
 ---
 success: true
 exit_code: 0
 ----- stdout -----
-wt merge - Merge current branch into the target branch
+wt merge - Merge a branch into the target branch
 
 Usage: [1m[36mwt merge[0m [36m[OPTIONS][0m [36m[TARGET][0m
 
@@ -42,13 +50,14 @@ Usage: [1m[36mwt merge[0m [36m[OPTIONS][0m [36m[TARGET][0m
   [36m[TARGET][0m  Target branch
 
 [1m[32mOptions:[0m
-      [1m[36m--no-squash[0m      Skip commit squashing
-      [1m[36m--no-commit[0m      Skip commit and squash
-      [1m[36m--no-rebase[0m      Skip rebase; require the target to fast-forward to the resulting tip
-      [1m[36m--no-remove[0m      Keep worktree after merge
-      [1m[36m--no-ff[0m          Create a merge commit (no fast-forward)
-      [1m[36m--stage[0m[36m [0m[36m<STAGE>[0m  What to stage before committing [default: all] [possible values: all, tracked, none]
-  [1m[36m-h[0m, [1m[36m--help[0m           Print help (see more with '--help')
+  [1m[36m-b[0m, [1m[36m--branch[0m[36m [0m[36m<BRANCH>[0m  Branch to merge from (defaults to current worktree)
+      [1m[36m--no-squash[0m        Skip commit squashing
+      [1m[36m--no-commit[0m        Skip commit and squash
+      [1m[36m--no-rebase[0m        Skip rebase; require the target to fast-forward to the resulting tip
+      [1m[36m--no-remove[0m        Keep worktree after merge
+      [1m[36m--no-ff[0m            Create a merge commit (no fast-forward)
+      [1m[36m--stage[0m[36m [0m[36m<STAGE>[0m    What to stage before committing [default: all] [possible values: all, tracked, none]
+  [1m[36m-h[0m, [1m[36m--help[0m             Print help (see more with '--help')
 
 [1m[32mAutomation:[0m
       [1m[36m--no-hooks[0m         Skip hooks

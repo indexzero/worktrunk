@@ -1,6 +1,8 @@
+#[cfg(unix)]
+use crate::common::temp_home;
 use crate::common::{
-    BareRepoTest, SLEEP_FOR_ABSENCE_CHECK, TestRepo, TestRepoBase, configure_directive_files,
-    directive_files, make_snapshot_cmd, repo, repo_with_remote, setup_snapshot_settings,
+    BareRepoTest, SLEEP_FOR_ABSENCE_CHECK, TestRepo, TestRepoBase, configure_directive_file,
+    directive_file, make_snapshot_cmd, repo, repo_with_remote, setup_snapshot_settings,
     setup_temp_snapshot_settings, wt_command,
 };
 use ansi_str::AnsiStr;
@@ -8,20 +10,8 @@ use insta::assert_snapshot;
 use insta_cmd::assert_cmd_snapshot;
 use path_slash::PathExt as _;
 use rstest::rstest;
-
-#[rstest]
-fn test_remove_already_on_default(repo: TestRepo) {
-    // Already on main branch
-    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &[], None));
-}
-
-#[rstest]
-fn test_remove_switch_to_default(repo: TestRepo) {
-    // Create and switch to a feature branch in the main repo
-    repo.run_git(&["switch", "-c", "feature"]);
-
-    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &[], None));
-}
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[rstest]
 fn test_remove_from_worktree(mut repo: TestRepo) {
@@ -34,6 +24,141 @@ fn test_remove_from_worktree(mut repo: TestRepo) {
         &[],
         Some(&worktree_path)
     ));
+}
+
+/// Merge and remove must advise activating the current shell's installed
+/// integration, not reinstalling it or restarting a different login shell.
+#[cfg(unix)]
+#[rstest]
+#[case("remove", "zsh", "remove_installed_shell_inactive")]
+#[case("merge", "zsh", "merge_installed_shell_inactive")]
+#[case("remove", "fish", "remove_current_shell_not_installed")]
+#[case("merge", "fish", "merge_current_shell_not_installed")]
+fn test_removal_shell_activation_advice(
+    mut repo: TestRepo,
+    #[case] command: &str,
+    #[case] current_shell: &str,
+    #[case] snapshot: &str,
+) {
+    use std::os::unix::process::CommandExt;
+
+    repo.configure_shell_integration(); // Installs zsh integration only.
+    let worktree_path = repo.add_worktree("feature");
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        let args = if command == "remove" {
+            ["--foreground", "--yes"]
+        } else {
+            ["--yes", "--no-squash"]
+        };
+        let mut cmd = make_snapshot_cmd(&repo, command, &args, Some(&worktree_path));
+        cmd.arg0("wt"); // Invoke through PATH, without the wrapper's cd directive.
+        cmd.env("SHELL", "/bin/zsh");
+        cmd.env("WORKTRUNK_TEST_PARENT_SHELL", current_shell);
+        assert_cmd_snapshot!(snapshot, cmd);
+    });
+}
+
+/// A PowerShell profile query that INT/TERM cancels while removal computes its
+/// change-directory warning stops the command before that warning or any
+/// activation hint.
+#[cfg(unix)]
+#[rstest]
+#[case::sigint("INT", 130)]
+#[case::sigterm("TERM", 143)]
+fn test_remove_stops_after_cancelled_powershell_query(
+    mut repo: TestRepo,
+    #[case] signal: &str,
+    #[case] exit_code: i32,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    repo.setup_mock_ci_tools_unauthenticated();
+    let pwsh = repo.mock_bin_path().unwrap().join("pwsh");
+    fs::write(&pwsh, format!("#!/bin/sh\nkill -{signal} $$\n")).unwrap();
+    fs::set_permissions(&pwsh, fs::Permissions::from_mode(0o755)).unwrap();
+    let worktree_path = repo.add_worktree("feature");
+
+    let mut cmd = repo.wt_command();
+    cmd.env("WORKTRUNK_TEST_PARENT_SHELL", "pwsh")
+        .arg0("wt")
+        .args(["remove", "--foreground", "--yes"])
+        .current_dir(&worktree_path);
+    let output = cmd.output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        crate::common::shell_exit_code(&output.status),
+        Some(exit_code),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cannot change directory"), "{stderr}");
+}
+
+/// Installation advice must use the installer's wrapper-aware state: a
+/// legacy fish wrapper needs migration, while current fish/Nushell wrappers
+/// need activation. Exercise the real installer and removal output together.
+#[cfg(unix)]
+#[rstest]
+#[case("fish", true, "remove", "remove_legacy_fish_needs_install")]
+#[case("fish", false, "remove", "remove_current_fish_needs_activation")]
+#[case("nu", false, "remove", "remove_current_nushell_needs_activation")]
+#[case("fish", false, "switch", "switch_current_fish_needs_activation")]
+fn test_removal_wrapper_installation_advice(
+    mut repo: TestRepo,
+    temp_home: tempfile::TempDir,
+    #[case] shell: &str,
+    #[case] legacy: bool,
+    #[case] command: &str,
+    #[case] snapshot: &str,
+) {
+    use crate::common::{set_temp_home_env, setup_snapshot_settings_with_home};
+    use std::os::unix::process::CommandExt;
+
+    let home = crate::common::canonical_temp_home(&temp_home);
+    let autoload = home.join(".local/share/nushell/vendor/autoload");
+    if legacy {
+        let path = home.join(".config/fish/conf.d/wt.fish");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, worktrunk::shell::Shell::Fish.config_line("wt")).unwrap();
+    } else {
+        let mut install = repo.wt_command();
+        set_temp_home_env(&mut install, &home);
+        install.env("WORKTRUNK_TEST_NU_VENDOR_AUTOLOAD_DIR", &autoload);
+        let output = install
+            .args(["config", "shell", "install", shell, "--yes"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // Completion availability must not determine whether the shell wrapper
+    // is installed. A directory at the completion-file path is unreadable as
+    // a file, while the installed fish wrapper remains valid.
+    if shell == "fish" && !legacy {
+        let completion = home.join(".config/fish/completions/wt.fish");
+        fs::remove_file(&completion).unwrap();
+        fs::create_dir(&completion).unwrap();
+    }
+    let worktree = repo.add_worktree("feature");
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let args: &[&str] = if command == "remove" {
+            &["--foreground", "--yes"]
+        } else {
+            &["main"]
+        };
+        let mut cmd = make_snapshot_cmd(&repo, command, args, Some(&worktree));
+        set_temp_home_env(&mut cmd, &home);
+        cmd.env("WORKTRUNK_TEST_NU_VENDOR_AUTOLOAD_DIR", &autoload);
+        cmd.env("WORKTRUNK_TEST_PARENT_SHELL", shell);
+        cmd.arg0("wt");
+        assert_cmd_snapshot!(snapshot, cmd);
+    });
 }
 
 // `--reap` (experimental) with no processes running under the worktree: the
@@ -58,15 +183,17 @@ fn test_remove_reap_no_processes(mut repo: TestRepo) {
 // `--reap` (experimental) with a real process running under the worktree: the
 // detached child is discovered and terminated before removal. Whether the
 // controlling-terminal guard reaps it depends on the test's own terminal
-// (none in CI → reaped; a TTY on a dev box → spared), so the assertion is
-// driven off the guard's verdict rather than assuming either — keeping the
-// found-processes path exercised in CI without becoming host-dependent.
+// (none in CI → reaped; a TTY on a dev box → spared), so the assertion
+// branches on that terminal — read directly from the session (`/dev/tty`),
+// the property the child inherits at spawn, not probed via a second
+// `lsof`/`ps` snapshot, which can transiently fail under suite load and
+// predict the branch `wt`'s own probe then contradicts.
 #[cfg(unix)]
 #[rstest]
 fn test_remove_reap_kills_process(mut repo: TestRepo) {
+    use crate::common::{wait_for, wait_for_worktree_removed};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
     use worktrunk::git::reap;
 
     let worktree_path = repo.add_worktree("feature-reapkill");
@@ -84,23 +211,22 @@ fn test_remove_reap_kills_process(mut repo: TestRepo) {
         .unwrap();
     let pid = child.id();
 
-    // Wait until lsof reports the child's cwd (fast, but not instant).
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !reap::processes_under(&canonical)
-        .iter()
-        .any(|p| p.pid == pid)
-    {
-        assert!(
-            Instant::now() < deadline,
-            "child {pid} never discovered — is lsof installed and able to read process cwds?"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // Wait until lsof reports the child's cwd — fast when idle, but under
+    // suite load a single probe can burn its whole 5s in-process timeout;
+    // `wait_for` carries the suite's generous presence-poll deadline.
+    wait_for(
+        &format!("child {pid} in cwd discovery — is lsof installed and able to read process cwds?"),
+        || {
+            reap::processes_under(&canonical)
+                .iter()
+                .any(|p| p.pid == pid)
+        },
+    );
 
-    // The guard reaps the child iff it holds no controlling terminal.
-    let will_reap = reap::collect_reapable(&canonical)
-        .iter()
-        .any(|p| p.pid == pid);
+    // The guard reaps the child iff it holds no controlling terminal — which
+    // it inherited from this process's session, so read the session directly:
+    // `/dev/tty` opens iff the session has a controlling terminal.
+    let will_reap = std::fs::File::open("/dev/tty").is_err();
 
     let run_remove = |repo: &TestRepo| {
         let output = repo
@@ -136,6 +262,87 @@ fn test_remove_reap_kills_process(mut repo: TestRepo) {
         let _ = child.kill();
         let _ = child.wait();
     }
+
+    // The reap phase prints before the removal runs, so neither branch's
+    // output proves the removal itself completed.
+    wait_for_worktree_removed(&worktree_path);
+}
+
+// `--reap` (experimental) with a process *holding* a controlling terminal
+// under the worktree: the guard spares it. Unlike
+// `test_remove_reap_kills_process` this doesn't branch on the suite's own
+// terminal — the child gets a fresh PTY as its controlling terminal at spawn
+// (portable_pty runs it as a session leader on the slave side), so the spared
+// branch runs deterministically in every environment, CI included.
+//
+// From the outside a spared process is indistinguishable from an undiscovered
+// one (both print "No processes to reap"), so the test first proves discovery
+// sees the child, then pins the guard's verdict in-process. The load-bearing
+// assertion is the child surviving removal — the data-safety contract — which
+// a guard regression fails whenever discovery succeeds.
+#[cfg(unix)]
+#[rstest]
+fn test_remove_reap_spares_terminal_process(mut repo: TestRepo) {
+    use crate::common::{open_pty_with_size, wait_for, wait_for_worktree_removed};
+    use portable_pty::CommandBuilder;
+    use worktrunk::git::reap;
+
+    let worktree_path = repo.add_worktree("feature-reapspare");
+    let canonical = std::fs::canonicalize(&worktree_path).unwrap();
+
+    // The "keep-me" shape: a terminal-holding process cwd'd in the worktree.
+    // `sleep` writes nothing, so the never-read master can't fill and block it;
+    // 600s bounds the leak if an assertion panics before cleanup.
+    let pty = open_pty_with_size(24, 80);
+    let mut cmd = CommandBuilder::new("sleep");
+    cmd.arg("600");
+    cmd.cwd(&canonical);
+    let mut child = pty.slave.spawn_command(cmd).unwrap();
+    let pid = child.process_id().unwrap();
+
+    // Same presence poll as the kill test: prove discovery sees the child
+    // before asking what the guard makes of it.
+    wait_for(
+        &format!("child {pid} in cwd discovery — is lsof installed and able to read process cwds?"),
+        || {
+            reap::processes_under(&canonical)
+                .iter()
+                .any(|p| p.pid == pid)
+        },
+    );
+
+    // The guard's verdict, pinned in-process: discovered but not reapable.
+    // (A transiently failed `ps` probe also yields "not reapable" — the
+    // fail-safe points the same way as the contract, so this can't flake.)
+    assert!(
+        !reap::collect_reapable(&canonical)
+            .iter()
+            .any(|p| p.pid == pid),
+        "terminal-holding child {pid} was classified reapable"
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "--reap", "feature-reapspare"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No processes to reap"),
+        "expected no-reap output, got:\n{stderr}"
+    );
+    // The reap phase prints before the removal runs, so confirm the removal
+    // actually happened — otherwise the survival assertion below would hold
+    // just as well for a `wt` that gave up before touching the worktree.
+    assert!(output.status.success(), "remove failed; stderr:\n{stderr}");
+    wait_for_worktree_removed(&worktree_path);
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "spared child {pid} was killed during removal"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[rstest]
@@ -143,10 +350,10 @@ fn test_remove_internal_mode(mut repo: TestRepo) {
     let worktree_path = repo.add_worktree("feature-internal");
 
     // Directive file guards must live through command execution
-    let (cd_path, exec_path, _guard) = directive_files();
+    let (cd_path, _guard) = directive_file();
     assert_cmd_snapshot!({
         let mut cmd = make_snapshot_cmd(&repo, "remove", &[], Some(&worktree_path));
-        configure_directive_files(&mut cmd, &cd_path, &exec_path);
+        configure_directive_file(&mut cmd, &cd_path);
         cmd
     });
 }
@@ -166,14 +373,6 @@ fn test_remove_as_git_subcommand(mut repo: TestRepo) {
         cmd.env("GIT_EXEC_PATH", "/usr/lib/git-core");
         assert_cmd_snapshot!("remove_as_git_subcommand", cmd);
     });
-}
-
-#[rstest]
-fn test_remove_dirty_working_tree(repo: TestRepo) {
-    // Create a dirty file
-    std::fs::write(repo.root_path().join("dirty.txt"), "uncommitted changes").unwrap();
-
-    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &[], None));
 }
 
 #[rstest]
@@ -229,7 +428,7 @@ fn test_remove_locked_detached_worktree(mut repo: TestRepo) {
     repo.lock_worktree("locked-detached", Some("Detached and locked"));
 
     // Try to remove from within the locked detached worktree - should fail
-    // This exercises the RemoveTarget::Current path for locked worktrees
+    // This exercises exact-path removal of the current locked worktree.
     assert_cmd_snapshot!(make_snapshot_cmd(
         &repo,
         "remove",
@@ -310,6 +509,200 @@ fn test_remove_locked_worktree_directory_missing(mut repo: TestRepo) {
     );
 }
 
+/// Regression test for #3769. Detaching a worktree's HEAD severs the only link
+/// git records between it and the branch, so the branch really has no worktree
+/// and deleting the ref alone is the right operation — the directory is left on
+/// disk either way, and `wt remove <path>` is what clears it.
+///
+/// What was wrong was the report: `○ No worktree found for branch <name>` reads
+/// as "nothing is there" while a directory sits at exactly that path. The
+/// removal must still happen, and must now name what it left behind.
+#[rstest]
+fn test_remove_branch_whose_worktree_was_detached(mut repo: TestRepo) {
+    let worktree_path = repo.add_worktree("detached-later");
+    repo.detach_head_in_worktree("detached-later");
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "detached-later", "--foreground", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the branch has no worktree, so removing it is the right operation.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // The branch goes, because nothing is checked out on it.
+    let branch_exists = repo
+        .git_command()
+        .args(["branch", "--list", "detached-later"])
+        .run()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&branch_exists.stdout)
+            .trim()
+            .is_empty(),
+        "Branch should be deleted — no worktree holds it",
+    );
+
+    // The detached worktree is untouched, and the output says so rather than
+    // leaving the user to discover it.
+    assert!(
+        worktree_path.exists(),
+        "Detached worktree must be left alone"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("a detached worktree is @"),
+        "Output must name the directory it left behind; stderr:\n{stderr}"
+    );
+}
+
+/// The wording: the info line names the detached worktree alongside the branch
+/// it no longer belongs to, and the hint gives the path spelling that removes
+/// it.
+#[rstest]
+fn test_remove_branch_with_detached_worktree_message(mut repo: TestRepo) {
+    repo.add_worktree("feature-detached-strand");
+    repo.detach_head_in_worktree("feature-detached-strand");
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &["feature-detached-strand"],
+        None
+    ));
+}
+
+/// The default branch's expected path is the main worktree, so a detached main
+/// worktree would match — but `wt remove <that path>` refuses the main worktree,
+/// so naming it would be a dead end. The default-branch refusal, which is the
+/// accurate answer, is what surfaces.
+#[rstest]
+fn test_remove_default_branch_with_detached_main_worktree(repo: TestRepo) {
+    repo.run_git(&["checkout", "--detach", "HEAD"]);
+
+    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &["main"], None));
+}
+
+/// `-D` is what reaches the annotation for the default branch: without it
+/// `check_not_default_branch` errors first, so the case above never exercises
+/// the exclusion it appears to be about. `compute_worktree_path` returns the
+/// repo root for the default branch of a non-bare repo, and a detached main
+/// worktree passes every other predicate in the `find` — `is_linked()` is the
+/// only thing keeping the removal from pointing at a directory `wt remove`
+/// refuses outright.
+#[rstest]
+fn test_remove_default_branch_force_with_detached_main_worktree(repo: TestRepo) {
+    repo.run_git(&["checkout", "--detach", "HEAD"]);
+
+    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &["-D", "main"], None));
+}
+
+/// A detached worktree at the templated path must not make a name that is no
+/// longer a branch look like one: once the ref is gone, the missing branch is
+/// what gets reported.
+#[rstest]
+fn test_remove_missing_branch_with_detached_worktree_at_its_path(mut repo: TestRepo) {
+    repo.add_worktree("feature-detached-orphan");
+    repo.detach_head_in_worktree("feature-detached-orphan");
+    repo.run_git(&["branch", "-D", "feature-detached-orphan"]);
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &["feature-detached-orphan"],
+        None
+    ));
+}
+
+/// `--no-delete-branch` deletes nothing, so the removal is a no-op — but the
+/// detached worktree is still worth naming, since "no worktree found" misreads
+/// the same way whether or not a ref goes with it.
+#[rstest]
+fn test_remove_branch_with_detached_worktree_keeping_branch(mut repo: TestRepo) {
+    repo.add_worktree("feature-detached-keep");
+    repo.detach_head_in_worktree("feature-detached-keep");
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &["--no-delete-branch", "feature-detached-keep"],
+        None
+    ));
+}
+
+/// An unintegrated branch keeps its ref under `SafeDelete`, and the detached
+/// worktree at its path is named all the same — the note is about the directory
+/// on disk, not about what happened to the ref.
+#[rstest]
+fn test_remove_unmerged_branch_with_detached_worktree_reports_it(mut repo: TestRepo) {
+    let worktree_path = repo.add_worktree("feature-detached-unmerged");
+    std::fs::write(worktree_path.join("feature.txt"), "new feature").unwrap();
+    repo.git_command()
+        .args(["add", "feature.txt"])
+        .current_dir(&worktree_path)
+        .run()
+        .unwrap();
+    repo.git_command()
+        .args(["commit", "-m", "Add feature"])
+        .current_dir(&worktree_path)
+        .run()
+        .unwrap();
+    repo.detach_head_in_worktree("feature-detached-unmerged");
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &["feature-detached-unmerged"],
+        None
+    ));
+}
+
+/// A detached worktree whose directory is already gone is stale metadata for
+/// `wt step prune` to sweep — there is nothing on disk to point the user at, so
+/// the removal says nothing extra.
+#[rstest]
+fn test_remove_branch_with_prunable_detached_worktree(mut repo: TestRepo) {
+    let worktree_path = repo.add_worktree("feature-detached-gone");
+    repo.detach_head_in_worktree("feature-detached-gone");
+    std::fs::remove_dir_all(&worktree_path).unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &["-D", "feature-detached-gone"],
+        None
+    ));
+}
+
+/// Pruning a stale checkout must not hide a separate detached worktree left at
+/// the branch's configured path.
+#[rstest]
+fn test_remove_branch_with_stale_and_detached_worktrees(mut repo: TestRepo) {
+    let detached_path = repo.add_worktree("detached-and-pruned");
+    repo.detach_head_in_worktree("detached-and-pruned");
+
+    let stale_path = repo.path().parent().unwrap().join("stale-branch-checkout");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        stale_path.to_str().unwrap(),
+        "detached-and-pruned",
+    ]);
+    std::fs::remove_dir_all(stale_path).unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &["detached-and-pruned"],
+        None
+    ));
+    assert!(detached_path.is_dir());
+}
+
 #[rstest]
 fn test_remove_by_name_from_main(mut repo: TestRepo) {
     // Create a worktree
@@ -345,12 +738,6 @@ fn test_remove_current_by_name(mut repo: TestRepo) {
         &["feature-current"],
         Some(&worktree_path)
     ));
-}
-
-#[rstest]
-fn test_remove_nonexistent_worktree(repo: TestRepo) {
-    // Try to remove a worktree that doesn't exist
-    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &["nonexistent"], None));
 }
 
 ///
@@ -446,6 +833,359 @@ fn test_remove_nonexistent_branch(repo: TestRepo) {
     assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &["nonexistent"], None));
 }
 
+/// A directory holding no worktree — a skeleton left behind by an interrupted
+/// create — is reported as the directory it is. Resolution falls through to a
+/// branch name, and reporting that would send the user to a branch listing the
+/// path could never appear in.
+///
+/// Spelled `../<sibling>`, which is both worktrunk's own layout and the shape
+/// that resolves against the cwd rather than against `-C`; the absolute form is
+/// covered at the unit boundary.
+#[rstest]
+fn test_remove_path_holding_no_worktree(repo: TestRepo) {
+    let leftover = repo.root_path().parent().unwrap().join("repo.leftover");
+    std::fs::create_dir_all(&leftover).unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &["../repo.leftover"],
+        None
+    ));
+}
+
+/// A worktree directory deleted and *recreated* is a stale registration like
+/// one deleted outright, and is cleaned up the same way: the entry is
+/// unregistered and the branch removed, while the directory itself stays.
+/// `git worktree remove` refuses this entry, `--force` included, so handing
+/// it to git would surface as a raw `exit 128`.
+/// `test_remove_pruned_worktree_directory_missing` covers the absent half.
+#[rstest]
+fn test_remove_worktree_directory_recreated(mut repo: TestRepo) {
+    let worktree_path = repo.add_worktree("feature");
+    std::fs::remove_dir_all(&worktree_path).unwrap();
+    std::fs::create_dir_all(&worktree_path).unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &["feature"], None));
+    assert!(
+        worktree_path.is_dir(),
+        "the recreated directory should stay"
+    );
+}
+
+/// A stale worktree whose registration holds staged changes is refused, with
+/// the repair that restores it; `--force` discards them as it discards a live
+/// worktree's uncommitted changes.
+#[rstest]
+fn test_remove_stale_worktree_holding_staged_changes(mut repo: TestRepo) {
+    let wt_path = repo.add_worktree("feature");
+    std::fs::write(wt_path.join("new.txt"), "work").unwrap();
+    repo.run_git_in(&wt_path, &["add", "new.txt"]);
+    std::fs::remove_file(wt_path.join(".git")).unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &["feature"], None));
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "-f", "feature", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let list = repo.git_output(&["worktree", "list", "--porcelain"]);
+    assert!(!list.contains("prunable"), "worktrees:\n{list}");
+    assert!(
+        wt_path.join("new.txt").is_file(),
+        "the directory's files stay"
+    );
+}
+
+/// An orphan worktree's branch is unborn, so there is no local branch to
+/// delete or retain, even with a remote branch of that name: removing the
+/// worktree, or pruning a stale one, is the whole removal.
+#[rstest]
+fn test_remove_orphan_worktree(#[from(repo_with_remote)] repo: TestRepo) {
+    let remove = |branch: &str| {
+        repo.run_git(&[
+            "update-ref",
+            &format!("refs/remotes/origin/{branch}"),
+            "HEAD",
+        ]);
+        let wt_path = repo
+            .root_path()
+            .parent()
+            .unwrap()
+            .join(format!("repo.{branch}"));
+        repo.run_git(&[
+            "worktree",
+            "add",
+            "--orphan",
+            "-b",
+            branch,
+            wt_path.to_str().unwrap(),
+        ]);
+        if branch == "stale" {
+            std::fs::remove_dir_all(&wt_path).unwrap();
+        }
+        let output = repo
+            .wt_command()
+            .args(["remove", branch, "--yes", "--foreground"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr)
+            .ansi_strip()
+            .to_string()
+    };
+
+    assert_snapshot!(remove("live"), @"
+    ◎ Removing live worktree...
+    ✓ Removed live worktree (1 file · [BYTES] B)
+    ");
+    assert_snapshot!(remove("stale"), @"✓ Pruned stale worktree for stale");
+    let list = repo.git_output(&["worktree", "list", "--porcelain"]);
+    assert!(
+        !list.contains("repo.live") && !list.contains("repo.stale"),
+        "worktrees:\n{list}"
+    );
+}
+
+/// A detached stale entry has no branch for the removal to fall back to, so
+/// `wt remove` reports it rather than removing it; `wt step prune` is what
+/// unregisters one.
+#[rstest]
+fn test_remove_stale_detached_worktree_reports_it(repo: TestRepo) {
+    let wt_path = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("repo.detached-stale");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "--detach",
+        wt_path.to_str().unwrap(),
+        "HEAD",
+    ]);
+    std::fs::remove_dir_all(&wt_path).unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &["../repo.detached-stale"],
+        None
+    ));
+}
+
+/// A registration whose directory now holds a *different* repository is not
+/// this repository's worktree, and removing it would destroy that one — its
+/// uncommitted work and, for a repo that was never pushed, the only copy of
+/// its objects.
+///
+/// `--force` is the case that matters. It is the user waiving their own
+/// uncommitted changes, never a claim about who owns the directory, and it is
+/// where the dirty-worktree gate stops applying — so it must not carry the
+/// removal through. `git worktree remove` refuses this same removal with
+/// `--force`; worktrunk's fast path renames the directory itself instead of
+/// asking git to, so it has to make the check for itself.
+#[rstest]
+fn test_remove_refuses_foreign_repository_at_worktree_path(mut repo: TestRepo) {
+    let worktree_path = repo.add_worktree("feature");
+    let parent = worktree_path.parent().unwrap().to_path_buf();
+    let dir_name = worktree_path.file_name().unwrap().to_str().unwrap();
+
+    // Replace the worktree with an unrelated repository at the same path — the
+    // registration still resolves, and the occupant's own `.git` keeps git
+    // from calling it prunable.
+    std::fs::remove_dir_all(&worktree_path).unwrap();
+    repo.run_git_in(&parent, &["init", "-b", "main", dir_name]);
+    std::fs::write(worktree_path.join("precious.txt"), "unpushed work").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "--force", "feature", "--yes"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "wt remove --force must refuse a foreign repository at a registered path.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    // The refusal is worth nothing if the directory went anyway: removal
+    // stages by rename and deletes in a detached process, so the exit code
+    // alone would not catch a staged-then-deleted tree.
+    assert!(
+        worktree_path.join("precious.txt").exists(),
+        "the foreign repository's uncommitted file must survive",
+    );
+    assert!(
+        worktree_path.join(".git").is_dir(),
+        "the foreign repository's object store must survive",
+    );
+}
+
+/// The registration a worktree's `.git` file names — `<common>/worktrees/<id>`.
+///
+/// Read from the worktree rather than assembled from its directory name, so a
+/// test never depends on how git derives the id.
+fn registration_dir(worktree: &Path) -> PathBuf {
+    let dot_git = std::fs::read_to_string(worktree.join(".git")).unwrap();
+    let path = PathBuf::from(dot_git.trim().strip_prefix("gitdir: ").unwrap());
+    if path.is_relative() {
+        worktree.join(path)
+    } else {
+        path
+    }
+}
+
+/// A registration whose directory now holds a *sibling worktree of the same
+/// repository* is refused on the same terms, `--force` included.
+///
+/// This is the case repository-level ownership cannot see: the occupant's git
+/// dir sits under `<common>/worktrees/` like any worktree of this repo, so only
+/// the pointer back — the registration's `gitdir` file naming this directory —
+/// tells the two registrations apart. git refuses it (`does not point back to
+/// '.git/worktrees/<id>'`), and what removal would destroy is a live checkout
+/// with its own uncommitted work.
+///
+/// The occupant has to be *moved* onto the path rather than created there:
+/// `git worktree add` refuses a registered path, which is what leaves a plain
+/// `mv` as the way this state arises.
+///
+/// The hint is part of the assertion. Moving the occupant back to the path its
+/// own registration records — which is what the hint names — leaves `git
+/// worktree prune` with only the stale entry to clear; from anywhere else both
+/// registrations are prunable, and clearing them both would leave this checkout
+/// pointing at a registration that no longer exists.
+#[rstest]
+fn test_remove_refuses_sibling_worktree_at_worktree_path(mut repo: TestRepo) {
+    let worktree_path = repo.add_worktree("feature");
+    let sibling_path = repo.add_worktree("other");
+
+    std::fs::remove_dir_all(&worktree_path).unwrap();
+    std::fs::rename(&sibling_path, &worktree_path).unwrap();
+    std::fs::write(worktree_path.join("precious.txt"), "unpushed work").unwrap();
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &["--force", "feature", "--yes"],
+        None
+    ));
+
+    // The refusal is worth nothing if the directory went anyway: removal stages
+    // by rename and deletes in a detached process, so the exit code alone would
+    // not catch a staged-then-deleted tree.
+    assert!(
+        worktree_path.join("precious.txt").exists(),
+        "the sibling worktree's uncommitted file must survive",
+    );
+    assert!(
+        worktree_path.join(".git").is_file(),
+        "the sibling worktree's link to its own registration must survive",
+    );
+}
+
+/// The ownership gate is re-decided at the rename, not carried over from
+/// planning.
+///
+/// Removal asks twice — once while planning, once with nothing between it and
+/// the `mv` into trash — and the approval prompt and this `pre-remove` hook run
+/// in between. So the hook repoints the worktree's `.git` at a sibling's
+/// registration, exactly the state the planning gate had just cleared, and the
+/// second gate has to catch it. Resolving through a per-process cache instead
+/// would answer from the planning-time read and delete the directory.
+#[rstest]
+fn test_remove_rechecks_ownership_after_pre_remove_hook(mut repo: TestRepo) {
+    let worktree_path = repo.add_worktree("feature");
+    let sibling_registration = registration_dir(&repo.add_worktree("other"));
+
+    // Hooks run under a POSIX shell on every platform (Git Bash on Windows), and
+    // a TOML literal string carries the `"` the format needs verbatim.
+    let hook = format!(
+        r#"printf "gitdir: %s" {} > {}"#,
+        sibling_registration.to_slash_lossy(),
+        worktree_path.join(".git").to_slash_lossy(),
+    );
+    repo.write_project_config(&format!("pre-remove = '{hook}'"));
+    repo.commit("Add pre-remove config");
+    repo.write_test_config(r#"worktree-path = "../{{ repo }}.{{ branch }}""#);
+    repo.write_test_approvals(&format!(
+        r#"[projects."../origin"]
+approved-commands = ['{hook}']
+"#
+    ));
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "--foreground", "feature"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "removal must refuse once the hook has repointed the worktree.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("does not hold the worktree registered there"),
+        "the refusal must come from the ownership gate, not the dirty check.\nstderr: {stderr}"
+    );
+    assert!(
+        worktree_path.join("file.txt").exists(),
+        "the worktree the hook repointed must survive.\nstderr: {stderr}"
+    );
+}
+
+/// A registration using Git's configured path format is recognized and the
+/// worktree removes normally.
+///
+/// Git 2.48 and newer honor `worktree.useRelativePaths` and enable the
+/// `extensions.relativeWorktrees` repository extension. Older supported Git
+/// versions ignore the setting and keep writing absolute registrations. A
+/// hand-written relative entry would be unusable on Git 2.43, so Git creates
+/// the entry: this exercises the relative form where supported and the absolute
+/// form on older versions.
+#[rstest]
+fn test_remove_worktree_with_git_generated_registration_paths(mut repo: TestRepo) {
+    repo.run_git(&["config", "worktree.useRelativePaths", "true"]);
+    let worktree_path = repo.add_worktree("feature");
+    let registration = registration_dir(&worktree_path);
+    let gitdir = std::fs::read_to_string(registration.join("gitdir")).unwrap();
+    let relative_extension_enabled = repo
+        .git_command()
+        .args(["config", "--get", "extensions.relativeWorktrees"])
+        .run()
+        .unwrap()
+        .status
+        .success();
+    assert_eq!(
+        Path::new(gitdir.trim()).is_relative(),
+        relative_extension_enabled,
+        "Git must write a relative registration exactly when it enables the repository extension",
+    );
+
+    assert_cmd_snapshot!(make_snapshot_cmd(
+        &repo,
+        "remove",
+        &["--foreground", "feature"],
+        None
+    ));
+    assert!(
+        !worktree_path.exists(),
+        "the worktree directory must be gone",
+    );
+}
+
 #[rstest]
 fn test_remove_partial_success(mut repo: TestRepo) {
     // Create one valid worktree
@@ -468,6 +1208,200 @@ fn test_remove_partial_success(mut repo: TestRepo) {
     );
 }
 
+/// Execution failures belong to their target, just like validation failures.
+/// Successful JSON entries must still name the right targets after failures,
+/// including branch-only removal and the current worktree executed last.
+#[rstest]
+#[case::hook_foreground("exit 7", true, "hook_foreground")]
+#[case::hook_background("exit 7", false, "hook_background")]
+#[case::dirty_foreground("printf uncommitted > dirty.txt", true, "dirty_foreground")]
+#[case::dirty_background("printf uncommitted > dirty.txt", false, "dirty_background")]
+fn test_remove_continues_after_execution_failures(
+    mut repo: TestRepo,
+    #[case] failure: &str,
+    #[case] foreground: bool,
+    #[case] snapshot_name: &str,
+) {
+    let hook = format!("case '{{{{ branch }}}}' in failed-*) {failure} ;; esac");
+    repo.write_project_config(&format!("pre-remove = {hook:?}"));
+    repo.commit("Add conditional pre-remove hook");
+    let failed_a = repo.add_worktree("failed-a");
+    let valid = repo.add_worktree("valid");
+    let failed_b = repo.add_worktree("failed-b");
+    let current = repo.add_worktree("current");
+    repo.create_branch("branch-only");
+
+    let mut cmd = repo.wt_command();
+    // Select the logical current worktree without holding its directory open:
+    // Windows cannot remove a live process's physical working directory.
+    cmd.arg("-C").arg(&current).args([
+        "remove",
+        "current",
+        "failed-a",
+        "valid",
+        "failed-b",
+        "branch-only",
+        "--format=json",
+        "--yes",
+    ]);
+    if foreground {
+        cmd.arg("--foreground");
+    }
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        failed_a.exists() && failed_b.exists(),
+        "failed targets must survive"
+    );
+    assert!(
+        !valid.exists(),
+        "a later valid worktree must be removed; stderr:\n{stderr}"
+    );
+    crate::common::wait_for_worktree_removed(&current);
+    assert_branch_exists(&repo, "branch-only", false, &stderr);
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let branches: Vec<_> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["branch"].as_str().unwrap())
+        .collect();
+    assert_eq!(branches, ["valid", "branch-only", "current"]);
+    setup_snapshot_settings(&repo).bind(|| {
+        assert_snapshot!(format!("remove_continues_{snapshot_name}"), stderr);
+    });
+}
+
+/// Cancellation stops the batch before its next worktree. The hook signals
+/// its own shell, exercising child signal identity without signaling cargo.
+#[cfg(unix)]
+#[rstest]
+#[case::sigint("INT", 130)]
+#[case::sigterm("TERM", 143)]
+fn test_remove_interrupt_stops_batch(
+    mut repo: TestRepo,
+    #[case] signal: &str,
+    #[case] exit_code: i32,
+) {
+    let hook = format!("kill -{signal} $$");
+    repo.write_project_config(&format!("pre-remove = {hook:?}"));
+    repo.commit("Add interrupting pre-remove hook");
+    let interrupted = repo.add_worktree("interrupted");
+    let later = repo.add_worktree("later");
+    let output = repo
+        .wt_command()
+        .args(["remove", "interrupted", "later", "--foreground", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        crate::common::shell_exit_code(&output.status),
+        Some(exit_code),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        interrupted.exists() && later.exists(),
+        "interrupt must stop all removals"
+    );
+}
+
+/// Signals from execution-time Git commands cancel removal just like hook
+/// signals. The hook arms the shim only after validation has succeeded;
+/// everything except the selected Git boundary delegates to real Git.
+#[cfg(unix)]
+#[rstest]
+#[case::status_foreground("status", true, false, "INT", 130)]
+#[case::status_background("status", false, false, "TERM", 143)]
+#[case::delete_foreground("delete", true, false, "TERM", 143)]
+#[case::delete_background("delete", false, false, "INT", 130)]
+#[case::detached_status_foreground("status", true, true, "TERM", 143)]
+fn test_remove_git_interrupt_stops_batch(
+    mut repo: TestRepo,
+    #[case] boundary: &str,
+    #[case] foreground: bool,
+    #[case] detached: bool,
+    #[case] signal: &str,
+    #[case] exit_code: i32,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    repo.write_project_config("pre-remove = 'touch \"$WORKTRUNK_TEST_INTERRUPT_ARMED\"'");
+    repo.commit("Add hook arming the Git interrupt shim");
+    let interrupted = repo.add_worktree("interrupted");
+    let later = repo.add_worktree("later");
+    if detached {
+        repo.detach_head_in_worktree("interrupted");
+    }
+    let armed = repo.home_path().join("interrupt-armed");
+    let triggered = repo.home_path().join("interrupt-triggered");
+    assert!(!armed.exists() && !triggered.exists());
+
+    let bin_dir = repo.home_path().join("git-wrapper");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let git = bin_dir.join("git");
+    let real_git = which::which("git").unwrap();
+    let real_git = shell_escape::unix::escape(real_git.to_string_lossy());
+    fs::write(
+        &git,
+        format!(
+            r#"#!/bin/sh
+if [ -f "$WORKTRUNK_TEST_INTERRUPT_ARMED" ]; then
+  if {{ [ "$WORKTRUNK_TEST_INTERRUPT_BOUNDARY" = status ] && [ "$1" = status ] && [ "$PWD" = "$WORKTRUNK_TEST_INTERRUPT_WORKTREE" ]; }} ||
+     {{ [ "$WORKTRUNK_TEST_INTERRUPT_BOUNDARY" = delete ] && [ "$1" = update-ref ] && [ "$3" = refs/heads/interrupted ]; }}; then
+    touch "$WORKTRUNK_TEST_INTERRUPT_TRIGGERED"
+    kill "-$WORKTRUNK_TEST_INTERRUPT_SIGNAL" "$$"
+  fi
+fi
+exec {real_git} "$@"
+"#
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cmd = repo.wt_command();
+    let mut paths: Vec<_> = std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect();
+    paths.insert(0, bin_dir);
+    cmd.env("PATH", std::env::join_paths(paths).unwrap());
+    cmd.arg("remove")
+        .arg(&interrupted)
+        .args(["later", "--yes", "--format=json"])
+        .env("WORKTRUNK_TEST_INTERRUPT_ARMED", &armed)
+        .env("WORKTRUNK_TEST_INTERRUPT_TRIGGERED", &triggered)
+        .env("WORKTRUNK_TEST_INTERRUPT_BOUNDARY", boundary)
+        .env("WORKTRUNK_TEST_INTERRUPT_SIGNAL", signal)
+        .env("WORKTRUNK_TEST_INTERRUPT_WORKTREE", &interrupted);
+    if foreground {
+        cmd.arg("--foreground");
+    }
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        armed.exists() && triggered.exists(),
+        "the selected execution-time Git command must receive the signal; stderr:\n{stderr}"
+    );
+    assert!(
+        later.exists(),
+        "cancellation must preserve the later worktree; stderr:\n{stderr}"
+    );
+    assert_branch_exists(&repo, "later", true, &stderr);
+    assert_branch_exists(&repo, "interrupted", true, &stderr);
+    if boundary == "status" {
+        assert!(interrupted.exists(), "the clean check precedes removal");
+    }
+    assert_eq!(
+        crate::common::shell_exit_code(&output.status),
+        Some(exit_code),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a canceled batch must not publish success JSON"
+    );
+}
+
 #[rstest]
 fn test_remove_by_name_dirty_target(mut repo: TestRepo) {
     let worktree_path = repo.add_worktree("feature-dirty");
@@ -477,6 +1411,210 @@ fn test_remove_by_name_dirty_target(mut repo: TestRepo) {
 
     // Try to remove it by name from main repo
     assert_cmd_snapshot!(make_snapshot_cmd(&repo, "remove", &["feature-dirty"], None));
+}
+
+/// A user's status display preference must not weaken the destructive clean
+/// gate. Both execution paths ultimately rename the worktree into trash, so a
+/// false clean result would make the untracked file unrecoverable.
+#[rstest]
+#[case::foreground(&["--foreground"])]
+#[case::background(&[])]
+fn test_remove_refuses_untracked_files_hidden_by_user_config(
+    mut repo: TestRepo,
+    #[case] execution_args: &[&str],
+) {
+    let branch = "feature-hidden-untracked";
+    let worktree_path = repo.add_worktree(branch);
+    repo.run_git(&["config", "status.showUntrackedFiles", "no"]);
+    fs::write(worktree_path.join("precious.txt"), "uncommitted work").unwrap();
+
+    let hidden = repo
+        .git_command()
+        .args(["status", "--porcelain"])
+        .current_dir(&worktree_path)
+        .run()
+        .unwrap();
+    assert!(
+        hidden.stdout.is_empty(),
+        "the fixture must demonstrate that the user setting hides the file"
+    );
+    let forced = repo
+        .git_command()
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .current_dir(&worktree_path)
+        .run()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&forced.stdout).contains("?? precious.txt"),
+        "the explicit safety query must reveal the untracked file"
+    );
+
+    let output = repo
+        .wt_command()
+        .arg("remove")
+        .args(execution_args)
+        .arg(branch)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "remove must refuse a worktree with hidden untracked files; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("has uncommitted changes") && stderr.contains("precious.txt"),
+        "the dirty-worktree gate must explain the refusal; stderr:\n{stderr}"
+    );
+    assert!(
+        worktree_path.join("precious.txt").exists(),
+        "the hidden untracked file must remain recoverable"
+    );
+    assert_branch_exists(&repo, branch, true, &stderr);
+}
+
+/// An inherited `GIT_DIR` pinned to the invoking worktree makes
+/// `ensure_clean` compare the target's working tree against the invoking
+/// index. When those agree on a path, a genuinely dirty target reads as
+/// clean and removal proceeds — a silent data-loss path (#4081).
+#[rstest]
+fn test_remove_refuses_dirty_target_when_git_dir_names_invoking_worktree(mut repo: TestRepo) {
+    fs::write(repo.root_path().join("base.txt"), "base").unwrap();
+    repo.run_git_in(repo.root_path(), &["add", "base.txt"]);
+    repo.run_git_in(repo.root_path(), &["commit", "-m", "add base"]);
+
+    let other_wt = repo.add_worktree("other");
+    let feature_wt = repo.add_worktree("feature");
+
+    fs::write(feature_wt.join("base.txt"), "modified").unwrap();
+    repo.run_git_in(&feature_wt, &["add", "base.txt"]);
+    repo.run_git_in(&feature_wt, &["commit", "-m", "feature edits base.txt"]);
+
+    // Dirty against `other`'s HEAD, but matches `feature`'s index.
+    fs::write(other_wt.join("base.txt"), "modified").unwrap();
+    let status = repo
+        .git_command()
+        .args(["status", "--porcelain"])
+        .current_dir(&other_wt)
+        .run()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("base.txt"),
+        "other must be genuinely dirty: {}",
+        String::from_utf8_lossy(&status.stdout),
+    );
+
+    let git_dir = fs::read_to_string(feature_wt.join(".git")).unwrap();
+    let git_dir = PathBuf::from(git_dir.trim().strip_prefix("gitdir: ").unwrap());
+
+    let output = repo
+        .wt_command()
+        .current_dir(&feature_wt)
+        .args(["remove", "other", "--yes"])
+        .env("GIT_DIR", &git_dir)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "wt remove must refuse when GIT_DIR names the invoking worktree.\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.contains("has uncommitted changes"),
+        "removal must be refused by the dirty gate, not another error: {stderr}"
+    );
+    assert!(other_wt.exists(), "the dirty target worktree must survive");
+    assert_eq!(
+        fs::read_to_string(other_wt.join("base.txt")).unwrap(),
+        "modified",
+        "uncommitted changes must survive",
+    );
+}
+
+/// Stash advice includes untracked files, including alongside tracked edits.
+#[rstest]
+#[case::untracked_only(false)]
+#[case::mixed(true)]
+fn test_remove_stash_advice_preserves_untracked(mut repo: TestRepo, #[case] mixed: bool) {
+    let worktree = repo.add_worktree("stash-advice");
+    fs::write(worktree.join("draft.txt"), "untracked draft\n").unwrap();
+    if mixed {
+        fs::write(worktree.join("tracked.txt"), "original\n").unwrap();
+        repo.run_git_in(&worktree, &["add", "tracked.txt"]);
+        repo.run_git_in(&worktree, &["commit", "-m", "tracked file"]);
+        fs::write(worktree.join("tracked.txt"), "modified\n").unwrap();
+    }
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "stash-advice"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .ansi_strip()
+        .into_owned();
+    assert!(!output.status.success());
+    assert!(stderr.contains("git stash -u"), "{stderr}");
+    repo.run_git_in(&worktree, &["stash", "-u"]);
+    assert!(!worktree.join("draft.txt").exists());
+    assert_eq!(
+        repo.git_output(&["show", "stash^3:draft.txt"]),
+        "untracked draft"
+    );
+    repo.run_git_in(&worktree, &["stash", "pop"]);
+    assert_eq!(
+        fs::read_to_string(worktree.join("draft.txt")).unwrap(),
+        "untracked draft\n"
+    );
+    if mixed {
+        assert_eq!(
+            fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
+            "modified\n"
+        );
+    }
+}
+
+/// Force-discard disclosure observes changes made by an approved pre-remove
+/// hook, and runs only after that hook succeeds.
+#[rstest]
+#[case::remove("printf data > hook-only.txt", true)]
+#[case::abort("printf data > hook-only.txt; exit 1", false)]
+fn test_force_discard_warning_after_pre_remove(
+    mut repo: TestRepo,
+    #[case] hook: &str,
+    #[case] succeeds: bool,
+) {
+    repo.write_project_config(&format!("pre-remove = '{hook}'"));
+    repo.commit("hook");
+    let worktree = repo.add_worktree("force-hook");
+    let output = repo
+        .wt_command()
+        .args(["remove", "force-hook", "--force", "--foreground", "--yes"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .ansi_strip()
+        .into_owned();
+    assert_eq!(output.status.success(), succeeds, "{stderr}");
+    if succeeds {
+        assert!(
+            stderr.contains("Discarding uncommitted changes (--force)"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("?? hook-only.txt"), "{stderr}");
+        assert!(!worktree.exists());
+    } else {
+        assert!(
+            !stderr.contains("Discarding uncommitted changes"),
+            "{stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(worktree.join("hook-only.txt")).unwrap(),
+            "data"
+        );
+    }
 }
 
 /// --force allows removal of dirty worktrees (issue #658)
@@ -996,6 +2134,41 @@ fn test_remove_branch_only_unmerged(repo: TestRepo) {
         &["feature-unmerged"],
         None
     ));
+}
+
+/// `diff.relative` limits porcelain `git diff` to the cwd. With it set, running
+/// `wt remove` from a subdirectory made a branch whose changes sat outside that
+/// subdirectory look integrated, and the branch was deleted.
+#[rstest]
+fn test_remove_branch_only_unmerged_from_subdirectory_with_diff_relative(repo: TestRepo) {
+    repo.run_git(&["switch", "--create", "feature-unmerged"]);
+    fs::write(repo.root_path().join("feature.txt"), "new feature").unwrap();
+    repo.run_git(&["add", "feature.txt"]);
+    repo.run_git(&["commit", "--message", "Add feature"]);
+    repo.run_git(&["checkout", "main"]);
+    repo.run_git(&["config", "diff.relative", "true"]);
+    let subdir = repo.root_path().join("subdir");
+    fs::create_dir(&subdir).unwrap();
+
+    let output = make_snapshot_cmd(&repo, "remove", &["feature-unmerged"], Some(&subdir))
+        .output()
+        .unwrap();
+
+    let branch = repo
+        .git_command()
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/feature-unmerged",
+        ])
+        .run()
+        .unwrap();
+    assert!(
+        branch.status.success(),
+        "unmerged branch must survive; wt remove said: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[rstest]
@@ -1847,12 +3020,8 @@ approved-commands = ["echo 'hook ran' > {}"]
     let _worktree_path = repo.add_worktree("feature-bg");
 
     // Remove in background mode (default)
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_wt"));
-    repo.configure_wt_cmd(&mut cmd);
-    cmd.current_dir(repo.root_path())
-        .args(["remove", "feature-bg"])
-        .output()
-        .unwrap();
+    let mut cmd = repo.wt_command();
+    cmd.args(["remove", "feature-bg"]).output().unwrap();
 
     // Wait for the hook to create the marker file
     wait_for_file(&marker_file);
@@ -1864,8 +3033,21 @@ approved-commands = ["echo 'hook ran' > {}"]
     );
 }
 
+/// The final dirty-worktree gate holds on both execution paths.
+///
+/// Planning validates cleanliness before `pre-remove` runs, so a hook that
+/// dirties the worktree can only be caught by the gate immediately before the
+/// mutation — `stage_worktree_removal`'s, the one every path shares. The
+/// background case is the load-bearing one: it's the default for `wt remove`,
+/// and it stages the worktree by renaming it out from under the user, so a
+/// missing gate there destroys the hook's output rather than refusing.
 #[rstest]
-fn test_pre_remove_hook_dirtying_worktree_blocks_foreground_remove(mut repo: TestRepo) {
+#[case::foreground(&["--foreground"])]
+#[case::background(&[])]
+fn test_pre_remove_hook_dirtying_worktree_blocks_remove(
+    mut repo: TestRepo,
+    #[case] execution_args: &[&str],
+) {
     let hook = "echo dirty > hook-created.txt";
     repo.write_project_config(&format!(r#"pre-remove = "{hook}""#));
     repo.commit("Add config");
@@ -1878,7 +3060,9 @@ approved-commands = ["{hook}"]
     let worktree_path = repo.add_worktree("feature-hook-dirties");
     let output = repo
         .wt_command()
-        .args(["remove", "--foreground", "feature-hook-dirties"])
+        .arg("remove")
+        .args(execution_args)
+        .arg("feature-hook-dirties")
         .output()
         .unwrap();
 
@@ -2182,13 +3366,13 @@ approved-commands = ["exit 1"]
     let worktree_path = repo.add_worktree("feature-cd-test");
 
     // Set up directive files
-    let (cd_path, exec_path, _guard) = directive_files();
+    let (cd_path, _guard) = directive_file();
 
     // Run remove from within the worktree (which would trigger cd to main if it worked)
     let mut cmd = repo.wt_command();
     cmd.args(["remove", "--foreground"]);
     cmd.current_dir(&worktree_path);
-    configure_directive_files(&mut cmd, &cd_path, &exec_path);
+    configure_directive_file(&mut cmd, &cd_path);
     let output = cmd.output().unwrap();
 
     // Command should have failed (hook failure)
@@ -2240,12 +3424,8 @@ approved-commands = ["echo 'hook ran' > {}"]
         .unwrap();
 
     // Remove the branch (no worktree)
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_wt"));
-    repo.configure_wt_cmd(&mut cmd);
-    cmd.current_dir(repo.root_path())
-        .args(["remove", "branch-only"])
-        .output()
-        .unwrap();
+    let mut cmd = repo.wt_command();
+    cmd.args(["remove", "branch-only"]).output().unwrap();
 
     // Marker file should NOT exist - pre-remove hooks only run for worktree removal
     assert!(
@@ -2440,9 +3620,11 @@ fn test_pre_remove_hook_branch_expansion_detached_head(mut repo: TestRepo) {
     let branch_file = repo.root_path().join("branch-expansion.txt");
     let branch_path = branch_file.to_slash_lossy();
 
-    // Create project config with hook that writes {{ branch }} to file
+    // Create project config with a hook that writes {{ branch }} to file,
+    // guarded the way the hook docs prescribe for every optional variable —
+    // a detached worktree is on no branch, so `branch` is unset there.
     repo.write_project_config(&format!(
-        r#"pre-remove = "echo 'branch={{{{ branch }}}}' > {branch_path}""#,
+        r#"pre-remove = "echo 'branch={{% if branch %}}{{{{ branch }}}}{{% endif %}}' > {branch_path}""#,
     ));
     repo.commit("Add config");
 
@@ -2450,7 +3632,7 @@ fn test_pre_remove_hook_branch_expansion_detached_head(mut repo: TestRepo) {
     repo.write_test_config(r#"worktree-path = "../{{ repo }}.{{ branch }}""#);
     repo.write_test_approvals(&format!(
         r#"[projects."../origin"]
-approved-commands = ["echo 'branch={{{{ branch }}}}' > {branch_path}"]
+approved-commands = ["echo 'branch={{% if branch %}}{{{{ branch }}}}{{% endif %}}' > {branch_path}"]
 "#,
     ));
 
@@ -2473,13 +3655,15 @@ approved-commands = ["echo 'branch={{{{ branch }}}}' > {branch_path}"]
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify {{ branch }} expanded to "HEAD" (fallback for detached HEAD state)
+    // Verify {{ branch }} is unset — not the literal "HEAD", which git would
+    // resolve as a ref and which every guard written around `branch` passed
+    // (issue #4009).
     let content =
         std::fs::read_to_string(&branch_file).expect("Hook should have created the branch file");
     assert_eq!(
         content.trim(),
-        "branch=HEAD",
-        "{{ branch }} should expand to 'HEAD' for detached HEAD worktrees"
+        "branch=",
+        "{{ branch }} should be unset for detached HEAD worktrees"
     );
 }
 
@@ -2550,8 +3734,9 @@ fn test_remove_detached_worktree_in_multi(mut repo: TestRepo) {
     // Detach HEAD in feature-b
     repo.detach_head_in_worktree("feature-b");
 
-    // From main, try to multi-remove both
-    // feature-a should succeed, feature-b should fail (detached HEAD)
+    // From main, remove both. feature-a's worktree goes; feature-b was detached,
+    // so its branch has no worktree and only the ref is deleted — with the
+    // directory left behind named in the output rather than passed over (#3769).
     assert_cmd_snapshot!(make_snapshot_cmd(
         &repo,
         "remove",
@@ -3088,17 +4273,23 @@ fn test_remove_background_fallback_on_rename_failure(mut repo: TestRepo) {
 fn block_staged_rename(repo: &TestRepo, worktree_path: &std::path::Path) -> std::path::PathBuf {
     let trash_dir = crate::common::resolve_git_common_dir(repo.root_path()).join("wt/trash");
     std::fs::create_dir_all(&trash_dir).unwrap();
-    let staged_path = trash_dir.join(format!(
-        "{}-{}",
-        worktree_path.file_name().unwrap().to_string_lossy(),
-        crate::common::TEST_EPOCH
-    ));
+    let git_dir = repo
+        .git_command()
+        .args(["rev-parse", "--absolute-git-dir"])
+        .current_dir(worktree_path)
+        .run()
+        .unwrap();
+    assert!(git_dir.status.success(), "{git_dir:?}");
+    let path = std::str::from_utf8(git_dir.stdout.strip_suffix(b"\n").unwrap()).unwrap();
+    let mut staged_name = Path::new(path).file_name().unwrap().to_os_string();
+    staged_name.push(format!("-{}", crate::common::TEST_EPOCH));
+    let staged_path = trash_dir.join(staged_name);
     std::fs::write(&staged_path, "blocking file").unwrap();
     staged_path
 }
 
 /// The rename-failure fallback honors `-D`: an unmerged branch is force-deleted
-/// in the legacy `git worktree remove && git branch -D` command.
+/// by the Rust child after `git worktree remove` succeeds.
 #[rstest]
 fn test_remove_background_fallback_force_delete_branch(mut repo: TestRepo) {
     repo.commit("initial");
@@ -3129,6 +4320,45 @@ fn test_remove_background_fallback_force_delete_branch(mut repo: TestRepo) {
             .run()
             .unwrap();
         String::from_utf8_lossy(&branches.stdout).trim().is_empty()
+    });
+
+    let _ = std::fs::remove_file(&staged_path);
+}
+
+/// The force-delete fallback must pass a flag-like branch after `--`. Git
+/// accepts such refs through plumbing, even though its branch parser cannot
+/// create or delete them without an option separator.
+#[rstest]
+fn test_remove_background_fallback_force_deletes_flag_like_branch(mut repo: TestRepo) {
+    repo.commit("initial");
+    let worktree_path = repo.add_worktree("flag-like-holder");
+    repo.run_git(&["update-ref", "refs/heads/-x", "HEAD"]);
+    repo.run_git_in(&worktree_path, &["symbolic-ref", "HEAD", "refs/heads/-x"]);
+    repo.run_git(&["branch", "-D", "flag-like-holder"]);
+    let staged_path = block_staged_rename(&repo, &worktree_path);
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "--force", "-D", worktree_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wt remove --force -D should start the legacy fallback: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    crate::common::wait_for("flag-like worktree removed by legacy fallback", || {
+        !worktree_path.exists()
+    });
+    crate::common::wait_for("flag-like branch force-deleted by legacy fallback", || {
+        !repo
+            .git_command()
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/-x"])
+            .run()
+            .unwrap()
+            .status
+            .success()
     });
 
     let _ = std::fs::remove_file(&staged_path);
@@ -3533,7 +4763,7 @@ fn test_remove_foreground_with_submodules(mut repo: TestRepo) {
     // Create a local repo to use as a submodule source
     let sub_source = repo.root_path().parent().unwrap().join("sub-source");
     std::fs::create_dir_all(&sub_source).unwrap();
-    repo.run_git_in(&sub_source, &["init"]);
+    repo.run_git_in(&sub_source, &["init", "-b", "main"]);
     std::fs::write(sub_source.join("sub.txt"), "submodule content").unwrap();
     repo.run_git_in(&sub_source, &["add", "sub.txt"]);
     repo.run_git_in(&sub_source, &["commit", "-m", "sub init"]);
@@ -3614,7 +4844,7 @@ fn test_remove_worktree_submodule_dirty_fails_closed(mut repo: TestRepo) {
     // Submodule source.
     let sub_source = repo.root_path().parent().unwrap().join("sub-source-dirty");
     std::fs::create_dir_all(&sub_source).unwrap();
-    repo.run_git_in(&sub_source, &["init"]);
+    repo.run_git_in(&sub_source, &["init", "-b", "main"]);
     std::fs::write(sub_source.join("sub.txt"), "submodule content").unwrap();
     repo.run_git_in(&sub_source, &["add", "sub.txt"]);
     repo.run_git_in(&sub_source, &["commit", "-m", "sub init"]);
@@ -3684,6 +4914,107 @@ fn test_remove_worktree_submodule_dirty_fails_closed(mut repo: TestRepo) {
     );
 }
 
+/// `submodule.<name>.ignore=all` is a display preference, not permission to
+/// delete modifications inside an initialized submodule. This is especially
+/// important because Worktrunk must internally force Git's worktree removal
+/// when initialized submodules are present.
+#[rstest]
+fn test_remove_refuses_dirty_submodule_hidden_by_user_config(mut repo: TestRepo) {
+    let sub_source = repo.root_path().parent().unwrap().join("sub-source-hidden");
+    fs::create_dir_all(&sub_source).unwrap();
+    repo.run_git_in(&sub_source, &["init", "-b", "main"]);
+    fs::write(sub_source.join("sub.txt"), "submodule content").unwrap();
+    repo.run_git_in(&sub_source, &["add", "sub.txt"]);
+    repo.run_git_in(&sub_source, &["commit", "-m", "sub init"]);
+
+    let output = repo
+        .git_command()
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub_source.to_str().unwrap(),
+            "submod",
+        ])
+        .run()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Failed to add submodule: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    repo.run_git(&["commit", "-m", "add submodule"]);
+
+    let worktree_path = repo.add_worktree("feature-submod-hidden-dirty");
+    let output = repo
+        .git_command()
+        .current_dir(&worktree_path)
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+        ])
+        .run()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Failed to init submodule: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    repo.run_git(&["config", "submodule.submod.ignore", "all"]);
+    let changed_file = worktree_path.join("submod/sub.txt");
+    fs::write(&changed_file, "DIRTIED\n").unwrap();
+
+    let hidden = repo
+        .git_command()
+        .current_dir(&worktree_path)
+        .args(["status", "--porcelain"])
+        .run()
+        .unwrap();
+    assert!(
+        hidden.stdout.is_empty(),
+        "the fixture must demonstrate that the user setting hides the dirty submodule"
+    );
+    let forced = repo
+        .git_command()
+        .current_dir(&worktree_path)
+        .args(["status", "--porcelain", "--ignore-submodules=none"])
+        .run()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&forced.stdout).contains("submod"),
+        "the explicit safety query must reveal the dirty submodule"
+    );
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "--foreground", "feature-submod-hidden-dirty"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "remove must refuse a dirty submodule hidden by config; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("submod"),
+        "the refusal must name the dirty submodule; stderr:\n{stderr}"
+    );
+    assert!(
+        worktree_path.exists(),
+        "the hidden dirty submodule's worktree must be preserved"
+    );
+    assert_eq!(
+        fs::read_to_string(changed_file).unwrap(),
+        "DIRTIED\n",
+        "the hidden submodule change must remain recoverable"
+    );
+}
+
 /// Restore write permissions recursively so TempDir cleanup succeeds.
 #[cfg(unix)]
 fn restore_dir_permissions(dir: &std::path::Path) {
@@ -3707,7 +5038,7 @@ fn restore_dir_permissions(dir: &std::path::Path) {
 // convention — `<!-- wt remove (docs-example) -->` in `src/cli/mod.rs`.
 // ============================================================================
 
-/// `wt remove` example for `docs/content/remove.md` — pre-remove hook running
+/// `wt remove` example for `docs/src/content/docs/remove.md` — pre-remove hook running
 /// `flyctl scale count 0`, background cleanup.
 #[rstest]
 fn test_docs_remove_pre_remove_hook(mut repo: TestRepo) {
@@ -3763,6 +5094,41 @@ cleanup = "flyctl scale count 0"
 // --format=json
 // ============================================================================
 
+/// Removing the current worktree by omitting the branch takes a separate
+/// single-worktree path from the named removals above, with its own
+/// `--format=json` emission. The shape must match: one array, one item.
+///
+/// Removal stays backgrounded: `wt` runs with the doomed worktree as its cwd,
+/// and Windows refuses to delete a directory a live process is sitting in, so
+/// `--foreground` would make this a Windows-only failure. The JSON is emitted
+/// either way — the execution mode picks who deletes, not who reports.
+#[rstest]
+fn test_remove_json_current_worktree_no_args(mut repo: TestRepo) {
+    use crate::common::wait_for_worktree_removed;
+
+    repo.commit("initial");
+    let feature_wt = repo.add_worktree("feature");
+
+    let output = repo
+        .wt_command()
+        .args(["remove", "--format=json", "--yes"])
+        .current_dir(&feature_wt)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .ansi_strip()
+        .into_owned();
+    assert!(output.status.success(), "remove should succeed:\n{stderr}");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 1, "one worktree removed, one item:\n{stderr}");
+    assert_eq!(items[0]["branch"], "feature");
+
+    wait_for_worktree_removed(&feature_wt);
+}
+
 #[rstest]
 fn test_remove_json(mut repo: TestRepo) {
     repo.commit("initial");
@@ -3777,27 +5143,6 @@ fn test_remove_json(mut repo: TestRepo) {
             "--yes",
             "--foreground",
         ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-
-    let mut settings = insta::Settings::clone_current();
-    settings.add_filter(r#""path": "[^"]*""#, r#""path": "<PATH>""#);
-    settings.bind(|| {
-        assert_snapshot!(String::from_utf8_lossy(&output.stdout));
-    });
-}
-
-#[cfg(not(target_os = "windows"))] // foreground removal with cwd inside the worktree hits directory locking
-#[rstest]
-fn test_remove_json_current(mut repo: TestRepo) {
-    repo.commit("initial");
-    let feature_wt = repo.add_worktree("feature");
-
-    let output = repo
-        .wt_command()
-        .args(["remove", "--format=json", "--yes", "--foreground"])
-        .current_dir(&feature_wt)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -3832,6 +5177,82 @@ fn test_remove_json_branch_only(repo: TestRepo) {
     assert!(output.status.success());
 
     assert_snapshot!(String::from_utf8_lossy(&output.stdout));
+}
+
+/// `--format=json` carries the detached worktree too. The human output names it
+/// on stderr, which a script consuming stdout never sees — and "a script
+/// checking the exit code sees a clean run" is half of what #3769 reported.
+#[rstest]
+fn test_remove_json_reports_detached_worktree(mut repo: TestRepo) {
+    let worktree_path = repo.add_worktree("json-detached");
+    repo.detach_head_in_worktree("json-detached");
+
+    let output = repo
+        .wt_command()
+        .args([
+            "remove",
+            "json-detached",
+            "--format=json",
+            "--yes",
+            "--foreground",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let entry = &json[0];
+    assert_eq!(entry["kind"], "branch_only");
+    assert_eq!(
+        entry["detached_worktree"]
+            .as_str()
+            .map(std::path::Path::new),
+        Some(worktree_path.as_path()),
+        "json must name the directory the removal left behind: {json}"
+    );
+}
+
+/// Naming the detached worktree by path alongside the branch — the removal the
+/// hint above suggests — removes that directory in the same run, so the
+/// branch-only removal must not report it as left behind.
+#[rstest]
+fn test_remove_branch_and_its_detached_worktree_together(mut repo: TestRepo) {
+    let worktree_path = repo.add_worktree("both-detached");
+    repo.detach_head_in_worktree("both-detached");
+
+    let output = repo
+        .wt_command()
+        .args([
+            "remove",
+            "both-detached",
+            worktree_path.to_str().unwrap(),
+            "--format=json",
+            "--yes",
+            "--foreground",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!worktree_path.exists(), "detached worktree must be removed");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("a detached worktree is @"),
+        "must not point at a directory this run removed; stderr:\n{stderr}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let branch_only = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "branch_only")
+        .unwrap_or_else(|| panic!("expected a branch_only entry: {json}"));
+    assert!(
+        branch_only["detached_worktree"].is_null(),
+        "json must not name a directory this run removed: {json}"
+    );
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -3902,15 +5323,17 @@ fn test_remove_json_multi_with_current(mut repo: TestRepo) {
     assert_eq!(items[1]["kind"], "worktree");
 }
 
-/// `branch_deleted` reports what execution did, not what the plan intended.
+/// `branch_outcome` reports what execution did, not what the plan intended,
+/// and names *why* the branch survived.
 ///
 /// The planner sees `feature` at main's tip and intends to delete it. A
 /// `pre-remove` hook then commits on the branch, so the SafeDelete's re-check
 /// against fresh refs finds it unmerged and declines — the worktree goes, the
 /// branch stays. Reporting the plan here would tell a script the branch was
-/// deleted while it is still on disk.
+/// deleted while it is still on disk, and reporting a bare `false` would leave
+/// it unable to tell this from a retention it asked for.
 #[rstest]
-fn test_remove_json_branch_deleted_reflects_execution(mut repo: TestRepo) {
+fn test_remove_json_branch_outcome_reflects_execution(mut repo: TestRepo) {
     use crate::common::wait_for_worktree_removed;
 
     repo.commit("initial");
@@ -3940,8 +5363,8 @@ fn test_remove_json_branch_deleted_reflects_execution(mut repo: TestRepo) {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["branch"], "feature");
     assert_eq!(
-        items[0]["branch_deleted"], false,
-        "branch_deleted must report the declined deletion, not the plan's intent:\n{stderr}",
+        items[0]["branch_outcome"], "retained_unmerged",
+        "branch_outcome must report the declined deletion and its reason, not the plan's intent:\n{stderr}",
     );
 
     wait_for_worktree_removed(&feature_wt);
@@ -3958,11 +5381,53 @@ fn test_remove_json_branch_deleted_reflects_execution(mut repo: TestRepo) {
     );
 }
 
+/// A retention the caller asked for reads differently from one a guard forced.
+///
+/// This is the contrast the old `branch_deleted` boolean could not draw: both
+/// this run and the declined deletion above left the branch standing and
+/// reported `false`, so an orchestrator could not tell "I asked you to keep
+/// it" from "I could not safely delete it". `--no-delete-branch` never
+/// attempts a deletion, so nothing is retained — there is no outcome to name.
+#[rstest]
+fn test_remove_json_branch_outcome_distinguishes_requested_retention(mut repo: TestRepo) {
+    repo.commit("initial");
+    repo.add_worktree("feature");
+
+    let output = repo
+        .wt_command()
+        .args([
+            "remove",
+            "feature",
+            "--no-delete-branch",
+            "--format=json",
+            "--yes",
+            "--foreground",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .ansi_strip()
+        .into_owned();
+    assert!(output.status.success(), "remove should succeed:\n{stderr}");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let items = json.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["branch"], "feature");
+    assert_eq!(
+        items[0]["branch_outcome"], "not_attempted",
+        "a retention the caller asked for is not a deletion that was refused:\n{stderr}",
+    );
+
+    repo.run_git(&["rev-parse", "--verify", "refs/heads/feature"]);
+}
+
 /// The detached legacy fallback also corrects a broken deletion promise.
 ///
 /// When the rename-into-trash fast path fails, the removal falls back to a
-/// detached `git worktree remove`, and the branch deletion becomes a CAS
-/// shell tail — built in the foreground. A `pre-remove` hook that advances
+/// detached `git worktree remove`, followed by the Rust branch-deletion child
+/// planned in the foreground. A `pre-remove` hook that advances
 /// the branch makes the integration re-check decline the tail, so the branch
 /// definitively survives while the progress message already promised
 /// "worktree & branch". That survival must be warned and reported, exactly as
@@ -4012,8 +5477,8 @@ fn test_remove_fallback_warns_when_no_cas_tail(mut repo: TestRepo) {
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
     assert_eq!(
-        json.as_array().unwrap()[0]["branch_deleted"],
-        false,
+        json.as_array().unwrap()[0]["branch_outcome"],
+        "retained_unmerged",
         "a survival known in the foreground is not a deferral:\n{stderr}",
     );
     // The branch survives with the hook's commit as its tip; the worktree
@@ -4277,7 +5742,7 @@ fn test_remove_pruned_dir_with_sibling_checkout_retains_branch(mut repo: TestRep
     assert_branch_exists(&repo, "feature", true, &stderr);
     assert_not_orphaned(&repo, &survivor, &stderr);
     assert!(
-        stderr.contains("pruned")
+        stderr.contains("Pruned stale worktree")
             && stderr.contains("retained")
             && stderr.contains("still checked out"),
         "output should report the prune and explain the branch was retained\nstderr:\n{stderr}",
@@ -4304,6 +5769,47 @@ fn test_remove_last_live_checkout_deletes_branch(mut repo: TestRepo) {
         !stderr.contains("still checked out"),
         "a stale entry is not a checkout to retain the branch for\nstderr:\n{stderr}",
     );
+}
+
+/// Planning sees one checkout, then an approved `pre-remove` hook creates a
+/// duplicate. The final topology guard must retain the branch and report the
+/// actual checkout race, not mislabel it as ref movement or failed integration.
+#[rstest]
+fn test_pre_remove_hook_new_checkout_retains_branch(mut repo: TestRepo) {
+    let survivor = repo
+        .root_path()
+        .parent()
+        .unwrap()
+        .join("repo.feature-hook-survivor");
+    let hook = "git worktree add --force ../repo.feature-hook-survivor feature-hook-checkout";
+    repo.write_project_config(&format!("pre-remove = {hook:?}"));
+    repo.commit("Add config");
+    repo.write_test_approvals(&format!(
+        r#"[projects."../origin"]
+approved-commands = [{hook:?}]
+"#
+    ));
+    let removed = repo.add_worktree("feature-hook-checkout");
+
+    let settings = setup_snapshot_settings(&repo);
+    settings.bind(|| {
+        assert_cmd_snapshot!(
+            "remove_pre_remove_hook_new_checkout_retains_branch",
+            make_snapshot_cmd(
+                &repo,
+                "remove",
+                &["--foreground", "feature-hook-checkout"],
+                None,
+            )
+        );
+    });
+
+    assert!(
+        !removed.exists(),
+        "the originally planned worktree is removed"
+    );
+    assert_branch_exists(&repo, "feature-hook-checkout", true, "snapshot above");
+    assert_not_orphaned(&repo, &survivor, "snapshot above");
 }
 
 /// Assert git still tracks `branch`'s worktree — that its `.git/worktrees/<id>`
@@ -4378,4 +5884,329 @@ fn test_remove_stale_entry_spares_absent_sibling(mut repo: TestRepo) {
         !listed.contains("branch refs/heads/victim"),
         "the stale entry should have been pruned\n{listed}"
     );
+}
+
+/// An unreadable index prevents normal removal, but disclosure must not veto
+/// explicitly forced removal that Git itself permits. Neighboring data and
+/// the retained branch remain intact.
+#[rstest]
+fn test_force_remove_with_corrupt_index_reports_unreadable_status(mut repo: TestRepo) {
+    let mut target = None;
+    let mut target_index = None;
+    for branch in ["corrupt-index", "git-force-control"] {
+        let worktree = repo.add_worktree(branch);
+        fs::write(worktree.join("untracked.txt"), "keep until forced\n").unwrap();
+        let output = repo
+            .git_command()
+            .args(["rev-parse", "--absolute-git-dir"])
+            .current_dir(&worktree)
+            .run()
+            .unwrap();
+        assert!(output.status.success());
+        let index = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim()).join("index");
+        fs::write(&index, "bad").unwrap();
+        let status = repo
+            .git_command()
+            .args(["status", "--porcelain"])
+            .current_dir(&worktree)
+            .run()
+            .unwrap();
+        assert_eq!(status.status.code(), Some(128));
+        if branch == "git-force-control" {
+            let removal = repo
+                .git_command()
+                .args(["worktree", "remove", "--force"])
+                .arg(&worktree)
+                .run()
+                .unwrap();
+            assert!(
+                removal.status.success(),
+                "{}",
+                String::from_utf8_lossy(&removal.stderr)
+            );
+            assert!(!worktree.exists());
+        } else {
+            target = Some(worktree);
+            target_index = Some(index);
+        }
+    }
+    let worktree = target.unwrap();
+    let index = target_index.unwrap();
+    let branch_head = repo.git_output(&["rev-parse", "refs/heads/corrupt-index"]);
+    let sentinel = repo.root_path().join("main-only.txt");
+    fs::write(&sentinel, "main worktree data\n").unwrap();
+    let refusal = repo
+        .wt_command()
+        .args([
+            "remove",
+            "corrupt-index",
+            "--foreground",
+            "--no-delete-branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refusal.status.success());
+    assert_eq!(fs::read(&index).unwrap(), b"bad");
+    assert_eq!(
+        fs::read_to_string(worktree.join("untracked.txt")).unwrap(),
+        "keep until forced\n"
+    );
+    let removal = repo
+        .wt_command()
+        .args([
+            "remove",
+            "corrupt-index",
+            "--foreground",
+            "--no-delete-branch",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        removal.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removal.stderr)
+    );
+    assert!(!worktree.exists());
+    assert!(!index.exists());
+    assert_eq!(
+        repo.git_output(&["rev-parse", "refs/heads/corrupt-index"]),
+        branch_head
+    );
+    assert_eq!(
+        fs::read_to_string(&sentinel).unwrap(),
+        "main worktree data\n"
+    );
+    setup_snapshot_settings(&repo).bind(|| {
+        assert_snapshot!(
+            "force_remove_corrupt_index",
+            String::from_utf8_lossy(&removal.stderr)
+        );
+    });
+}
+
+/// An interrupted status probe must cancel force removal before data is staged
+/// for deletion, and before the next worktree in a removal batch is touched.
+#[cfg(unix)]
+#[rstest]
+#[case::foreground_sigint(true, false, 2)]
+#[case::background_sigint(false, false, 2)]
+#[case::foreground_sigterm(true, false, 15)]
+#[case::background_sigterm(false, false, 15)]
+#[case::detached_foreground_sigint(true, true, 2)]
+#[case::detached_foreground_sigterm(true, true, 15)]
+fn test_force_remove_interrupted_status_preserves_worktrees(
+    mut repo: TestRepo,
+    #[case] foreground: bool,
+    #[case] detached: bool,
+    #[case] signal: i32,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    let worktree = repo.add_worktree("interrupted-status");
+    let later_worktree = repo.add_worktree("later-worktree");
+    fs::write(worktree.join("untracked.txt"), "preserve this data\n").unwrap();
+    fs::write(
+        later_worktree.join("untracked.txt"),
+        "preserve later data\n",
+    )
+    .unwrap();
+    let branch_head = repo.git_output(&["rev-parse", "refs/heads/interrupted-status"]);
+    if detached {
+        repo.detach_head_in_worktree("interrupted-status");
+        repo.run_git(&["branch", "-d", "interrupted-status"]);
+        let symbolic_head = repo
+            .git_command()
+            .args(["symbolic-ref", "--quiet", "HEAD"])
+            .current_dir(&worktree)
+            .run()
+            .unwrap();
+        assert_eq!(symbolic_head.status.code(), Some(1));
+        assert_eq!(
+            repo.git_command()
+                .args([
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/interrupted-status"
+                ])
+                .run()
+                .unwrap()
+                .status
+                .code(),
+            Some(1)
+        );
+    }
+    let worktrees_before = repo.git_output(&["worktree", "list", "--porcelain"]);
+    let staged_path = crate::common::resolve_git_common_dir(repo.root_path())
+        .join("wt/trash")
+        .join(format!("interrupted-status-{}", crate::common::TEST_EPOCH));
+    assert!(!staged_path.exists());
+    let monitor = repo.root_path().join(".git/interrupt-status");
+    fs::write(
+        &monitor,
+        format!("#!/bin/sh\nkill -{signal} \"$PPID\"\nexit 0\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&monitor, fs::Permissions::from_mode(0o755)).unwrap();
+    repo.run_git(&["config", "core.fsmonitor", monitor.to_str().unwrap()]);
+
+    // Git invokes a real fsmonitor hook during status; the hook interrupts
+    // only its own parent Git process, never the test or Worktrunk process.
+    let status = repo
+        .git_command()
+        .args(["status", "--porcelain"])
+        .current_dir(&worktree)
+        .run()
+        .unwrap();
+    assert_eq!(status.status.signal(), Some(signal));
+
+    let mut command = repo.wt_command();
+    let target = if detached {
+        worktree.to_str().unwrap()
+    } else {
+        "interrupted-status"
+    };
+    command.args([
+        "remove",
+        target,
+        "later-worktree",
+        "--no-delete-branch",
+        "--force",
+    ]);
+    if foreground {
+        command.arg("--foreground");
+    }
+    let removal = command.output().unwrap();
+    assert_eq!(
+        removal.status.signal(),
+        Some(signal),
+        "{}",
+        String::from_utf8_lossy(&removal.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("untracked.txt")).unwrap(),
+        "preserve this data\n"
+    );
+    assert!(worktree.join(".git").is_file());
+    assert!(later_worktree.join(".git").is_file());
+    assert!(!staged_path.exists());
+    assert_eq!(
+        fs::read_to_string(later_worktree.join("untracked.txt")).unwrap(),
+        "preserve later data\n"
+    );
+    assert_eq!(
+        repo.git_output(&["-C", worktree.to_str().unwrap(), "rev-parse", "HEAD"]),
+        branch_head
+    );
+    assert_eq!(
+        repo.git_output(&["worktree", "list", "--porcelain"]),
+        worktrees_before
+    );
+    let stderr = String::from_utf8_lossy(&removal.stderr);
+    assert!(!stderr.contains("Discarding"));
+    assert!(!stderr.contains("discarding"));
+    assert!(!stderr.contains("Removing later-worktree"));
+}
+
+/// The child uses the invoking checkout's target and retains a moved tip,
+/// even when the replacement commit is integrated into that target.
+#[test]
+fn test_detached_delete_child_captured_target_and_tip() {
+    let mut repo = TestRepo::with_initial_commit();
+    let original = repo.git_output(&["rev-parse", "HEAD"]);
+    let invoking = repo.add_worktree("invoking");
+    repo.commit_in_worktree(&invoking, "new.txt", "new content", "new commit");
+    let target = repo.git_output(&["rev-parse", "invoking"]);
+    repo.run_git(&["branch", "feature", &target]);
+
+    let run_child = |tip: &str| {
+        repo.wt_command()
+            .args([
+                "_delete-branch-if-safe",
+                "--branch=feature",
+                &format!("--target={target}"),
+                &format!("--expected-tip={tip}"),
+            ])
+            .output()
+            .unwrap()
+    };
+    // The child runs from main, whose HEAD is behind the invoking target.
+    let output = run_child(&target);
+    assert!(output.status.success(), "{output:?}");
+    assert_branch_exists(
+        &repo,
+        "feature",
+        false,
+        &String::from_utf8_lossy(&output.stderr),
+    );
+
+    repo.run_git(&["branch", "feature", &original]);
+    repo.run_git(&["update-ref", "refs/heads/feature", &target, &original]);
+    let output = run_child(&original);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("moved during deletion"),
+        "{output:?}"
+    );
+    assert_eq!(repo.git_output(&["rev-parse", "feature"]), target);
+}
+
+/// A detached fallback must preserve a new checkout even when its path looks
+/// like a porcelain status field. Branches and checkout paths remain argv data.
+#[cfg(unix)]
+#[rstest]
+fn test_detached_fallback_native_arguments_and_fresh_checkout(mut repo: TestRepo) {
+    use shell_escape::unix::escape;
+
+    let branch = "feature;touch${IFS}PWNED";
+    let parent = repo.root_path().parent().unwrap().to_path_buf();
+    let survivor = parent.join("survivor\nprunable");
+    let removed = parent.join("checkout '$(touch PWNED)");
+    let hook = format!(
+        "git worktree add --force {} {}",
+        escape(survivor.to_str().unwrap().into()),
+        escape(branch.into()),
+    );
+    repo.write_project_config(&format!("pre-remove = {hook:?}"));
+    repo.commit("Add config");
+    repo.write_test_approvals(&format!(
+        r#"[projects."../origin"]
+approved-commands = [{hook:?}]
+"#
+    ));
+    let removed = repo.add_worktree_at_path(branch, &removed);
+    let staged_path = block_staged_rename(&repo, &removed);
+    let output = repo
+        .wt_command()
+        .args(["remove", "--yes", branch])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let log = crate::common::resolve_git_common_dir(repo.root_path())
+        .join("wt/logs")
+        .join(worktrunk::path::sanitize_for_filename(branch))
+        .join("internal/remove.log");
+    let completion = format!(
+        "detached child retained the new checkout; log {} initially {:?}; blocker {}; foreground {output:?}",
+        log.display(),
+        fs::read_to_string(&log),
+        staged_path.display(),
+    );
+    crate::common::wait_for(&completion, || {
+        fs::read_to_string(&log).is_ok_and(|text| text.contains("checked out @"))
+    });
+    assert!(!removed.exists());
+    assert_branch_exists(
+        &repo,
+        branch,
+        true,
+        &String::from_utf8_lossy(&output.stderr),
+    );
+    assert_not_orphaned(&repo, &survivor, "detached child completed");
+    assert!(!repo.root_path().join("PWNED").exists());
+    assert!(!parent.join("PWNED").exists());
+    let _ = fs::remove_file(staged_path);
 }

@@ -1,38 +1,38 @@
 //! `RefSnapshot` — a captured, immutable view of repository ref state.
 //!
 //! A `RefSnapshot` is an explicit, named, point-in-time value: callers
-//! capture it once and thread it through. Unlike an ambient ref-name → SHA
-//! cache, it cannot go stale invisibly when wt updates a ref mid-command —
-//! `wt merge`'s `git update-ref refs/heads/main` is the canonical example.
-//! After a ref-mutating write, the caller captures a new snapshot and uses
-//! it for downstream reads — the old snapshot remains valid as a pre-write
-//! view, but cannot masquerade as current state.
+//! capture it once and thread it through. Which point in time depends on
+//! the constructor. [`Repository::capture_refs`] scans at the call, so after
+//! a ref-mutating write (`wt merge`'s `git update-ref refs/heads/main` is the
+//! canonical example) the caller captures a new snapshot for downstream
+//! reads — the old one remains valid as a pre-write view, but cannot
+//! masquerade as current state. [`Repository::inventory_snapshot`] is as of
+//! the repository's cached branch inventories, for read-only commands whose
+//! rows come from those same inventories.
 //!
 //! # Construction
 //!
 //! [`Repository::capture_refs`] runs one `git for-each-ref refs/heads/`
 //! plus one `git for-each-ref refs/remotes/` and parses both into a
-//! single `RefSnapshot`. [`Repository::capture_refs_with_ahead_behind`]
-//! additionally populates ahead/behind counts: it reads them from the
+//! single `RefSnapshot`. [`Repository::inventory_snapshot`] instead builds
+//! it from the repository's cached branch inventories, which a read-only
+//! command like `wt list` has already scanned for its rows, and optionally
+//! populates ahead/behind counts: it reads them from the
 //! persistent SHA-keyed cache (`ahead-behind/` — content-addressed, so
 //! never stale) and only falls back to a `for-each-ref ...
 //! %(ahead-behind:BASE)` batch walk (git ≥ 2.36) when the cache is cold
 //! for this base, seeding the cache from the batch so later runs are pure
 //! reads. Branches that moved since the last run are left out of the
-//! snapshot map — the per-branch `AheadBehindTask` recomputes (and
+//! snapshot map — the per-branch ahead/behind task recomputes (and
 //! caches) those by SHA in the parallel pool.
 //!
 //! # Lifetime
 //!
-//! The snapshot is a value, not a cache field. There is no `OnceCell`,
-//! no `Arc<DashMap>`, no shared mutable state. Two `capture_refs()`
-//! calls within one command produce two distinct snapshots; neither
-//! invalidates the other. This is intentional — it removes the
-//! "invisible refresh" surface that ambient caching introduces.
+//! The snapshot is a value, not a cache field: nothing refreshes it after
+//! construction. Two `capture_refs()` calls within one command produce two
+//! distinct snapshots; neither invalidates the other.
 
 use std::collections::HashMap;
-
-use anyhow::bail;
 
 use super::branches::LocalBranchInventory;
 use super::{LocalBranch, RemoteBranch, Repository};
@@ -60,7 +60,7 @@ pub struct RefSnapshot {
 
     /// Ahead/behind counts keyed by `(base, head)` ref names.
     /// Populated only when constructed via
-    /// [`Repository::capture_refs_with_ahead_behind`], and even then it
+    /// [`Repository::inventory_snapshot`] with a base, and even then it
     /// may be partial: a branch that moved since its last cache write is
     /// omitted (the per-branch task recomputes it by SHA). On git < 2.36
     /// a cold base yields an empty map. Callers that need ahead/behind for
@@ -76,14 +76,6 @@ impl RefSnapshot {
     /// to handle those should fall back to `git rev-parse` (uncached).
     pub fn resolve(&self, name: &str) -> Option<&str> {
         self.commits.get(name).map(String::as_str)
-    }
-
-    /// Resolve a ref name to its commit SHA, erroring when absent.
-    pub fn must_resolve(&self, name: &str) -> anyhow::Result<&str> {
-        match self.resolve(name) {
-            Some(sha) => Ok(sha),
-            None => bail!("ref not present in snapshot: {name}"),
-        }
     }
 
     /// Look up the configured upstream short name for a local branch.
@@ -139,7 +131,16 @@ impl Repository {
         Ok(build(locals, remotes, HashMap::new()))
     }
 
-    /// Capture current ref state plus ahead/behind counts vs `base`.
+    /// Build a [`RefSnapshot`] from this repository's branch inventories
+    /// ([`Self::local_branches`], [`Self::remote_branches`]), plus
+    /// ahead/behind counts vs `base` when one is given.
+    ///
+    /// Unlike [`Self::capture_refs`], this forks no `for-each-ref` for an
+    /// inventory that is already cached, so the snapshot is as of that
+    /// inventory's first scan in this `Repository`'s lifetime. That suits a
+    /// read-only command that built its rows from the same inventories, like
+    /// `wt list`: rows and snapshot then agree on every SHA. A command that
+    /// moves a ref and then reads it uses `capture_refs`.
     ///
     /// Ahead/behind for `(base, branch)` is content-addressed — a pure
     /// function of the two commit SHAs — so the snapshot map is built from
@@ -147,7 +148,7 @@ impl Repository {
     /// cached (a fresh repo, after `wt config state clear`, or branches
     /// that moved since their last write) the misses are filled by:
     /// - a few misses → left out of the map; the per-branch
-    ///   `AheadBehindTask` recomputes (and caches) them by SHA in the
+    ///   ahead/behind task recomputes (and caches) them by SHA in the
     ///   parallel pool;
     /// - everything cold → one unscoped `for-each-ref %(ahead-behind)
     ///   refs/heads/` walk, results written to the cache;
@@ -162,10 +163,12 @@ impl Repository {
     /// normalized to `(0, 0)`, matching `compute_ahead_behind`. On git <
     /// 2.36 the `%(ahead-behind)` walk yields nothing and the affected
     /// keys stay absent — callers fall back to per-pair queries.
-    pub fn capture_refs_with_ahead_behind(&self, base: &str) -> anyhow::Result<RefSnapshot> {
-        let locals = scan_locals(self)?;
-        let remotes = scan_remotes(self)?;
-        let ahead_behind = self.capture_ahead_behind(base, &locals, &remotes);
+    pub fn inventory_snapshot(&self, base: Option<&str>) -> anyhow::Result<RefSnapshot> {
+        let locals = self.local_branches()?.to_vec();
+        let remotes = self.remote_branches()?.to_vec();
+        let ahead_behind = base.map_or_else(HashMap::new, |base| {
+            self.capture_ahead_behind(base, &locals, &remotes)
+        });
         Ok(build(locals, remotes, ahead_behind))
     }
 
@@ -173,7 +176,7 @@ impl Repository {
     /// local branches, preferring the persistent SHA-keyed cache and
     /// reaching for a `for-each-ref %(ahead-behind)` walk only for the
     /// branches the cache doesn't cover. See
-    /// [`Self::capture_refs_with_ahead_behind`].
+    /// [`Self::inventory_snapshot`].
     fn capture_ahead_behind(
         &self,
         base: &str,
@@ -183,7 +186,7 @@ impl Repository {
         let full_ref = |b: &LocalBranch| format!("refs/heads/{}", b.name);
 
         // The cache is SHA-keyed; we need base's SHA, and it's a branch —
-        // so it's among the refs we just scanned. If somehow it isn't, the
+        // so it's among the inventoried refs. If somehow it isn't, the
         // cache is unreachable for this run: run the batch against the
         // refname (git resolves it), key the snapshot map by refname, and
         // cache nothing.
@@ -291,11 +294,11 @@ impl Repository {
     /// upstream and, for the ones the cache doesn't already cover, runs
     /// one `for-each-ref %(ahead-behind:UPSTREAM_SHA)` walk per unique
     /// upstream SHA — the same shared-graph-traversal win that
-    /// [`Self::capture_refs_with_ahead_behind`] uses for the `main↕`
+    /// [`Self::inventory_snapshot`] uses for the `main↕`
     /// column, scoped to branches sharing one base.
     ///
     /// Mirrors the cache-correctness defenses applied in
-    /// [`Self::capture_refs_with_ahead_behind`]:
+    /// [`Self::inventory_snapshot`]:
     /// `%(ahead-behind:UPSTREAM_SHA)` (not `:UPSTREAM_REFNAME`) so git
     /// counts against the SHA the cache will be keyed by — a tag
     /// shadowing the remote-tracking branch can't poison the entry; the
@@ -314,9 +317,9 @@ impl Repository {
     /// `parse_local_branch_line`), are skipped: nothing to cache. Each
     /// per-upstream group below the same threshold
     /// `capture_ahead_behind` uses for the cold-subset batch is also
-    /// skipped — the per-row `UpstreamTask` will recompute those by SHA
+    /// skipped — the per-row upstream task will recompute those by SHA
     /// in the parallel pool, which beats blocking the pool on a small
-    /// serial batch. Unlike [`Self::capture_refs_with_ahead_behind`]
+    /// serial batch. Unlike [`Self::inventory_snapshot`]
     /// there is no "all cold → unscoped walk" shortcut: each upstream
     /// group's refs are already the maximal set of branches that track
     /// it.
@@ -370,7 +373,7 @@ impl Repository {
         }
 
         // Partition cold vs warm by probing the SHA cache. Warm pairs
-        // need no work — the per-row `UpstreamTask` reads them in
+        // need no work — the per-row upstream task reads them in
         // parallel via `ahead_behind_by_sha`.
         let mut cold_by_upstream: HashMap<String, Vec<String>> = HashMap::new();
         for (branch_ref, branch_sha, upstream_sha) in &candidates {
@@ -619,12 +622,12 @@ mod tests {
     }
 
     #[test]
-    fn must_resolve_errors_on_missing_ref() {
+    fn resolve_returns_none_for_uncaptured_refs() {
         let test = TestRepo::with_initial_commit();
         let repo = Repository::at(test.root_path()).unwrap();
         let snap = repo.capture_refs().unwrap();
 
-        assert!(snap.must_resolve("does-not-exist").is_err());
+        assert_eq!(snap.resolve("does-not-exist"), None);
         // HEAD is intentionally absent — callers fall back to rev-parse.
         assert_eq!(snap.resolve("HEAD"), None);
     }
@@ -639,7 +642,7 @@ mod tests {
         test.run_git(&["checkout", "main"]);
 
         let repo = Repository::at(test.root_path()).unwrap();
-        let snap = repo.capture_refs_with_ahead_behind("main").unwrap();
+        let snap = repo.inventory_snapshot(Some("main")).unwrap();
 
         // The plain capture leaves ahead_behind empty.
         let plain = repo.capture_refs().unwrap();
@@ -664,7 +667,7 @@ mod tests {
 
         // First capture: cold base → runs the batch walk, seeds the cache.
         let repo = Repository::at(test.root_path()).unwrap();
-        let first = repo.capture_refs_with_ahead_behind("main").unwrap();
+        let first = repo.inventory_snapshot(Some("main")).unwrap();
         // Skip on git < 2.36 where the batch silently yields nothing.
         let Some((1, 0)) = first.ahead_behind("main", "refs/heads/feature") else {
             return;
@@ -690,7 +693,7 @@ mod tests {
         // Second capture (fresh repo): every entry is cached → no batch
         // walk → the map reflects the tampered value.
         let repo2 = Repository::at(test.root_path()).unwrap();
-        let second = repo2.capture_refs_with_ahead_behind("main").unwrap();
+        let second = repo2.inventory_snapshot(Some("main")).unwrap();
         assert_eq!(
             second.ahead_behind("main", "refs/heads/feature"),
             Some((7, 3)),
@@ -708,7 +711,7 @@ mod tests {
         test.run_git(&["checkout", "main"]);
 
         let repo = Repository::at(test.root_path()).unwrap();
-        let first = repo.capture_refs_with_ahead_behind("main").unwrap();
+        let first = repo.inventory_snapshot(Some("main")).unwrap();
         // Skip on git < 2.36.
         if first.ahead_behind("main", "refs/heads/feature").is_none() {
             return;
@@ -723,7 +726,7 @@ mod tests {
         test.run_git(&["checkout", "main"]);
 
         let repo2 = Repository::at(test.root_path()).unwrap();
-        let snap = repo2.capture_refs_with_ahead_behind("main").unwrap();
+        let snap = repo2.inventory_snapshot(Some("main")).unwrap();
         // Partial-warm path: feature moved → omitted from the snapshot map
         // (its per-branch task recomputes by SHA); main is still present.
         assert_eq!(snap.ahead_behind("main", "refs/heads/feature"), None);
@@ -743,7 +746,7 @@ mod tests {
 
         // First capture: everything cold → unscoped batch seeds the cache.
         let repo = Repository::at(test.root_path()).unwrap();
-        let first = repo.capture_refs_with_ahead_behind("main").unwrap();
+        let first = repo.inventory_snapshot(Some("main")).unwrap();
         if first.ahead_behind("main", "refs/heads/feat0").is_none() {
             return; // git < 2.36 — %(ahead-behind) unsupported
         }
@@ -759,7 +762,7 @@ mod tests {
         test.run_git(&["checkout", "main"]);
 
         let repo2 = Repository::at(test.root_path()).unwrap();
-        let snap = repo2.capture_refs_with_ahead_behind("main").unwrap();
+        let snap = repo2.inventory_snapshot(Some("main")).unwrap();
         for i in 0..10 {
             assert_eq!(
                 snap.ahead_behind("main", &format!("refs/heads/feat{i}")),
@@ -783,7 +786,7 @@ mod tests {
         test.run_git(&["checkout", "main"]);
 
         let repo = Repository::at(test.root_path()).unwrap();
-        let snap = repo.capture_refs_with_ahead_behind("main").unwrap();
+        let snap = repo.inventory_snapshot(Some("main")).unwrap();
         // git < 2.36 — %(ahead-behind) unsupported, nothing seeded.
         if snap.ahead_behind("main", "refs/heads/main").is_none() {
             return;
@@ -823,7 +826,7 @@ mod tests {
         test.run_git(&["commit", "-m", "feat"]);
 
         let repo = Repository::at(test.root_path()).unwrap();
-        let snap = repo.capture_refs_with_ahead_behind("origin/trunk").unwrap();
+        let snap = repo.inventory_snapshot(Some("origin/trunk")).unwrap();
         let Some((1, 0)) = snap.ahead_behind("origin/trunk", "refs/heads/feature") else {
             // git < 2.36: batch silently empty; the cache is unreachable
             // for it, but resolve-via-remote still ran without panicking.
@@ -846,7 +849,7 @@ mod tests {
         // cache, and the `for-each-ref %(ahead-behind:...)` walk fails too.
         // The snapshot is still valid, just without ahead/behind.
         let snap = repo
-            .capture_refs_with_ahead_behind("definitely-not-a-ref")
+            .inventory_snapshot(Some("definitely-not-a-ref"))
             .unwrap();
         assert_eq!(
             snap.ahead_behind("definitely-not-a-ref", "refs/heads/main"),
@@ -938,6 +941,28 @@ mod tests {
         // still holds the pre-move value.
         let snap = repo.capture_refs().unwrap();
         assert_eq!(snap.resolve("main"), Some(main_after.as_str()));
+    }
+
+    #[test]
+    fn inventory_snapshot_reuses_cached_inventories() {
+        // The counterpart of the test above: `wt list` builds its rows from
+        // the inventories, then its snapshot, and the two must agree, so
+        // `inventory_snapshot` reads the cached scans rather than rescanning.
+        let test = TestRepo::with_initial_commit();
+        let main_before = test.git_output(&["rev-parse", "main"]);
+        test.run_git(&["update-ref", "refs/remotes/origin/main", &main_before]);
+        let repo = Repository::at(test.root_path()).unwrap();
+        repo.local_branches().unwrap();
+        repo.remote_branches().unwrap();
+
+        std::fs::write(test.root_path().join("a.txt"), "x\n").unwrap();
+        test.run_git(&["add", "a.txt"]);
+        test.run_git(&["commit", "-m", "advance main"]);
+        test.run_git(&["update-ref", "refs/remotes/origin/main", "main"]);
+
+        let snap = repo.inventory_snapshot(None).unwrap();
+        assert_eq!(snap.resolve("main"), Some(main_before.as_str()));
+        assert_eq!(snap.resolve("origin/main"), Some(main_before.as_str()));
     }
 
     #[test]

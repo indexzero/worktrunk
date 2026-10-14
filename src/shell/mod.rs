@@ -9,8 +9,6 @@ mod detection;
 mod paths;
 mod utils;
 
-use std::io::{BufRead, BufReader};
-
 use askama::Template;
 
 // Re-export public types and functions
@@ -19,12 +17,12 @@ pub use detection::{
     is_shell_integration_line_for_uninstall_any_cmd, scan_for_detection_details,
 };
 pub use paths::{
-    completion_path, config_paths, home_dir_required, legacy_fish_conf_d_path,
-    line_based_config_paths, nushell_autoload_candidates,
+    fish_completion_path, fish_config_dir, home_dir_required, line_based_config_paths,
+    nushell_autoload_candidates, profile_query_interruption,
 };
 pub use utils::{
-    AncestorShell, ancestor_shell, current_shell, current_shell_name, detect_zsh_compinit,
-    extract_filename_from_path,
+    AncestorShell, ZshStartupScope, ancestor_shell, current_shell, current_shell_name,
+    extract_filename_from_path, probe_zsh_compdef,
 };
 
 /// Validate a command name before embedding it in shell syntax or shell-owned paths.
@@ -156,18 +154,6 @@ impl Shell {
         paths::legacy_fish_conf_d_path(cmd)
     }
 
-    /// Returns the path to the native completion directory for this shell.
-    ///
-    /// The `cmd` parameter affects the completion filename (e.g., `wt.fish` or `git-wt.fish`).
-    ///
-    /// Note: Bash and Zsh use inline lazy completions in the init script.
-    /// Only Fish uses a separate completion file at ~/.config/fish/completions/
-    /// (installed by `wt config shell install`) that uses $WORKTRUNK_BIN to bypass
-    /// the shell function wrapper.
-    pub fn completion_path(&self, cmd: &str) -> Result<std::path::PathBuf, std::io::Error> {
-        paths::completion_path(*self, cmd)
-    }
-
     /// Returns the line to add to the config file for shell integration.
     ///
     /// The `cmd` parameter specifies the command name (e.g., `wt` or `git-wt`).
@@ -207,44 +193,6 @@ impl Shell {
             }
         }
     }
-
-    /// Check if this shell has integration configured.
-    ///
-    /// Used for accurate warning messages that need to know about the user's
-    /// current shell specifically (e.g., "installed but not active" vs "not
-    /// installed").
-    pub fn is_shell_configured(&self, cmd: &str) -> Result<bool, std::io::Error> {
-        let config_paths = self.config_paths(cmd)?;
-
-        // For fish, also check legacy conf.d location
-        let mut paths_to_check = config_paths;
-        if matches!(self, Shell::Fish)
-            && let Ok(legacy) = Shell::legacy_fish_conf_d_path(cmd)
-        {
-            paths_to_check.push(legacy);
-        }
-
-        for path in paths_to_check {
-            if !path.exists() {
-                continue;
-            }
-            if Self::file_has_integration(&path, cmd)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Check if a file contains shell integration lines for the given command.
-    fn file_has_integration(path: &std::path::Path, cmd: &str) -> Result<bool, std::io::Error> {
-        let file = std::fs::File::open(path)?;
-        for line in BufReader::new(file).lines() {
-            if is_shell_integration_line(&line?, cmd) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
 }
 
 /// Shell integration configuration
@@ -267,11 +215,15 @@ impl ShellInit {
                 let template = BashTemplate {
                     shell_name: self.shell.to_string(),
                     cmd: &self.cmd,
+                    cmd_ident: clap_completer_ident(&self.cmd),
                 };
                 template.render()
             }
             Shell::Zsh => {
-                let template = ZshTemplate { cmd: &self.cmd };
+                let template = ZshTemplate {
+                    cmd: &self.cmd,
+                    cmd_ident: clap_completer_ident(&self.cmd),
+                };
                 template.render()
             }
             Shell::Fish => {
@@ -300,12 +252,30 @@ impl ShellInit {
     }
 }
 
+/// Suffix of the completer function clap names its registration script after.
+///
+/// clap builds it as `<prefix><command name with '-' replaced by '_'>`
+/// (`_clap_complete_git_wt`, `_clap_dynamic_completer_git_wt`), so the lazy
+/// loader in the bash and zsh templates has to apply the same escaping to guard
+/// on and call the function the registration actually defines. The registration
+/// is emitted under this command name via `WORKTRUNK_COMPLETE_NAME`, which the
+/// templates set on the eval — see `registration_name` in `src/completion.rs`.
+///
+/// This is the one place the rule is encoded: `make_zsh_autoload_safe` in
+/// `src/commands/init.rs` rewrites the same function name in clap's zsh
+/// registration and calls here for it, so a change to clap's escaping is one
+/// edit rather than two sites that can drift apart silently.
+pub fn clap_completer_ident(cmd: &str) -> String {
+    cmd.replace('-', "_")
+}
+
 /// Bash shell template
 #[derive(Template)]
 #[template(path = "bash.sh", escape = "none")]
 struct BashTemplate<'a> {
     shell_name: String,
     cmd: &'a str,
+    cmd_ident: String,
 }
 
 /// Zsh shell template
@@ -313,6 +283,7 @@ struct BashTemplate<'a> {
 #[template(path = "zsh.zsh", escape = "none")]
 struct ZshTemplate<'a> {
     cmd: &'a str,
+    cmd_ident: String,
 }
 
 /// Fish shell template (full function for `wt config shell init fish`)
@@ -475,14 +446,10 @@ mod tests {
 
     #[test]
     fn test_shell_config_paths_returns_paths() {
-        // All shells should return at least one config path
-        let shells = [
-            Shell::Bash,
-            Shell::Zsh,
-            Shell::Fish,
-            Shell::Nushell,
-            Shell::PowerShell,
-        ];
+        // Shells whose paths don't depend on querying an installed shell.
+        // Nushell and Unix PowerShell paths come from `nu` and `pwsh`, and are
+        // empty without them.
+        let shells = [Shell::Bash, Shell::Zsh, Shell::Fish];
         for shell in shells {
             let result = shell.config_paths("wt");
             assert!(result.is_ok(), "Failed to get config paths for {:?}", shell);
@@ -490,32 +457,6 @@ mod tests {
             assert!(
                 !paths.is_empty(),
                 "No config paths returned for {:?}",
-                shell
-            );
-        }
-    }
-
-    #[test]
-    fn test_shell_completion_path_returns_path() {
-        // All shells should return a completion path
-        let shells = [
-            Shell::Bash,
-            Shell::Zsh,
-            Shell::Fish,
-            Shell::Nushell,
-            Shell::PowerShell,
-        ];
-        for shell in shells {
-            let result = shell.completion_path("wt");
-            assert!(
-                result.is_ok(),
-                "Failed to get completion path for {:?}",
-                shell
-            );
-            let path = result.unwrap();
-            assert!(
-                !path.as_os_str().is_empty(),
-                "Empty completion path for {:?}",
                 shell
             );
         }
@@ -557,37 +498,11 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_completion_path_with_custom_prefix() {
-        let prefix = "my-prefix";
-
-        // Bash completion should include prefix in path
-        let bash_path = Shell::Bash.completion_path(prefix).unwrap();
+    fn test_fish_completion_path_with_custom_prefix() {
+        let fish_path = fish_completion_path("my-prefix").unwrap();
         assert!(
-            bash_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("my-prefix")),
-            "Bash completion should include prefix"
-        );
-
-        // Fish completion should include prefix in filename
-        let fish_path = Shell::Fish.completion_path(prefix).unwrap();
-        assert!(
-            fish_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("my-prefix.fish")),
-            "Fish completion should include prefix in filename"
-        );
-
-        // Zsh completion should include prefix
-        let zsh_path = Shell::Zsh.completion_path(prefix).unwrap();
-        assert!(
-            zsh_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("_my-prefix")),
-            "Zsh completion should include underscore prefix"
+            fish_path.ends_with("completions/my-prefix.fish"),
+            "{fish_path:?}"
         );
     }
 
@@ -643,35 +558,6 @@ mod tests {
             "{shell} config_line({prefix:?}) not detected:\n  {line}"
         );
     }
-
-    #[test]
-    fn test_file_has_integration() {
-        use std::io::Write;
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let bashrc = temp_dir.path().join(".bashrc");
-
-        // Write a valid integration line
-        let mut file = std::fs::File::create(&bashrc).unwrap();
-        writeln!(
-            file,
-            r#"if command -v wt >/dev/null 2>&1; then eval "$(command wt config shell init bash)"; fi"#
-        )
-        .unwrap();
-
-        // Test file_has_integration directly
-        assert!(Shell::file_has_integration(&bashrc, "wt").unwrap());
-        assert!(!Shell::file_has_integration(&bashrc, "git-wt").unwrap());
-
-        // Test with non-matching content
-        let empty_file = temp_dir.path().join(".zshrc");
-        std::fs::write(&empty_file, "# just a comment\n").unwrap();
-        assert!(!Shell::file_has_integration(&empty_file, "wt").unwrap());
-    }
-
-    // Note: is_shell_configured() is not unit-tested because it requires
-    // mutating HOME env var (unsafe). It's tested indirectly via integration
-    // tests that exercise the shell integration warning paths.
 
     // PowerShell config_line evaluation test is in tests/integration_tests/shell_powershell.rs
     // because it needs CARGO_BIN_EXE_wt which is only available in integration tests.

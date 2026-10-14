@@ -42,7 +42,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 ///
 /// `working_dir` is the global `-C <path>` flag — applied as the child's
 /// current directory so the tethered command can run from a subdirectory (a
-/// dev server in `frontend/`, zola in `docs/`), the same way `-C` works for
+/// dev server in `frontend/`, Astro in `docs/`), the same way `-C` works for
 /// custom subcommands. The reaper still watches the captured cwd (the worktree
 /// root), not `working_dir`, so a relative `-C docs` server is still torn down
 /// when the worktree is removed.
@@ -61,12 +61,12 @@ pub(crate) fn step_tether(command: &[String], working_dir: Option<&Path>) -> Res
         cmd.current_dir(dir);
     }
     // Direct exec, no implicit shell, same as `wt step for-each`; scrub the
-    // directive env vars so a long-lived child can't write to the parent
-    // shell's cd/exec directive files.
+    // directive env vars so a long-lived child can't redirect the parent
+    // shell's directory.
     worktrunk::shell_exec::scrub_directive_env_vars(&mut cmd);
     set_new_process_group(&mut cmd);
     let mut trace = CommandTrace::new(None, &command.join(" "));
-    let mut child = match cmd.spawn() {
+    let mut child = match worktrunk::shell_exec::spawn(&mut cmd) {
         Ok(child) => child,
         Err(e) => {
             trace.fail(&e);
@@ -122,8 +122,8 @@ fn set_new_process_group(cmd: &mut std::process::Command) {
 
     // POSIX `setpgid(0, 0)`: the child's pid is the new group's id, so
     // `child.id()` is the pgid. Children that do not re-`setpgid` (node,
-    // Vite, the esbuild sidecar) stay in the group. Same invariant the
-    // foreground runner relies on (`shell_exec.rs`).
+    // Vite, the esbuild sidecar) stay in the group. Timeout-bounded captures
+    // use the same ownership (`shell_exec.rs`).
     cmd.process_group(0);
 }
 
@@ -144,7 +144,7 @@ fn kill_process_tree(pid: u32) {
     // `process_group(0)` made the child its own group leader, so the pid is
     // the pgid. The bounded TERM → KILL escalation reaches every member,
     // including a child that reparented to PID 1 after the leader exited.
-    worktrunk::shell_exec::forward_signal_with_escalation(pid as i32, signal_hook::consts::SIGTERM);
+    worktrunk::shell_exec::terminate_process_group(pid as i32);
 }
 
 #[cfg(windows)]
@@ -152,11 +152,12 @@ fn kill_process_tree(pid: u32) {
     // No killable process group on Windows; `taskkill /T` terminates the
     // process and its child tree, `/F` forces. Best-effort: the pid may
     // already be gone (self-exit) or have left detached children.
-    let _ = std::process::Command::new("taskkill")
+    let mut command = std::process::Command::new("taskkill");
+    command
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::null());
+    let _ = worktrunk::shell_exec::spawn(&mut command).and_then(|mut child| child.wait());
 }
 
 #[cfg(test)]

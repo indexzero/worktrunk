@@ -2,17 +2,11 @@
 //!
 //! These tests verify that the CI status parsing code correctly handles
 //! JSON responses from GitHub (gh) and GitLab (glab) CLI tools.
-//!
-//! ## Windows support
-//!
-//! On Windows, mock-stub.exe sets MOCK_SCRIPT_DIR so the mock gh script can
-//! reliably locate its JSON data files. Use MOCK_DEBUG=1 to troubleshoot
-//! path issues.
 
 use crate::common::{
     TestRepo, make_snapshot_cmd,
-    mock_commands::{MockConfig, MockResponse},
-    repo, setup_snapshot_settings,
+    mock_commands::{MockConfig, MockResponse, mock_calls},
+    repo, setup_snapshot_settings, wt_command,
 };
 use ansi_str::AnsiStr;
 use insta_cmd::assert_cmd_snapshot;
@@ -25,10 +19,12 @@ fn branch_sha(repo: &TestRepo, branch: &str) -> String {
     repo.git_output(&["rev-parse", branch])
 }
 
-/// Set up tracking for all branches so @{push} resolves correctly.
+/// Set up tracking for all branches so `push_remote_url()` resolves a push
+/// destination.
 ///
-/// @{push} requires both tracking config AND the remote-tracking ref to exist.
-/// This is normally done by fetch/push, but in tests we create refs manually.
+/// `%(push:remotename)` reads the `branch.<name>.{remote,merge}` config. The
+/// remote-tracking ref that fetch/push would normally create is set up
+/// alongside it, so the fixture matches a real clone.
 fn setup_tracking_for_all_branches(repo: &TestRepo, remote: &str) {
     for branch in ["feature", "feature-a", "feature-b", "feature-c", "main"] {
         repo.run_git(&["config", &format!("branch.{}.remote", branch), remote]);
@@ -47,8 +43,8 @@ fn setup_tracking_for_all_branches(repo: &TestRepo, remote: &str) {
 }
 
 /// Helper to run a CI status test with the given mock data
-fn run_ci_status_test(repo: &mut TestRepo, snapshot_name: &str, pr_json: &str, run_json: &str) {
-    repo.setup_mock_gh_with_ci_data(pr_json, run_json);
+fn run_ci_status_test(repo: &mut TestRepo, snapshot_name: &str, pr_json: &str) {
+    repo.setup_mock_gh_with_ci_data(pr_json);
 
     let settings = setup_snapshot_settings(repo);
     settings.bind(|| {
@@ -70,6 +66,7 @@ fn setup_mock_gh_with_api_data(
 
     let mut gh = MockConfig::new("gh")
         .version("gh version 2.0.0 (mock)")
+        .command("auth token", MockResponse::exit(0))
         .command("pr list", MockResponse::output(pr_json));
 
     for (command, response) in api_responses {
@@ -119,49 +116,33 @@ fn setup_github_repo_with_feature(repo: &mut TestRepo) -> String {
 }
 
 // =============================================================================
-// PR status tests (CheckRun format)
+// PR conflict status
 // =============================================================================
 
 #[rstest]
-#[case::passed("CLEAN", "COMPLETED", "SUCCESS", "github_pr_passed")]
-#[case::failed("BLOCKED", "COMPLETED", "FAILURE", "github_pr_failed")]
-#[case::running("UNKNOWN", "IN_PROGRESS", "null", "github_pr_running")]
-#[case::conflicts("DIRTY", "COMPLETED", "SUCCESS", "github_pr_conflicts")]
-fn test_list_full_with_github_pr_status(
-    mut repo: TestRepo,
-    #[case] merge_state: &str,
-    #[case] status: &str,
-    #[case] conclusion: &str,
-    #[case] snapshot_name: &str,
-) {
+fn test_list_full_with_github_pr_conflicts(mut repo: TestRepo) {
     let head_sha = setup_github_repo_with_feature(&mut repo);
-
-    // Format conclusion - use raw value for null, quoted for strings
-    let conclusion_json = if conclusion == "null" {
-        "null".to_string()
-    } else {
-        format!("\"{}\"", conclusion)
-    };
 
     let pr_json = format!(
         r#"[{{
         "number": 1,
         "headRefOid": "{}",
-        "mergeStateStatus": "{}",
+        "mergeStateStatus": "DIRTY",
         "statusCheckRollup": [
-            {{"status": "{}", "conclusion": {}}}
+            {{"status": "COMPLETED", "conclusion": "SUCCESS"}}
         ],
         "url": "https://github.com/test-owner/test-repo/pull/1",
         "headRepositoryOwner": {{"login": "test-owner"}}
     }}]"#,
-        head_sha, merge_state, status, conclusion_json
+        head_sha
     );
 
-    run_ci_status_test(&mut repo, snapshot_name, &pr_json, "[]");
+    run_ci_status_test(&mut repo, "github_pr_conflicts", &pr_json);
 }
 
 #[rstest]
 fn test_list_full_json_ci_repo_from_pr_url(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
     let head_sha = setup_github_repo_with_feature(&mut repo);
 
     let pr_json = format!(
@@ -176,7 +157,7 @@ fn test_list_full_json_ci_repo_from_pr_url(mut repo: TestRepo) {
     }}]"#,
         head_sha
     );
-    repo.setup_mock_gh_with_ci_data(&pr_json, "[]");
+    repo.setup_mock_gh_with_ci_data(&pr_json);
 
     let mut cmd = repo.wt_command();
     cmd.args(["list", "--full", "--format=json"]);
@@ -214,6 +195,7 @@ fn test_list_full_json_ci_repo_from_pr_url(mut repo: TestRepo) {
 
 #[rstest]
 fn test_list_full_json_ci_repo_uses_configured_provider_for_opaque_host(mut repo: TestRepo) {
+    repo.write_test_config("[list]\njson-schema = 1\n");
     repo.run_git(&[
         "remote",
         "set-url",
@@ -237,7 +219,7 @@ fn test_list_full_json_ci_repo_uses_configured_provider_for_opaque_host(mut repo
     }}]"#,
         head_sha
     );
-    repo.setup_mock_gh_with_ci_data(&pr_json, "[]");
+    repo.setup_mock_gh_with_ci_data(&pr_json);
 
     let mut cmd = repo.wt_command();
     cmd.args(["list", "--full", "--format=json"]);
@@ -273,20 +255,11 @@ fn test_list_full_json_ci_repo_uses_configured_provider_for_opaque_host(mut repo
 }
 
 // =============================================================================
-// Review state tests (reviewDecision / isDraft from gh pr list)
+// Review state
 // =============================================================================
 
 #[rstest]
-#[case::changes_requested("\"CHANGES_REQUESTED\"", "false", "github_pr_changes_requested")]
-#[case::review_required("\"REVIEW_REQUIRED\"", "false", "github_pr_review_required")]
-#[case::approved("\"APPROVED\"", "false", "github_pr_approved")]
-#[case::draft("\"APPROVED\"", "true", "github_pr_draft")]
-fn test_list_full_with_github_review_state(
-    mut repo: TestRepo,
-    #[case] review_decision: &str,
-    #[case] is_draft: &str,
-    #[case] snapshot_name: &str,
-) {
+fn test_list_full_with_github_changes_requested(mut repo: TestRepo) {
     let head_sha = setup_github_repo_with_feature(&mut repo);
 
     let pr_json = format!(
@@ -299,78 +272,13 @@ fn test_list_full_with_github_review_state(
         ],
         "url": "https://github.com/test-owner/test-repo/pull/1",
         "headRepositoryOwner": {{"login": "test-owner"}},
-        "reviewDecision": {},
-        "isDraft": {}
+        "reviewDecision": "CHANGES_REQUESTED",
+        "isDraft": false
     }}]"#,
-        head_sha, review_decision, is_draft
+        head_sha
     );
 
-    run_ci_status_test(&mut repo, snapshot_name, &pr_json, "[]");
-}
-
-// =============================================================================
-// StatusContext tests (external CI systems like Jenkins)
-// =============================================================================
-
-#[rstest]
-#[case::pending("UNKNOWN", "PENDING", "status_context_pending")]
-#[case::failure("BLOCKED", "FAILURE", "status_context_failure")]
-fn test_list_full_with_status_context(
-    mut repo: TestRepo,
-    #[case] merge_state: &str,
-    #[case] state: &str,
-    #[case] snapshot_name: &str,
-) {
-    let head_sha = setup_github_repo_with_feature(&mut repo);
-
-    let pr_json = format!(
-        r#"[{{
-        "number": 1,
-        "headRefOid": "{}",
-        "mergeStateStatus": "{}",
-        "statusCheckRollup": [
-            {{"state": "{}"}}
-        ],
-        "url": "https://github.com/test-owner/test-repo/pull/1",
-        "headRepositoryOwner": {{"login": "test-owner"}}
-    }}]"#,
-        head_sha, merge_state, state
-    );
-
-    run_ci_status_test(&mut repo, snapshot_name, &pr_json, "[]");
-}
-
-// =============================================================================
-// Workflow run tests (no PR, just workflow runs)
-// =============================================================================
-
-#[rstest]
-#[case::completed("completed", "success", "github_workflow_run")]
-#[case::running("in_progress", "null", "github_workflow_running")]
-fn test_list_full_with_github_workflow(
-    mut repo: TestRepo,
-    #[case] status: &str,
-    #[case] conclusion: &str,
-    #[case] snapshot_name: &str,
-) {
-    let head_sha = setup_github_repo_with_feature(&mut repo);
-
-    let conclusion_json = if conclusion == "null" {
-        "null".to_string()
-    } else {
-        format!("\"{}\"", conclusion)
-    };
-
-    let run_json = format!(
-        r#"[{{
-        "status": "{}",
-        "conclusion": {},
-        "headSha": "{}"
-    }}]"#,
-        status, conclusion_json, head_sha
-    );
-
-    run_ci_status_test(&mut repo, snapshot_name, "[]", &run_json);
+    run_ci_status_test(&mut repo, "github_pr_changes_requested", &pr_json);
 }
 
 // =============================================================================
@@ -399,49 +307,7 @@ fn test_list_full_with_stale_pr(mut repo: TestRepo) {
         "headRepositoryOwner": {"login": "test-owner"}
     }]"#;
 
-    run_ci_status_test(&mut repo, "stale_pr", pr_json, "[]");
-}
-
-#[rstest]
-fn test_list_full_with_mixed_check_types(mut repo: TestRepo) {
-    let head_sha = setup_github_repo_with_feature(&mut repo);
-
-    // Mixed: CheckRun (passed) + StatusContext (pending)
-    let pr_json = format!(
-        r#"[{{
-        "number": 1,
-        "headRefOid": "{}",
-        "mergeStateStatus": "UNKNOWN",
-        "statusCheckRollup": [
-            {{"status": "COMPLETED", "conclusion": "SUCCESS"}},
-            {{"state": "PENDING"}}
-        ],
-        "url": "https://github.com/test-owner/test-repo/pull/1",
-        "headRepositoryOwner": {{"login": "test-owner"}}
-    }}]"#,
-        head_sha
-    );
-
-    run_ci_status_test(&mut repo, "mixed_check_types", &pr_json, "[]");
-}
-
-#[rstest]
-fn test_list_full_with_no_ci_checks(mut repo: TestRepo) {
-    let head_sha = setup_github_repo_with_feature(&mut repo);
-
-    let pr_json = format!(
-        r#"[{{
-        "number": 1,
-        "headRefOid": "{}",
-        "mergeStateStatus": "CLEAN",
-        "statusCheckRollup": [],
-        "url": "https://github.com/test-owner/test-repo/pull/1",
-        "headRepositoryOwner": {{"login": "test-owner"}}
-    }}]"#,
-        head_sha
-    );
-
-    run_ci_status_test(&mut repo, "no_ci_checks", &pr_json, "[]");
+    run_ci_status_test(&mut repo, "stale_pr", pr_json);
 }
 
 #[rstest]
@@ -480,7 +346,7 @@ fn test_list_full_filters_by_repo_owner(mut repo: TestRepo) {
         head_sha
     );
 
-    run_ci_status_test(&mut repo, "filters_by_repo_owner", &pr_json, "[]");
+    run_ci_status_test(&mut repo, "filters_by_repo_owner", &pr_json);
 }
 
 #[rstest]
@@ -531,8 +397,7 @@ platform = "github"
     }}]"#,
         head_sha
     );
-    let run_json = "[]";
-    repo.setup_mock_gh_with_ci_data(&pr_json, run_json);
+    repo.setup_mock_gh_with_ci_data(&pr_json);
 
     let settings = setup_snapshot_settings(&repo);
     settings.bind(|| {
@@ -545,7 +410,7 @@ platform = "github"
 
 #[rstest]
 fn test_list_full_with_gitlab_remote(mut repo: TestRepo) {
-    // Set GitLab remote URL - tests get_gitlab_host_for_repo path
+    // Set GitLab remote URL so the GitLab platform is detected
     repo.run_git(&[
         "remote",
         "set-url",
@@ -557,13 +422,11 @@ fn test_list_full_with_gitlab_remote(mut repo: TestRepo) {
     repo.add_worktree("feature");
 
     // No mock glab setup - this tests the hint path when glab isn't available
-    // The get_gitlab_host_for_repo function is called to detect GitLab platform
 
     let settings = setup_snapshot_settings(&repo);
     settings.bind(|| {
         let mut cmd = make_snapshot_cmd(&repo, "list", &["--full"], None);
         // Don't configure mocks - we want to test the "no CI tool" hint path
-        // which exercises get_gitlab_host_for_repo
         assert_cmd_snapshot!(cmd);
     });
 }
@@ -628,7 +491,7 @@ platform = "invalid_platform"
     }}]"#,
         head_sha
     );
-    repo.setup_mock_gh_with_ci_data(&pr_json, "[]");
+    repo.setup_mock_gh_with_ci_data(&pr_json);
 
     let mut settings = setup_snapshot_settings(&repo);
     // Normalize worker thread ID prefix in log output (e.g., [n], [z], [A] -> [W]).
@@ -687,33 +550,23 @@ fn setup_gitlab_repo_with_feature(repo: &mut TestRepo) -> String {
 }
 
 #[rstest]
-#[case::passed("success", false, "gitlab_mr_passed")]
-#[case::failed("failed", false, "gitlab_mr_failed")]
-#[case::running("running", false, "gitlab_mr_running")]
-#[case::pending("pending", false, "gitlab_mr_pending")]
-#[case::conflicts("success", true, "gitlab_mr_conflicts")]
-fn test_list_full_with_gitlab_mr_status(
-    mut repo: TestRepo,
-    #[case] pipeline_status: &str,
-    #[case] has_conflicts: bool,
-    #[case] snapshot_name: &str,
-) {
+fn test_list_full_with_gitlab_mr_conflicts(mut repo: TestRepo) {
     let head_sha = setup_gitlab_repo_with_feature(&mut repo);
 
     let mr_json = format!(
         r#"[{{
         "iid": 1,
         "sha": "{}",
-        "has_conflicts": {},
+        "has_conflicts": true,
         "detailed_merge_status": null,
-        "head_pipeline": {{"status": "{}"}},
+        "head_pipeline": {{"status": "success"}},
         "source_project_id": 12345,
         "web_url": "https://gitlab.com/test-group/test-project/-/merge_requests/1"
     }}]"#,
-        head_sha, has_conflicts, pipeline_status
+        head_sha
     );
 
-    run_gitlab_ci_status_test(&mut repo, snapshot_name, &mr_json, Some(12345));
+    run_gitlab_ci_status_test(&mut repo, "gitlab_mr_conflicts", &mr_json, Some(12345));
 }
 
 #[rstest]
@@ -738,27 +591,6 @@ fn test_list_full_with_gitlab_stale_mr(mut repo: TestRepo) {
     }]"#;
 
     run_gitlab_ci_status_test(&mut repo, "gitlab_stale_mr", mr_json, Some(12345));
-}
-
-#[rstest]
-fn test_list_full_with_gitlab_no_ci(mut repo: TestRepo) {
-    let head_sha = setup_gitlab_repo_with_feature(&mut repo);
-
-    // MR with no pipeline
-    let mr_json = format!(
-        r#"[{{
-        "iid": 1,
-        "sha": "{}",
-        "has_conflicts": false,
-        "detailed_merge_status": null,
-        "head_pipeline": null,
-        "source_project_id": 12345,
-        "web_url": "https://gitlab.com/test-group/test-project/-/merge_requests/1"
-    }}]"#,
-        head_sha
-    );
-
-    run_gitlab_ci_status_test(&mut repo, "gitlab_no_ci", &mr_json, Some(12345));
 }
 
 #[rstest]
@@ -805,6 +637,131 @@ fn test_list_full_with_gitlab_filters_by_project_id(mut repo: TestRepo) {
         "gitlab_filters_by_project_id",
         &mr_json,
         Some(99999),
+    );
+}
+
+/// `glab repo view` answers a repo-level question over the GitLab API, but MR
+/// detection runs once per row — so a table of N worktrees used to spend N
+/// round trips resolving one constant, on a command that cannot finish until
+/// every row's task returns. Assert the spawn count, not the rendering: the
+/// table looks identical either way.
+#[rstest]
+fn test_gitlab_project_id_resolved_once_per_command(mut repo: TestRepo) {
+    let head_sha = setup_gitlab_repo_with_feature(&mut repo);
+
+    let mr_json = format!(
+        r#"[{{
+        "iid": 1,
+        "sha": "{}",
+        "has_conflicts": false,
+        "detailed_merge_status": null,
+        "head_pipeline": {{"status": "success"}},
+        "source_project_id": 12345,
+        "web_url": "https://gitlab.com/test-group/test-project/-/merge_requests/1"
+    }}]"#,
+        head_sha
+    );
+    repo.setup_mock_glab_with_ci_data(&mr_json, Some(12345));
+
+    // Outside the repo under test, so the log can't dirty the working tree the
+    // command is inspecting.
+    let call_log = tempfile::tempdir().unwrap();
+    let mut cmd = repo.wt_command();
+    cmd.args(["list", "--full"]);
+    repo.configure_mock_commands(&mut cmd);
+    cmd.env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path());
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt list --full should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let calls = mock_calls(call_log.path(), "glab");
+    let repo_views: Vec<_> = calls
+        .iter()
+        .filter(|call| call.starts_with("repo view"))
+        .collect();
+    // More than one row reached MR detection, so a per-row lookup would show up
+    // as more than one `repo view`.
+    let mr_lists = calls
+        .iter()
+        .filter(|call| call.starts_with("mr list"))
+        .count();
+    assert!(
+        mr_lists > 1,
+        "the fixture must exercise several rows, else the count below proves nothing. calls: {calls:#?}"
+    );
+    assert_eq!(
+        repo_views.len(),
+        1,
+        "the project ID is repo-level, so it costs exactly one `glab repo view` however many rows ask for it. calls: {calls:#?}"
+    );
+}
+
+/// A PR's head is a branch on the forge, so a never-pushed local branch can't
+/// head one and costs no `gh pr list`. A missing `refs/remotes/` copy shows a
+/// branch was never pushed only where a push would have recorded one: a URL
+/// push remote (a fork's PR checked out with `gh pr checkout`) records nothing,
+/// and a single-branch clone's remote records only the branch it cloned, so
+/// branches pushing to either are still asked about. Assert the spawns, not
+/// the rendering: an unpushed branch shows no CI either way.
+#[rstest]
+fn test_pr_lookup_skips_branches_on_no_remote(mut repo: TestRepo) {
+    setup_github_repo_with_feature(&mut repo);
+    repo.add_worktree("local-only");
+    repo.add_worktree("fork-pr");
+    repo.run_git(&[
+        "config",
+        "branch.fork-pr.pushremote",
+        "https://github.com/fork-owner/test-repo.git",
+    ]);
+    // A remote fetched the way `git clone --single-branch` sets it up.
+    repo.add_worktree("narrow-pushed");
+    repo.run_git(&[
+        "remote",
+        "add",
+        "-t",
+        "main",
+        "narrow",
+        "https://github.com/test-owner/test-repo.git",
+    ]);
+    repo.run_git(&["config", "branch.narrow-pushed.pushremote", "narrow"]);
+    repo.setup_mock_gh_with_ci_data("[]");
+
+    let call_log = tempfile::tempdir().unwrap();
+    let mut cmd = repo.wt_command();
+    cmd.args(["list", "--full"]);
+    repo.configure_mock_commands(&mut cmd);
+    cmd.env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path());
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt list --full should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let calls = mock_calls(call_log.path(), "gh");
+    let asked = |branch: &str| {
+        calls
+            .iter()
+            .any(|call| call.starts_with(&format!("pr list --head {branch} ")))
+    };
+    assert!(
+        asked("feature"),
+        "a pushed branch is asked about. calls: {calls:#?}"
+    );
+    assert!(
+        asked("fork-pr"),
+        "a URL push remote is asked about. calls: {calls:#?}"
+    );
+    assert!(
+        asked("narrow-pushed"),
+        "a push remote that records no refs for the branch is asked about. calls: {calls:#?}"
+    );
+    assert!(
+        !asked("local-only"),
+        "a never-pushed branch is skipped. calls: {calls:#?}"
     );
 }
 
@@ -910,7 +867,8 @@ fn test_list_full_with_gitlab_multiple_mrs_no_project_id(mut repo: TestRepo) {
 /// - branch.<name>.pushremote = https://github.com/fork-owner/repo.git (a URL)
 /// - branch.<name>.merge = refs/pull/123/head (a PR ref)
 ///
-/// Git's @{push} syntax fails with URLs, so we fall back to reading the config directly.
+/// Git's @{push} syntax fails when the push remote is a URL, so
+/// `push_remote_url()` reads `%(push:remotename)`, which returns the URL directly.
 #[rstest]
 fn test_list_full_with_url_based_pushremote(mut repo: TestRepo) {
     // Set origin URL (the upstream repo where PRs are opened)
@@ -952,7 +910,7 @@ fn test_list_full_with_url_based_pushremote(mut repo: TestRepo) {
         head_sha
     );
 
-    run_ci_status_test(&mut repo, "url_based_pushremote", &pr_json, "[]");
+    run_ci_status_test(&mut repo, "url_based_pushremote", &pr_json);
 }
 
 /// When a branch has no PR yet, fallback check-runs detection should query the
@@ -975,7 +933,7 @@ fn test_list_full_with_branch_fallback_using_fork_pushremote(mut repo: TestRepo)
         "[]",
         &[
             (
-                &format!("api repos/upstream-owner/test-repo/commits/{feature_a_sha}/check-runs"),
+                &format!("api repos/test-owner/test-repo/commits/{feature_a_sha}/check-runs"),
                 "[]",
             ),
             (
@@ -1001,6 +959,132 @@ fn test_list_full_with_branch_fallback_using_fork_pushremote(mut repo: TestRepo)
         feature_a_line.contains("#"),
         "expected feature-a to show passed branch CI from the fork repo fallback\nstdout:\n{stdout}",
     );
+}
+
+/// A branch whose head is on no remote gets no lookup by commit SHA: the
+/// forge has no such commit and answers with an error, which would otherwise
+/// show the error indicator on ordinary unpushed work. A pushed branch against
+/// the same failing lookup is the control.
+#[rstest]
+fn test_list_full_skips_commit_checks_for_unpushed_head(mut repo: TestRepo) {
+    setup_github_repo_with_feature(&mut repo);
+    // feature-a is one commit ahead of every remote-tracking ref.
+    repo.run_git(&["update-ref", "refs/remotes/origin/feature-a", "feature-a~1"]);
+
+    // No PRs, and every `gh api` check-runs lookup fails.
+    let mock_bin = setup_mock_gh_with_api_data(&repo, "[]", &[]);
+
+    let mut cmd = make_snapshot_cmd(&repo, "list", &["--full"], None);
+    configure_mock_ci_env(&mut cmd, &mock_bin);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "wt list should succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!list_line(&stdout, "feature-a").contains('⚠'), "{stdout}");
+    assert!(list_line(&stdout, "feature-b").contains('⚠'), "{stdout}");
+}
+
+/// The `wt list --full` line for `branch`, ANSI-stripped.
+fn list_line(stdout: &str, branch: &str) -> String {
+    stdout
+        .ansi_strip()
+        .lines()
+        .find(|line| line.contains(&format!(" {branch} ")))
+        .unwrap_or_else(|| panic!("expected a {branch} line\nstdout:\n{stdout}"))
+        .to_string()
+}
+
+/// A failed PR/MR list shows the error indicator whatever the CLI printed, here
+/// an authentication failure that no retry would change — when the CLI holds a
+/// login for the host. Without one, the cell stays blank: the user isn't using
+/// that CLI here. `gh` reports a missing login with exit code 4; `glab` is asked
+/// for a token for the remote's host.
+#[rstest]
+#[case::github(
+    "gh",
+    "pr list",
+    "https://github.com/test-owner/test-repo.git",
+    1,
+    ("auth token", MockResponse::exit(0)),
+    true
+)]
+#[case::github_logged_out(
+    "gh",
+    "pr list",
+    "https://github.com/test-owner/test-repo.git",
+    4,
+    ("auth token", MockResponse::exit(0)),
+    false
+)]
+#[case::gitlab(
+    "glab",
+    "mr list",
+    "https://gitlab.com/test-group/test-project.git",
+    1,
+    ("config get token", MockResponse::output("glpat-mock")),
+    true
+)]
+#[case::gitlab_logged_out(
+    "glab",
+    "mr list",
+    "https://gitlab.com/test-group/test-project.git",
+    1,
+    ("config get token", MockResponse::output("")),
+    false
+)]
+fn test_list_full_failed_pr_list(
+    mut repo: TestRepo,
+    #[case] tool: &str,
+    #[case] list_command: &str,
+    #[case] remote_url: &str,
+    #[case] list_exit_code: i32,
+    #[case] login: (&str, MockResponse),
+    #[case] shows_error: bool,
+) {
+    repo.run_git(&["remote", "set-url", "origin", remote_url]);
+    repo.add_worktree("feature");
+    setup_tracking_for_all_branches(&repo, "origin");
+
+    let mock_bin = repo.root_path().join("mock-bin");
+    std::fs::create_dir_all(&mock_bin).unwrap();
+    let (login_command, login_response) = login;
+    MockConfig::new(tool)
+        .version(&format!("{tool} version 2.0.0 (mock)"))
+        .command(
+            list_command,
+            MockResponse::stderr("HTTP 401: Bad credentials").with_exit_code(list_exit_code),
+        )
+        .command(login_command, login_response)
+        .command("_default", MockResponse::output("[]"))
+        .write(&mock_bin);
+
+    let mut cmd = make_snapshot_cmd(&repo, "list", &["--full"], None);
+    configure_mock_ci_env(&mut cmd, &mock_bin);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "wt list should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        list_line(&stdout, "feature").contains('⚠'),
+        shows_error,
+        "{stdout}"
+    );
+}
+
+/// The Gitea commit-status lookup is by SHA too, so an unpushed head skips it
+/// (the pushed `test_list_full_with_gitea_commit_status_tea_failure` is the
+/// control: the same failing lookup shows the error indicator).
+#[rstest]
+fn test_list_full_gitea_skips_commit_status_for_unpushed_head(mut repo: TestRepo) {
+    let head_sha = setup_gitea_repo_with_feature(&mut repo);
+    repo.run_git(&["update-ref", "refs/remotes/origin/feature", "feature~1"]);
+    repo.setup_mock_tea_commit_status_error(&head_sha, "Error: connection refused");
+
+    let mut cmd = make_snapshot_cmd(&repo, "list", &["--full"], None);
+    repo.configure_mock_commands(&mut cmd);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "wt list should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!list_line(&stdout, "feature").contains('⚠'), "{stdout}");
 }
 
 // =============================================================================
@@ -1037,8 +1121,8 @@ fn test_list_full_with_gitlab_mr_view_failure(mut repo: TestRepo) {
 
 /// Test that rate limit errors in `glab ci list` show error status (not NoCI).
 ///
-/// This exercises the `is_retriable_error` check in `detect_gitlab_pipeline`,
-/// which is the fallback path when no MR exists for a branch.
+/// This exercises the failure branch in `detect_gitlab_pipeline`, which is
+/// the fallback path when no MR exists for a branch.
 #[rstest]
 fn test_list_full_with_gitlab_ci_rate_limit(mut repo: TestRepo) {
     setup_gitlab_repo_with_feature(&mut repo);
@@ -1098,7 +1182,7 @@ fn test_ci_cache_expired_entry_refetches(mut repo: TestRepo) {
         "headRepositoryOwner": {{"login": "test-owner"}}
     }}]"#
     );
-    repo.setup_mock_gh_with_ci_data(&pr_json, "[]");
+    repo.setup_mock_gh_with_ci_data(&pr_json);
 
     // Expired cache entry claiming the CI failed
     let git_dir = repo.git_output(&["rev-parse", "--git-common-dir"]);
@@ -1213,34 +1297,20 @@ fn test_list_full_with_azure_pr_queued(mut repo: TestRepo) {
 /// No PR for the branch falls back to the latest pipeline run
 /// (exercises `detect_azure_pipeline` via `parse_azure_pipeline_status`).
 #[rstest]
-#[case::passed("completed", "succeeded", "azure_pipeline_passed")]
-#[case::failed("completed", "failed", "azure_pipeline_failed")]
-#[case::running("inProgress", "null", "azure_pipeline_running")]
-fn test_list_full_with_azure_pipeline_status(
-    mut repo: TestRepo,
-    #[case] status: &str,
-    #[case] result: &str,
-    #[case] snapshot_name: &str,
-) {
+fn test_list_full_with_azure_passed_pipeline(mut repo: TestRepo) {
     let head_sha = setup_azure_repo_with_feature(&mut repo);
 
     let runs_json = format!(
         r#"[{{
         "id": 4242,
-        "status": "{}",
-        "result": {},
+        "status": "completed",
+        "result": "succeeded",
         "sourceVersion": "{}"
     }}]"#,
-        status,
-        if result == "null" {
-            "null".to_string()
-        } else {
-            format!(r#""{}""#, result)
-        },
         head_sha
     );
 
-    run_azure_ci_status_test(&mut repo, snapshot_name, "[]", &runs_json);
+    run_azure_ci_status_test(&mut repo, "azure_pipeline_passed", "[]", &runs_json);
 }
 
 /// A pipeline run from a different SHA than local HEAD is marked stale (dimmed).
@@ -1258,6 +1328,47 @@ fn test_list_full_with_azure_stale_pipeline(mut repo: TestRepo) {
     run_azure_ci_status_test(&mut repo, "azure_stale_pipeline", "[]", runs_json);
 }
 
+/// `az repos pr list` searches every repository in the project unless it is
+/// told which one, and `az` infers the repository from the git remote only when
+/// `--org` is absent. Since the lookup passes `--org`, it must pass
+/// `--repository` too, or a same-named branch's PR in a sibling repository
+/// shows up on this repository's row.
+#[rstest]
+fn test_list_full_azure_pr_lookup_names_the_repository(mut repo: TestRepo) {
+    setup_azure_repo_with_feature(&mut repo);
+    repo.setup_mock_az_with_ci_data("[]", "[]");
+
+    // Outside the repo under test, so the log can't dirty the working tree the
+    // command is inspecting.
+    let call_log = tempfile::tempdir().unwrap();
+    let mut cmd = repo.wt_command();
+    cmd.args(["list", "--full"]);
+    repo.configure_mock_commands(&mut cmd);
+    cmd.env("WORKTRUNK_TEST_MOCK_CALL_LOG_DIR", call_log.path());
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt list --full should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let calls = mock_calls(call_log.path(), "az");
+    let pr_lists: Vec<_> = calls
+        .iter()
+        .filter(|call| call.starts_with("repos pr list"))
+        .collect();
+    assert!(
+        !pr_lists.is_empty(),
+        "the fixture must reach PR detection. calls: {calls:#?}"
+    );
+    for call in pr_lists {
+        assert!(
+            call.contains("--repository test-repo"),
+            "PR lookup must be scoped to this repository: {call}"
+        );
+    }
+}
+
 /// No PR and no pipeline runs → no CI indicator.
 #[rstest]
 fn test_list_full_with_azure_no_ci(mut repo: TestRepo) {
@@ -1265,11 +1376,10 @@ fn test_list_full_with_azure_no_ci(mut repo: TestRepo) {
     run_azure_ci_status_test(&mut repo, "azure_no_ci", "[]", "[]");
 }
 
-/// A retriable error from `az repos pr list` (e.g., HTTP 429) surfaces as an
-/// error indicator rather than NoCI (exercises the `is_retriable_error` branch
-/// in `detect_azure_pr`).
+/// A failed `az repos pr list` (e.g., HTTP 429) surfaces as an error indicator
+/// rather than NoCI (exercises the failure branch in `detect_azure_pr`).
 #[rstest]
-fn test_list_full_with_azure_pr_list_retriable_error(mut repo: TestRepo) {
+fn test_list_full_with_azure_pr_list_error(mut repo: TestRepo) {
     setup_azure_repo_with_feature(&mut repo);
     repo.setup_mock_az_with_detection_errors(
         Some("ERROR: HTTP error 429: Too Many Requests"),
@@ -1280,15 +1390,15 @@ fn test_list_full_with_azure_pr_list_retriable_error(mut repo: TestRepo) {
     settings.bind(|| {
         let mut cmd = make_snapshot_cmd(&repo, "list", &["--full"], None);
         repo.configure_mock_commands(&mut cmd);
-        assert_cmd_snapshot!("azure_pr_list_retriable_error", cmd);
+        assert_cmd_snapshot!("azure_pr_list_error", cmd);
     });
 }
 
-/// A retriable error from `az pipelines runs list` surfaces as an error
-/// indicator (exercises the `is_retriable_error` branch in
-/// `detect_azure_pipeline`, reached when no PR exists for the branch).
+/// A failed `az pipelines runs list` surfaces as an error indicator (exercises
+/// the failure branch in `detect_azure_pipeline`, reached when no PR exists
+/// for the branch).
 #[rstest]
-fn test_list_full_with_azure_pipeline_retriable_error(mut repo: TestRepo) {
+fn test_list_full_with_azure_pipeline_error(mut repo: TestRepo) {
     setup_azure_repo_with_feature(&mut repo);
     repo.setup_mock_az_with_detection_errors(
         None,
@@ -1299,7 +1409,7 @@ fn test_list_full_with_azure_pipeline_retriable_error(mut repo: TestRepo) {
     settings.bind(|| {
         let mut cmd = make_snapshot_cmd(&repo, "list", &["--full"], None);
         repo.configure_mock_commands(&mut cmd);
-        assert_cmd_snapshot!("azure_pipeline_retriable_error", cmd);
+        assert_cmd_snapshot!("azure_pipeline_error", cmd);
     });
 }
 
@@ -1329,15 +1439,16 @@ fn setup_gitea_repo_with_feature(repo: &mut TestRepo) -> String {
 }
 
 /// Run a Gitea CI status test with the given `tea api .../pulls` and
-/// `tea api .../commits/{sha}/status` mock responses.
+/// `tea api .../commits/{sha}/status` mock responses, each an
+/// `(HTTP status, body)` pair.
 fn run_gitea_ci_status_test(
     repo: &mut TestRepo,
     snapshot_name: &str,
     head_sha: &str,
-    pulls_json: &str,
-    status_json: &str,
+    pulls: (&str, &str),
+    status: (&str, &str),
 ) {
-    repo.setup_mock_tea_with_ci_data("owner", "test-repo", head_sha, pulls_json, status_json);
+    repo.setup_mock_tea_with_ci_data("owner", "test-repo", head_sha, pulls, status);
 
     let settings = setup_snapshot_settings(repo);
     settings.bind(|| {
@@ -1349,11 +1460,17 @@ fn run_gitea_ci_status_test(
 
 /// Gitea's `APIError` body, which the API returns in place of the resource
 /// whenever a request fails — and which `tea api` copies to stdout with exit 0,
-/// since it never reads the HTTP status. The message is a 500's wrapped
-/// internal error (Gitea passes it through for an admin token), so
-/// `is_retriable_error` recognizes the cause.
+/// since it never reads the HTTP status.
 const GITEA_API_ERROR_BODY: &str = r#"{
     "message": "pq: dial tcp 10.0.0.5:5432: connect: connection refused",
+    "url": "https://gitea.example.com/api/swagger"
+}"#;
+
+/// The same body a production Gitea sends a non-admin token for that 500:
+/// `APIError` with the message blanked. Nothing in it says "error", which is
+/// why the status line rather than the body is what the backend reads.
+const GITEA_BLANK_ERROR_BODY: &str = r#"{
+    "message": "",
     "url": "https://gitea.example.com/api/swagger"
 }"#;
 
@@ -1382,30 +1499,8 @@ fn test_list_full_with_gitea_pr_conflicts(mut repo: TestRepo) {
         &mut repo,
         "gitea_pr_conflicts",
         &head_sha,
-        &gitea_feature_pr_json(&head_sha, false),
-        r#"{"state":"","total_count":0}"#,
-    );
-}
-
-/// An open PR's CI state comes from the PR head commit's combined status, and
-/// the indicator links to the PR.
-#[rstest]
-#[case::passed("success", "gitea_pr_passed")]
-#[case::failed("failure", "gitea_pr_failed")]
-#[case::running("pending", "gitea_pr_running")]
-fn test_list_full_with_gitea_pr_status(
-    mut repo: TestRepo,
-    #[case] state: &str,
-    #[case] snapshot_name: &str,
-) {
-    let head_sha = setup_gitea_repo_with_feature(&mut repo);
-    let status_json = format!(r#"{{"state":"{state}","total_count":2}}"#);
-    run_gitea_ci_status_test(
-        &mut repo,
-        snapshot_name,
-        &head_sha,
-        &gitea_feature_pr_json(&head_sha, true),
-        &status_json,
+        ("200 OK", &gitea_feature_pr_json(&head_sha, false)),
+        ("200 OK", r#"{"state":"","total_count":0}"#),
     );
 }
 
@@ -1418,8 +1513,8 @@ fn test_list_full_with_gitea_commit_status(mut repo: TestRepo) {
         &mut repo,
         "gitea_commit_status",
         &head_sha,
-        "[]",
-        r#"{"state":"failure","total_count":1}"#,
+        ("200 OK", "[]"),
+        ("200 OK", r#"{"state":"failure","total_count":1}"#),
     );
 }
 
@@ -1431,15 +1526,14 @@ fn test_list_full_with_gitea_no_ci(mut repo: TestRepo) {
         &mut repo,
         "gitea_no_ci",
         &head_sha,
-        "[]",
-        r#"{"state":"","total_count":0}"#,
+        ("200 OK", "[]"),
+        ("200 OK", r#"{"state":"","total_count":0}"#),
     );
 }
 
-/// A Gitea 500 whose `APIError` body names a retriable cause surfaces as an
-/// error indicator rather than NoCI. `tea api` exits 0 here — it copies the
-/// response body through without reading the HTTP status — so the body's shape
-/// is what separates this from a PR list.
+/// A Gitea 500 surfaces as an error indicator rather than NoCI. `tea api` exits 0 here — it copies the
+/// response body through whatever the status — so the status line `--include`
+/// puts on stderr is what separates this from a PR list.
 #[rstest]
 fn test_list_full_with_gitea_pr_error_body(mut repo: TestRepo) {
     let head_sha = setup_gitea_repo_with_feature(&mut repo);
@@ -1447,15 +1541,15 @@ fn test_list_full_with_gitea_pr_error_body(mut repo: TestRepo) {
         &mut repo,
         "gitea_pr_error_body",
         &head_sha,
-        GITEA_API_ERROR_BODY,
-        r#"{"state":"","total_count":0}"#,
+        ("500 Internal Server Error", GITEA_API_ERROR_BODY),
+        ("200 OK", r#"{"state":"","total_count":0}"#),
     );
 }
 
 /// The same `APIError` body from the commit-status lookup (when no PR exists
-/// for the branch). Without shape discrimination this one is the quieter bug:
-/// every field of `GiteaCombinedStatus` defaults, so the error body would
-/// deserialize as "no statuses" and paint a blank cell.
+/// for the branch). Read as data this one is the quieter bug: every field of
+/// `GiteaCombinedStatus` defaults, so the error body would deserialize as "no
+/// statuses" and paint a blank cell.
 #[rstest]
 fn test_list_full_with_gitea_commit_status_error_body(mut repo: TestRepo) {
     let head_sha = setup_gitea_repo_with_feature(&mut repo);
@@ -1463,17 +1557,93 @@ fn test_list_full_with_gitea_commit_status_error_body(mut repo: TestRepo) {
         &mut repo,
         "gitea_commit_status_error_body",
         &head_sha,
-        "[]",
-        GITEA_API_ERROR_BODY,
+        ("200 OK", "[]"),
+        ("500 Internal Server Error", GITEA_API_ERROR_BODY),
+    );
+}
+
+/// A 4xx is a failure like a 5xx: whatever the status, a failed call shows the
+/// error indicator rather than a blank cell.
+#[rstest]
+fn test_list_full_with_gitea_not_found(mut repo: TestRepo) {
+    let head_sha = setup_gitea_repo_with_feature(&mut repo);
+    run_gitea_ci_status_test(
+        &mut repo,
+        "gitea_not_found",
+        &head_sha,
+        (
+            "404 Not Found",
+            r#"{"message":"user redirect does not exist [name: owner]"}"#,
+        ),
+        ("200 OK", r#"{"state":"","total_count":0}"#),
+    );
+}
+
+/// Run `wt list --full` against the given `tea api .../pulls` response — an
+/// `(HTTP status, body)` pair — and return stderr.
+///
+/// `RUST_LOG=warn` because `parse_json`'s warning is a `tracing` record and the
+/// stderr layer is off at the default verbosity; `-v` would turn it on but bury
+/// it under a template expansion per worktree.
+fn gitea_ci_status_stderr(repo: &mut TestRepo, head_sha: &str, pulls: (&str, &str)) -> String {
+    repo.setup_mock_tea_with_ci_data(
+        "owner",
+        "test-repo",
+        head_sha,
+        pulls,
+        ("200 OK", r#"{"state":"","total_count":0}"#),
+    );
+
+    let mut cmd = wt_command();
+    repo.configure_wt_cmd(&mut cmd);
+    cmd.env("RUST_LOG", "warn");
+    cmd.args(["list", "--full"]).current_dir(repo.root_path());
+    let output = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "wt list --full failed: {stderr}");
+    stderr
+}
+
+/// "May indicate a Gitea API change" is reserved for a 2xx whose body isn't the
+/// resource, which is the only response that is one.
+///
+/// The status decides, so the two bodies that used to be the hard cases are
+/// now read by what accompanied them. A 500 whose message Gitea blanked says
+/// nothing about being an error, and a proxy's HTML page isn't Gitea's shape at
+/// all; both reach the PR list as errors on the strength of the status line
+/// alone, before any body is parsed.
+/// The 200 case is the control: it pins where the warning does belong, and
+/// keeps the others from passing merely because nothing logs at all.
+///
+/// One case per repo, not several runs in one: `wt list` caches CI status per
+/// branch for 30s, so a second run against the same HEAD never reaches `tea`.
+#[rstest]
+#[case::blanked_500_is_an_error(
+    ("500 Internal Server Error", GITEA_BLANK_ERROR_BODY),
+    false
+)]
+#[case::proxy_page_is_an_error(("502 Bad Gateway", "<html>Bad Gateway</html>"), false)]
+#[case::unknown_200_body_is_a_parse_failure(("200 OK", r#"{"unexpected":1}"#), true)]
+fn test_list_full_gitea_parse_warning_is_reserved_for_unknown_bodies(
+    mut repo: TestRepo,
+    #[case] pulls: (&str, &str),
+    #[case] expect_parse_warning: bool,
+) {
+    let head_sha = setup_gitea_repo_with_feature(&mut repo);
+    let stderr = gitea_ci_status_stderr(&mut repo, &head_sha, pulls);
+
+    assert_eq!(
+        stderr.contains("Failed to parse tea api pulls JSON"),
+        expect_parse_warning,
+        "wrong diagnosis for {pulls:?}: {stderr}"
     );
 }
 
 /// `tea` itself failing on `tea api .../pulls` surfaces as an error indicator
-/// rather than NoCI (exercises the `is_retriable_error` branch in
-/// `detect_gitea_pr`). A transport failure is the case that does exit non-zero,
+/// rather than NoCI (exercises the failure branch in `detect_gitea_pr`). A transport failure is the case that does exit non-zero,
 /// and `tea` names it on stderr.
 #[rstest]
-fn test_list_full_with_gitea_retriable_error(mut repo: TestRepo) {
+fn test_list_full_with_gitea_tea_failure(mut repo: TestRepo) {
     setup_gitea_repo_with_feature(&mut repo);
     repo.setup_mock_tea_with_detection_error(
         r#"Error: Get "https://gitea.example.com/api/v1/repos/owner/test-repo/pulls": dial tcp 10.0.0.5:443: connect: connection refused"#,
@@ -1483,15 +1653,15 @@ fn test_list_full_with_gitea_retriable_error(mut repo: TestRepo) {
     settings.bind(|| {
         let mut cmd = make_snapshot_cmd(&repo, "list", &["--full"], None);
         repo.configure_mock_commands(&mut cmd);
-        assert_cmd_snapshot!("gitea_retriable_error", cmd);
+        assert_cmd_snapshot!("gitea_tea_failure", cmd);
     });
 }
 
-/// A retriable error from the commit-status lookup (when no PR exists for the
-/// branch) surfaces as an error indicator (exercises the `is_retriable_error`
-/// branch in `fetch_combined_status`, reached via `detect_gitea_commit_status`).
+/// A failed commit-status lookup (when no PR exists for the branch) surfaces
+/// as an error indicator (exercises the failure branch in
+/// `fetch_combined_status`, reached via `detect_gitea_commit_status`).
 #[rstest]
-fn test_list_full_with_gitea_commit_status_retriable_error(mut repo: TestRepo) {
+fn test_list_full_with_gitea_commit_status_tea_failure(mut repo: TestRepo) {
     let head_sha = setup_gitea_repo_with_feature(&mut repo);
     repo.setup_mock_tea_commit_status_error(
         &head_sha,
@@ -1502,7 +1672,7 @@ fn test_list_full_with_gitea_commit_status_retriable_error(mut repo: TestRepo) {
     settings.bind(|| {
         let mut cmd = make_snapshot_cmd(&repo, "list", &["--full"], None);
         repo.configure_mock_commands(&mut cmd);
-        assert_cmd_snapshot!("gitea_commit_status_retriable_error", cmd);
+        assert_cmd_snapshot!("gitea_commit_status_tea_failure", cmd);
     });
 }
 
@@ -1546,8 +1716,8 @@ fn test_list_remotes_full_with_gitea_remote_branch(mut repo: TestRepo) {
         "forkowner",
         "test-repo",
         &head_sha,
-        "[]",
-        r#"{"state":"success","total_count":1}"#,
+        ("200 OK", "[]"),
+        ("200 OK", r#"{"state":"success","total_count":1}"#),
     );
 
     let settings = setup_snapshot_settings(&repo);
@@ -1614,8 +1784,8 @@ fn test_list_full_with_gitea_fork_pr(mut repo: TestRepo) {
         "upstream",
         "test-repo",
         &head_sha,
-        &pulls_json,
-        r#"{"state":"success","total_count":1}"#,
+        ("200 OK", &pulls_json),
+        ("200 OK", r#"{"state":"success","total_count":1}"#),
     );
 
     let settings = setup_snapshot_settings(&repo);

@@ -9,11 +9,11 @@ use worktrunk::git::{GitRemoteUrl, Repository};
 
 use super::{
     CiBranchName, CiSource, CiStatus, PrRef, PrStatus, branch_remote_url, non_interactive_cmd,
-    parse_json, retriable_pr_error,
+    parse_json,
 };
 
-/// Resolve the Azure DevOps context (host, org, project, `--org` URL) for this
-/// branch's `az` invocations.
+/// Resolve the Azure DevOps context (host, org, project, repository, `--org`
+/// URL) for this branch's `az` invocations.
 ///
 /// Walks the shared [`branch_remote_url`] chain first — so a remote-branch
 /// row from `wt list --remotes --full` queries the right tenant in
@@ -30,11 +30,17 @@ fn azure_context(repo: &Repository, branch: &CiBranchName) -> Option<AzureContex
         let host = parsed.host().to_string();
         let organization = parsed.azure_organization()?.to_string();
         let project = parsed.azure_project()?.to_string();
+        // Clone URLs percent-encode the name (`My%20Repo`), and `az` encodes
+        // `--repository` again when building the REST path.
+        let repository =
+            String::from_utf8_lossy(&urlencoding::decode_binary(parsed.repo().as_bytes()))
+                .into_owned();
         let org_url = az_url::az_org_url(&host, &organization);
         Some(AzureContext {
             host,
             organization,
             project,
+            repository,
             org_url,
         })
     };
@@ -56,12 +62,18 @@ struct AzureContext {
     host: String,
     organization: String,
     project: String,
+    /// Repository name. `az` infers it from the git remote only when `--org`
+    /// is absent, and we always pass `--org`, so a command scoped to this
+    /// repository has to name it.
+    repository: String,
     org_url: String,
 }
 
 /// Detect Azure DevOps PR CI status for a branch.
 ///
-/// Uses `az repos pr list` to find an open PR for the branch.
+/// Uses `az repos pr list` to find an open PR for the branch in this
+/// repository. Without `--repository` the list spans every repository in the
+/// project, so a same-named branch in a sibling repository would match.
 pub(super) fn detect_azure_pr(
     repo: &Repository,
     branch: &CiBranchName,
@@ -83,6 +95,8 @@ pub(super) fn detect_azure_pr(
             "active",
             "--project",
             &ctx.project,
+            "--repository",
+            &ctx.repository,
             "--org",
             &ctx.org_url,
             "--output",
@@ -105,7 +119,7 @@ pub(super) fn detect_azure_pr(
     };
 
     if !output.status.success() {
-        return retriable_pr_error(&output);
+        return Some(PrStatus::error());
     }
 
     let pr_list: Vec<AzPrListEntry> =
@@ -198,7 +212,7 @@ pub(super) fn detect_azure_pipeline(
     };
 
     if !output.status.success() {
-        return retriable_pr_error(&output);
+        return Some(PrStatus::error());
     }
 
     let runs: Vec<AzPipelineRun> =
@@ -239,15 +253,29 @@ pub(super) fn detect_azure_pipeline(
 }
 
 /// Map Azure Pipelines run status/result to [`CiStatus`].
+///
+/// `completed` is the only terminal status, so it alone consults `result`; the
+/// rest of the documented [build status
+/// enum](https://learn.microsoft.com/en-us/rest/api/azure/devops/build/builds/get?view=azure-devops-rest-7.1)
+/// (`inProgress`, `notStarted`, `cancelling`, `postponed`) is a run still on
+/// its way there and groups as `Running` — matching how
+/// `parse_gitlab_status` groups GitLab's non-terminal statuses. In particular
+/// `cancelling` is not the terminal cancellation: that one arrives as
+/// `completed` with result `canceled`, and is already `Failed` below.
+///
+/// Of the `BuildResult` values a `completed` run reports, `partiallySucceeded`
+/// ("completed compilation successfully but had other errors") groups with
+/// `Failed`, matching how `parse_gitea_status_state` classifies Gitea's
+/// equivalent `warning`. Only `none` stays `NoCI` — a finished run with no
+/// result carries no verdict to show.
 fn parse_azure_pipeline_status(status: Option<&str>, result: Option<&str>) -> CiStatus {
     match status {
-        Some("inProgress" | "notStarted") => CiStatus::Running,
+        Some("inProgress" | "notStarted" | "cancelling" | "postponed") => CiStatus::Running,
         Some("completed") => match result {
             Some("succeeded") => CiStatus::Passed,
-            Some("failed" | "canceled") => CiStatus::Failed,
+            Some("failed" | "canceled" | "partiallySucceeded") => CiStatus::Failed,
             _ => CiStatus::NoCI,
         },
-        Some("cancelling") => CiStatus::Failed,
         _ => CiStatus::NoCI,
     }
 }
@@ -350,6 +378,28 @@ mod tests {
         let ctx = azure_context(&repo, &branch).expect("scan should find the azure remote");
         assert_eq!(ctx.organization, "myorg");
         assert_eq!(ctx.project, "myproject");
+        assert_eq!(ctx.repository, "myrepo");
+    }
+
+    /// The repository name is decoded, since `az` percent-encodes it again.
+    #[test]
+    fn test_azure_context_decodes_repository_name() {
+        let test = TestRepo::with_initial_commit();
+        test.run_git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://dev.azure.com/myorg/myproject/_git/My%20Repo",
+        ]);
+        let repo = Repository::at(test.root_path()).unwrap();
+        let branch = CiBranchName {
+            full_name: "feature".to_string(),
+            remote: None,
+            name: "feature".to_string(),
+        };
+
+        let ctx = azure_context(&repo, &branch).expect("origin is an azure remote");
+        assert_eq!(ctx.repository, "My Repo");
     }
 
     /// No Azure remote anywhere → `None`.
@@ -373,29 +423,34 @@ mod tests {
 
     #[test]
     fn test_parse_azure_pipeline_status() {
-        assert_eq!(
-            parse_azure_pipeline_status(Some("inProgress"), None),
-            CiStatus::Running
-        );
-        assert_eq!(
-            parse_azure_pipeline_status(Some("notStarted"), None),
-            CiStatus::Running
-        );
+        // Non-terminal statuses. "cancelling" is cancellation in flight — the
+        // terminal form is "completed" with result "canceled"; "postponed" is a
+        // run sitting inactive in the queue.
+        for status in ["inProgress", "notStarted", "cancelling", "postponed"] {
+            assert_eq!(
+                parse_azure_pipeline_status(Some(status), None),
+                CiStatus::Running,
+                "status={status}"
+            );
+        }
         assert_eq!(
             parse_azure_pipeline_status(Some("completed"), Some("succeeded")),
             CiStatus::Passed
         );
+        // Terminal verdicts. "partiallySucceeded" completed with errors, so it
+        // reads as a failure rather than as no CI — same call gitea.rs makes
+        // for "warning".
+        for result in ["failed", "canceled", "partiallySucceeded"] {
+            assert_eq!(
+                parse_azure_pipeline_status(Some("completed"), Some(result)),
+                CiStatus::Failed,
+                "result={result}"
+            );
+        }
+        // A completed run with no result carries no verdict.
         assert_eq!(
-            parse_azure_pipeline_status(Some("completed"), Some("failed")),
-            CiStatus::Failed
-        );
-        assert_eq!(
-            parse_azure_pipeline_status(Some("completed"), Some("canceled")),
-            CiStatus::Failed
-        );
-        assert_eq!(
-            parse_azure_pipeline_status(Some("cancelling"), None),
-            CiStatus::Failed
+            parse_azure_pipeline_status(Some("completed"), Some("none")),
+            CiStatus::NoCI
         );
         assert_eq!(parse_azure_pipeline_status(None, None), CiStatus::NoCI);
     }

@@ -5,52 +5,49 @@
 
 use serde::Deserialize;
 use std::process::Output;
+use worktrunk::git::remote_ref::gitea::api_status;
 use worktrunk::git::{Repository, parse_owner_repo};
 
 use super::{
     CiBranchName, CiSource, CiStatus, MAX_PRS_TO_FETCH, PrRef, PrStatus, branch_owner_repo,
-    is_retriable_error, non_interactive_cmd, output_error_text, parse_json,
+    non_interactive_cmd, parse_json,
 };
 
-/// Run `tea api <path>` from the worktree root.
+/// Run `tea api --include <path>` from the worktree root.
 ///
-/// `is_tool_available` has already confirmed `tea` is on PATH, so a spawn
+/// `--include` puts the HTTP status line on stderr, which is the only place the
+/// status reaches us — see the [`gitea`](worktrunk::git::remote_ref::gitea)
+/// module docs.
+///
+/// `detect_ci` has already confirmed `tea` is on PATH, so a spawn
 /// failure here is an OS-level edge case — fall through to `None` (no CI status
 /// for this branch) rather than logging.
 fn tea_api(repo: &Repository, path: &str) -> Option<Output> {
     let repo_root = repo.current_worktree().root().ok()?;
     non_interactive_cmd("tea")
-        .args(["api", path])
+        .args(["api", "--include", path])
         .current_dir(&repo_root)
         .run()
         .ok()
 }
 
-/// The error text of a `tea api` call, or `None` when the response carries the
-/// resource.
+/// Whether a `tea api` call failed rather than returning the resource.
 ///
-/// Neither failure shape is an exit code. `tea api` never reads the HTTP status
-/// — it copies the response body to stdout and exits 0 — so a non-zero exit
-/// means `tea` itself failed (transport error, no login configured) and its
-/// stderr names which, while every HTTP error arrives as a successful spawn
-/// carrying Gitea's `APIError` body in place of the resource. Branching on the
-/// exit code alone would let that body through as data: every field of
+/// `tea api` exits 0 for every HTTP response, so a non-zero exit means `tea`
+/// itself failed, and an HTTP error arrives as a successful spawn carrying a
+/// body in place of the resource, which [`api_status`] identifies. Branching on
+/// the exit code alone would let that body through as data: every field of
 /// [`GiteaCombinedStatus`] defaults, so a 500 would deserialize as "no
-/// statuses" and paint a blank CI cell.
-fn tea_api_error(output: &Output) -> Option<String> {
-    if !output.status.success() {
-        return Some(output_error_text(output));
-    }
-    serde_json::from_slice::<GiteaApiError>(&output.stdout)
-        .ok()
-        .map(|error| error.message)
-        .filter(|message| !message.trim().is_empty())
+/// statuses" and paint a blank CI cell. A missing status line means the
+/// response never arrived.
+fn tea_api_failed(output: &Output) -> bool {
+    !output.status.success() || api_status(&output.stderr).is_none_or(|status| status >= 400)
 }
 
 /// Fetch the combined CI status for a commit SHA.
 ///
-/// Returns `Some(CiStatus::Error)` for retriable failures (rate limit, network),
-/// `None` when the commit has no statuses or the call fails non-retriably.
+/// Returns `Some(CiStatus::Error)` when the call fails, `None` when the commit
+/// has no statuses.
 fn fetch_combined_status(
     repo: &Repository,
     owner: &str,
@@ -59,10 +56,8 @@ fn fetch_combined_status(
 ) -> Option<CiStatus> {
     let path = format!("repos/{owner}/{repo_name}/commits/{sha}/status");
     let output = tea_api(repo, &path)?;
-    if let Some(error) = tea_api_error(&output) {
-        // The PR-status warning from `retriable_pr_error` is the wrong shape
-        // here (this returns just CiStatus).
-        return is_retriable_error(&error).then_some(CiStatus::Error);
+    if tea_api_failed(&output) {
+        return Some(CiStatus::Error);
     }
     let combined: GiteaCombinedStatus = parse_json(&output.stdout, "tea api commit status", sha)?;
     if combined.total_count == 0 {
@@ -93,8 +88,8 @@ pub(super) fn detect_gitea_pr(
     let path =
         format!("repos/{query_owner}/{query_repo}/pulls?state=open&limit={MAX_PRS_TO_FETCH}");
     let output = tea_api(repo, &path)?;
-    if let Some(error) = tea_api_error(&output) {
-        return is_retriable_error(&error).then(PrStatus::error);
+    if tea_api_failed(&output) {
+        return Some(PrStatus::error());
     }
 
     let prs: Vec<GiteaPr> = parse_json(&output.stdout, "tea api pulls", &branch.full_name)?;
@@ -159,6 +154,9 @@ pub(super) fn detect_gitea_commit_status(
     branch: &CiBranchName,
     local_head: &str,
 ) -> Option<PrStatus> {
+    if !branch.head_on_remote(repo, local_head) {
+        return None;
+    }
     let (owner, repo_name) = branch_owner_repo(repo, branch)?;
     let ci_status = fetch_combined_status(repo, &owner, &repo_name, local_head)?;
     Some(PrStatus {
@@ -191,15 +189,6 @@ fn parse_gitea_status_state(state: &str) -> Option<CiStatus> {
         "failure" | "error" | "warning" => Some(CiStatus::Failed),
         _ => None,
     }
-}
-
-/// Gitea's `APIError` body, which the API returns in place of the resource
-/// whenever a request fails. `message` carries no `#[serde(default)]` so the
-/// shape only matches a real error body — the success shapes here (a PR array,
-/// a combined status) have no `message` field.
-#[derive(Debug, Deserialize)]
-struct GiteaApiError {
-    message: String,
 }
 
 /// Combined commit status from `GET /repos/{owner}/{repo}/commits/{ref}/status`.
@@ -287,31 +276,34 @@ mod tests {
         assert_eq!(pr(Some(2)).comment_count(), Some(2));
     }
 
-    /// `tea_api_error` reads the response shape, since the exit code carries
-    /// nothing: a PR array and a combined status are data, an `APIError` body
-    /// is the failure. Gitea blanks the message of a 500 for a non-admin token,
-    /// which leaves nothing to sniff — that falls through to the data path,
-    /// where the parse decides.
+    /// The status line, not the exit code or the body, says whether an exit-0
+    /// `tea api` call failed.
     #[test]
-    fn test_tea_api_error_reads_the_response_shape() {
+    fn test_tea_api_failed_reads_the_http_status() {
         // `ExitStatus::default()` is success on every platform, so these all
         // exercise the exit-0 path — the one the exit code can't classify.
-        let response = |stdout: &str| Output {
+        let response = |status: &str, stdout: &str| Output {
             status: Default::default(),
             stdout: stdout.as_bytes().to_vec(),
-            stderr: Vec::new(),
+            stderr: format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\r\n")
+                .into_bytes(),
         };
+        let failed = |status: &str, stdout: &str| tea_api_failed(&response(status, stdout));
 
-        assert_eq!(tea_api_error(&response("[]")), None);
-        assert_eq!(
-            tea_api_error(&response(r#"{"state":"success","total_count":2}"#)),
-            None
-        );
-        assert_eq!(
-            tea_api_error(&response(r#"{"message":"token does not have scope"}"#)),
-            Some("token does not have scope".to_string())
-        );
-        assert_eq!(tea_api_error(&response(r#"{"message":"  "}"#)), None);
+        // 2xx is the resource, whatever it holds.
+        assert!(!failed("200 OK", "[]"));
+        assert!(!failed("200 OK", r#"{"message":"nope"}"#));
+
+        assert!(failed("500 Internal Server Error", r#"{"message":""}"#));
+        assert!(failed("429 Too Many Requests", "{}"));
+        assert!(failed("404 Not Found", r#"{"message":"does not exist"}"#));
+
+        // No status line: the response never arrived.
+        assert!(tea_api_failed(&Output {
+            status: Default::default(),
+            stdout: b"[]".to_vec(),
+            stderr: Vec::new(),
+        }));
     }
 
     #[test]

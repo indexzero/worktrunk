@@ -4,11 +4,11 @@
 //! [`ShellEscapeMode`] selecting how interpolated values are escaped:
 //! - `Posix` — POSIX single-quoting, for command lines fed to `Cmd::shell`
 //!   (`sh`/Git Bash): hooks, aliases.
-//! - `PowerShell` — PowerShell single-quoting, for the `--execute` payload
-//!   when the active directive shell is the PowerShell wrapper.
 //! - `Literal` — values substituted verbatim, for filesystem paths.
 //!
 //! All templates support Jinja2 syntax including filters, conditionals, and loops.
+//! Undefined-variable diagnostics use MiniJinja's source spans and shared syntax
+//! analysis; preflight checks use its undeclared-variable analysis.
 //!
 //! See `wt hook --help` for available filters and functions.
 
@@ -18,12 +18,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use color_print::cformat;
-use minijinja::value::{Enumerator, Object, ObjectRepr};
-use minijinja::{Environment, ErrorKind, UndefinedBehavior, Value};
+use minijinja::value::{Enumerator, Object, ObjectRepr, StringInput};
+use minijinja::{Environment, ErrorKind, State, UndefinedBehavior, Value};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::template_analysis::TemplateVars;
 use crate::git::{Diagnostic, HookType, Repository};
 use crate::path::to_posix_path;
 use crate::shell_exec::{ShellEscapeMode, shell_escape_for};
@@ -31,6 +32,7 @@ use crate::styling::{
     eprintln, error_message, format_bash_with_gutter, format_with_gutter, hint_message,
     info_message, verbosity,
 };
+use crate::utils::did_you_mean;
 
 /// Active-context vars: point at the branch the operation acts on.
 ///
@@ -51,6 +53,7 @@ pub const REPO_VARS: &[&str] = &[
     "repo",
     "repo_path",
     "owner",
+    "remote_repo",
     "primary_worktree_path",
     "default_branch",
     "remote",
@@ -80,25 +83,23 @@ pub fn base_vars() -> Vec<&'static str> {
 
 /// Reserved context key carrying a JSON-encoded `Vec<String>` of positional
 /// CLI args forwarded to an alias. The key flows through
-/// [`TemplateContext`]'s flat string map — stable for stdin JSON — and
+/// [`TemplateContext`]'s flat string map — stable for JSON round-trips — and
 /// [`expand_template`] rehydrates it as a `ShellArgs` object so bare
 /// `{{ args }}` renders as a space-joined, shell-escaped string while
 /// indexing, iteration, and `length` behave like a sequence.
 pub const ALIAS_ARGS_KEY: &str = "args";
 
-/// Deprecated template variable aliases (still valid for backward compatibility).
+/// Whether a `--KEY=VALUE` token on an alias or `wt hook` command line binds
+/// to `{{ KEY }}` rather than forwarding into `{{ args }}`.
 ///
-/// These map to current variables and are available in every scope:
-/// - `main_worktree` → `repo`
-/// - `repo_root` → `repo_path`
-/// - `worktree` → `worktree_path`
-/// - `main_worktree_path` → `primary_worktree_path`
-pub const DEPRECATED_TEMPLATE_VARS: &[&str] = &[
-    "main_worktree",
-    "repo_root",
-    "worktree",
-    "main_worktree_path",
-];
+/// `key` is the canonical (underscored) name and `referenced` the template's
+/// top-level variables. `args` and `vars` are never bindable even when
+/// referenced: the runtime always sets both (the positional list, the
+/// per-branch vars object) after CLI bindings, so a bound value would be
+/// overwritten and the token lost. Forwarding keeps it in `{{ args }}`.
+pub fn binds_cli_var(key: &str, referenced: &BTreeSet<String>) -> bool {
+    key != ALIAS_ARGS_KEY && key != "vars" && referenced.contains(key)
+}
 
 /// Variables available in `wt list` custom-column templates (plus `vars.*`).
 ///
@@ -110,14 +111,14 @@ pub const LIST_COLUMN_VARS: &[&str] = &["branch", "worktree_path", "worktree_nam
 /// The resolved template variables for one command invocation.
 ///
 /// Wraps the map `build_hook_context` produces and owns every operation on
-/// it: expansion, the JSON a hook child reads on stdin, and the `-v` variables
-/// table. Callers hold this rather than a bare map so the borrow
+/// it: expansion, the JSON a `wt step for-each` child reads on stdin, and the
+/// `-v` variables table. Callers hold this rather than a bare map so the borrow
 /// [`expand_template`] needs, the `serde_json` call, and the `(unset)` /
 /// `(unused)` rendering each have one home.
 ///
-/// Serializes transparently, so the JSON a child reads and the pipeline spec a
-/// background runner deserializes are both the flat `{"branch": "…", …}`
-/// object the [`ALIAS_ARGS_KEY`] contract describes.
+/// Serializes transparently, so the JSON a for-each child reads and the
+/// pipeline spec a background runner deserializes are both the flat
+/// `{"branch": "…", …}` object the [`ALIAS_ARGS_KEY`] contract describes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TemplateContext(HashMap<String, String>);
@@ -173,7 +174,7 @@ impl TemplateContext {
         expand_template_with(template, &vars, escape_mode, repo, name, vars_mode)
     }
 
-    /// The JSON form piped to a child's stdin.
+    /// The JSON form piped to a `wt step for-each` child's stdin.
     pub fn to_json(&self) -> String {
         serde_json::to_string(&self.0)
             .expect("HashMap<String, String> serialization should never fail")
@@ -190,8 +191,9 @@ pub enum VarScope<'a> {
     /// looked up. The set comes from `referenced_vars_for_config` or
     /// [`referenced_vars_for_templates`].
     Referenced(&'a BTreeSet<String>),
-    /// Something reads keys the templates never mention: a child consuming
-    /// the JSON on stdin, or a command whose output is the variable listing.
+    /// Something reads keys the templates never mention: a `wt step for-each`
+    /// child consuming the JSON on stdin, or a command whose output is the
+    /// variable listing.
     All,
 }
 
@@ -214,7 +216,7 @@ impl VarScope<'_> {
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationScope {
     /// A hook of the given type. Adds hook infrastructure vars (`hook_type`,
-    /// `hook_name`) plus hook-specific vars (`base`, `target`, etc.).
+    /// `hook_name`), hook-specific vars (`base`, `target`, etc.), and `args`.
     Hook(HookType),
     /// The `--execute` template or trailing args for `wt switch --create`.
     /// Adds `base` / `base_worktree_path` for the source worktree.
@@ -237,9 +239,9 @@ fn hook_extras(hook_type: HookType) -> &'static [&'static str] {
     use HookType::*;
     match hook_type {
         // Switch: source branch (`base`) and destination (`target`).
-        // `pr_number`/`pr_url` are populated for `post-switch` when creating
-        // via `pr:N` / `mr:N`; pre-switch fires before the PR/MR API call,
-        // so they're never set there but remain accepted for portability.
+        // `pr_number`/`pr_url` are populated whenever the switch was named by
+        // `pr:N` / `mr:N` — the forge answers before `pre-switch` runs, so
+        // both hooks see the same values.
         PreSwitch | PostSwitch => &[
             "base",
             "base_worktree_path",
@@ -276,9 +278,13 @@ const HOOK_INFRASTRUCTURE_VARS: &[&str] = &["hook_type", "hook_name"];
 
 /// All template variables available in a given scope.
 ///
-/// The returned list is [`base_vars`] + scope-specific extras + deprecated
-/// aliases. Used by [`validate_template`] to build the placeholder context
-/// and by error messages to list what the user could have typed.
+/// The returned list is [`base_vars`] + scope-specific extras. Used by
+/// [`validate_template`] to build the placeholder context and by error
+/// messages to list what the user could have typed. Retired names
+/// (`repo_root`, `worktree`, …) are absent: the deprecation layer renames them
+/// before serde parses the config, so a template reaching here carries only
+/// current names, and one typed on the command line gets the undefined-variable
+/// error with this list attached.
 pub fn vars_available_in(scope: ValidationScope) -> Vec<&'static str> {
     let mut vars: Vec<&'static str> = base_vars();
     match scope {
@@ -294,9 +300,20 @@ pub fn vars_available_in(scope: ValidationScope) -> Vec<&'static str> {
             vars.push(ALIAS_ARGS_KEY);
         }
     }
-    vars.extend(DEPRECATED_TEMPLATE_VARS);
     vars
 }
+
+/// Whether `name` is a variable Worktrunk supplies in some scope.
+fn is_worktrunk_var(name: &str) -> bool {
+    use strum::IntoEnumIterator;
+    HookType::iter().any(|hook| vars_available_in(ValidationScope::Hook(hook)).contains(&name))
+}
+
+/// Cheap vars `build_hook_context` computes regardless of [`VarScope`] but
+/// which can still come out absent, so their absence is `(unset)` — a fact
+/// about the worktree — rather than `(unused)`, which claims the scope gate
+/// skipped the work. `branch` is absent in a detached worktree.
+const ALWAYS_COMPUTED_VARS: &[&str] = &["branch"];
 
 /// Shared formatter for [`format_hook_variables`] and [`format_alias_variables`].
 ///
@@ -308,14 +325,18 @@ pub fn vars_available_in(scope: ValidationScope) -> Vec<&'static str> {
 /// When `referenced` is `Some`, vars absent from `ctx` *and* not in the set
 /// render as dim `(unused)` — `build_hook_context` only skips computation for
 /// expensive vars, so this fires precisely when the gate saved real work.
-/// Cheap vars are populated unconditionally and always show their value, even
-/// when the body doesn't reference them. `(unset)` is reserved for the
-/// distinct case of a referenced var the operation couldn't supply.
+/// Cheap vars are populated unconditionally, so they show their value even
+/// when the body doesn't reference them — though a cheap var can still come
+/// out absent. `(unset)` is reserved for the distinct case of a var the
+/// operation couldn't supply — including [`ALWAYS_COMPUTED_VARS`], the cheap
+/// vars that are computed whatever the scope but can still be genuinely
+/// absent.
 ///
-/// `(unset)` relies on an invariant in `build_hook_context`: optional vars
-/// are omitted from the map rather than inserted as empty strings. If a
-/// future caller starts inserting `""`, revisit the empty-vs-absent
-/// distinction here.
+/// `(unset)` relies on an invariant in `build_hook_context` that the
+/// `extra_vars` layered on top must hold too (see
+/// `PostRemoveContext::extra_vars`): optional vars are omitted from the map
+/// rather than inserted as empty strings. If a future caller starts inserting
+/// `""`, revisit the empty-vs-absent distinction here.
 fn format_variables_table(
     vars: &[&'static str],
     ctx: &TemplateContext,
@@ -325,7 +346,9 @@ fn format_variables_table(
     vars.iter()
         .map(|var| match ctx.get(var) {
             Some(value) => format!("{var:<max_name$} = {value}"),
-            None if !scope.wants(var) => cformat!("<dim>{var:<max_name$} = (unused)</>"),
+            None if !scope.wants(var) && !ALWAYS_COMPUTED_VARS.contains(var) => {
+                cformat!("<dim>{var:<max_name$} = (unused)</>")
+            }
             None => format!("{var:<max_name$} = (unset)"),
         })
         .collect::<Vec<_>>()
@@ -428,7 +451,7 @@ pub fn alias_context_filter(mut referenced: BTreeSet<String>) -> BTreeSet<String
 ///
 /// `args` exists only in alias scope, whose bodies always run through
 /// `Cmd::shell` (POSIX) — so this rendering is unconditionally POSIX,
-/// independent of the active directive shell.
+/// independent of the user's interactive shell.
 #[derive(Debug)]
 struct ShellArgs(Vec<String>);
 
@@ -685,14 +708,18 @@ fn invalid_filter_arg(message: impl Into<String>) -> minijinja::Error {
     minijinja::Error::new(ErrorKind::InvalidOperation, message.into())
 }
 
-fn codename_filter(value: Value, words: Option<usize>) -> Result<String, minijinja::Error> {
+fn codename_filter(
+    state: &State,
+    value: Value,
+    words: Option<usize>,
+) -> Result<String, minijinja::Error> {
     let words = words.unwrap_or(2);
     if words == 0 || words > CODENAME_MAX_WORDS {
         return Err(invalid_filter_arg(format!(
             "codename word count must be between 1 and {CODENAME_MAX_WORDS}"
         )));
     }
-    Ok(codename(value.as_str().unwrap_or_default(), words))
+    Ok(codename(filter_string(state, &value)?, words))
 }
 
 /// Redact credentials from URLs for safe logging.
@@ -737,10 +764,12 @@ pub fn redact_credentials(s: &str) -> String {
 pub struct TemplateExpandError {
     /// Plain-text error summary for callers that embed errors in styled messages.
     pub message: String,
-    /// The failing template line (if identifiable).
+    /// The failing template line, when identifiable.
     pub source_line: Option<String>,
     /// Variable names available in this template context.
     pub available_vars: Vec<String>,
+    /// Closest available variable, when a missing name is identifiable.
+    pub suggestion: Option<String>,
 }
 
 impl std::fmt::Display for TemplateExpandError {
@@ -754,6 +783,11 @@ impl Diagnostic for TemplateExpandError {
         let mut parts = vec![error_message(&self.message).to_string()];
         if let Some(ref line) = self.source_line {
             parts.push(format_with_gutter(line, None));
+        }
+        if let Some(ref suggestion) = self.suggestion {
+            parts.push(
+                hint_message(cformat!("Did you mean <underline>{suggestion}</>?")).to_string(),
+            );
         }
         if !self.available_vars.is_empty() {
             let underlined_vars: Vec<String> = self
@@ -775,20 +809,7 @@ impl Diagnostic for TemplateExpandError {
 
 impl std::error::Error for TemplateExpandError {}
 
-/// Build a [`TemplateExpandError`] from a minijinja error, the original template
-/// source, the template name (for error messages), and the available variable names.
-///
-/// Message format: `Failed to expand {name}: {kind}[: {detail}] [@ line {n}]`
-///
-/// ```text
-/// Failed to expand {name}: {kind}[: {detail}] [@ line {n}]
-/// │                 │        │       │              │
-/// │                 │        │       │              └─ e.line() from minijinja
-/// │                 │        │       └─ e.detail() from minijinja (None for UndefinedError)
-/// │                 │        └─ e.kind() from minijinja ("undefined value", "syntax error")
-/// │                 └─ `name` param passed by caller
-/// └─ hardcoded prefix
-/// ```
+/// Keep MiniJinja's error detail and failing source line in the CLI diagnostic.
 fn build_template_error(
     e: &minijinja::Error,
     template: &str,
@@ -800,13 +821,11 @@ fn build_template_error(
     let source_line =
         line_num.and_then(|n| lines.get(n.saturating_sub(1)).copied().map(String::from));
 
-    // Build message: "Failed to expand {name}: {kind}[: {detail}] [@ line {n}]"
-    // e.g. "Failed to expand --execute command: undefined value @ line 1"
+    let is_undefined = e.kind() == ErrorKind::UndefinedError;
     let detail = match e.detail() {
         Some(detail) => format!("{}: {detail}", e.kind()),
         None => e.kind().to_string(),
     };
-    let is_undefined = e.kind() == ErrorKind::UndefinedError;
 
     // minijinja always provides a line number for syntax and render errors
     let message = match line_num {
@@ -823,6 +842,7 @@ fn build_template_error(
         } else {
             Vec::new()
         },
+        suggestion: None,
     }
 }
 
@@ -837,23 +857,45 @@ fn build_undefined_vars_error(
     name: &str,
     undefined_vars: &[String],
     available_vars: Vec<String>,
+    template: &str,
+    line_num: Option<usize>,
 ) -> TemplateExpandError {
-    let names = undefined_vars
-        .iter()
-        .map(|var| format!("`{var}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let names = undefined_vars.join(", ");
     let noun = if undefined_vars.len() == 1 {
-        "value"
+        "variable"
     } else {
-        "values"
+        "variables"
     };
-
+    // A name Worktrunk defines somewhere is unset here, not misspelled, so a
+    // similar name (`target_worktree_path` for `target`) would mislead.
+    let suggestion = match undefined_vars {
+        [var] if !is_worktrunk_var(var) => did_you_mean(var, available_vars.iter().cloned())
+            .into_iter()
+            .next(),
+        _ => None,
+    };
+    let location = line_num
+        .map(|line| format!(" @ line {line}"))
+        .unwrap_or_default();
     TemplateExpandError {
-        message: format!("Failed to expand {name}: undefined {noun}: {names}"),
-        source_line: None,
+        message: format!("Failed to expand {name}: undefined {noun} {names}{location}"),
+        source_line: match line_num {
+            Some(line) => template
+                .lines()
+                .nth(line.saturating_sub(1))
+                .map(String::from),
+            None => (!template.contains('\n')).then(|| template.to_string()),
+        },
         available_vars,
+        suggestion,
     }
+}
+
+/// Apply the engine's undefined-input policy while preserving the filters'
+/// existing treatment of defined non-string values as empty strings.
+fn filter_string<'a>(state: &State, value: &'a Value) -> Result<&'a str, minijinja::Error> {
+    StringInput::new(state, value)?;
+    Ok(value.as_str().unwrap_or_default())
 }
 
 /// Set up a minijinja environment with worktrunk's custom filters and functions.
@@ -869,30 +911,36 @@ pub fn template_environment(repo: &Repository) -> Environment<'static> {
     env.set_undefined_behavior(UndefinedBehavior::SemiStrict);
 
     // Register custom filters
-    env.add_filter("sanitize", |value: Value| -> String {
-        sanitize_branch_name(value.as_str().unwrap_or_default())
+    env.add_filter("sanitize", |state: &State, value: Value| {
+        Ok::<_, minijinja::Error>(sanitize_branch_name(filter_string(state, &value)?))
     });
-    env.add_filter("sanitize_db", |value: Value| -> String {
-        sanitize_db(value.as_str().unwrap_or_default())
+    env.add_filter("sanitize_db", |state: &State, value: Value| {
+        Ok::<_, minijinja::Error>(sanitize_db(filter_string(state, &value)?))
     });
-    env.add_filter("sanitize_hash", |value: Value| -> String {
-        crate::path::sanitize_for_filename(value.as_str().unwrap_or_default())
+    env.add_filter("sanitize_hash", |state: &State, value: Value| {
+        Ok::<_, minijinja::Error>(crate::path::sanitize_for_filename(filter_string(
+            state, &value,
+        )?))
     });
-    env.add_filter("hash", |value: Value| -> String {
-        short_hash(value.as_str().unwrap_or_default())
+    env.add_filter("hash", |state: &State, value: Value| {
+        Ok::<_, minijinja::Error>(short_hash(filter_string(state, &value)?))
     });
     env.add_filter("hash_port", |value: String| string_to_port(&value));
-    env.add_filter("dirname", |value: Value| -> String {
-        std::path::Path::new(value.as_str().unwrap_or_default())
-            .parent()
-            .map(|p| to_posix_path(&p.to_string_lossy()))
-            .unwrap_or_default()
+    env.add_filter("dirname", |state: &State, value: Value| {
+        Ok::<_, minijinja::Error>(
+            std::path::Path::new(filter_string(state, &value)?)
+                .parent()
+                .map(|p| to_posix_path(&p.to_string_lossy()))
+                .unwrap_or_default(),
+        )
     });
-    env.add_filter("basename", |value: Value| -> String {
-        std::path::Path::new(value.as_str().unwrap_or_default())
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
+    env.add_filter("basename", |state: &State, value: Value| {
+        Ok::<_, minijinja::Error>(
+            std::path::Path::new(filter_string(state, &value)?)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
     });
     env.add_filter("codename", codename_filter);
 
@@ -993,11 +1041,8 @@ pub fn validate_template_syntax(template: &str, name: &str) -> Result<(), Templa
 
 /// Validate that a template can be expanded without errors in the given scope.
 ///
-/// Performs a trial expansion with placeholder values for exactly the variables
-/// available in `scope` (see [`vars_available_in`]). Catches syntax errors and
-/// undefined variable references *before* irreversible operations like worktree
-/// creation — including context-mismatch typos like `{{ args }}` in a hook or
-/// `{{ target }}` in a `pre-start` hook.
+/// Checks syntax and top-level variable references against [`vars_available_in`]
+/// and environment globals, then trial-renders with placeholder context values.
 ///
 /// This is deliberately more permissive than real expansion: conditional vars
 /// like `upstream` are provided even when they may be absent at runtime. A
@@ -1044,7 +1089,7 @@ pub fn validate_template(
     let mut undefined: Vec<String> = tmpl
         .undeclared_variables(false)
         .into_iter()
-        .filter(|var| !allowed.contains(var))
+        .filter(|var| !allowed.contains(var) && env.globals().all(|(key, _)| key != var))
         .collect();
     undefined.sort();
     if !undefined.is_empty() {
@@ -1052,6 +1097,8 @@ pub fn validate_template(
             name,
             &undefined,
             sorted_available_vars(&available),
+            template,
+            None,
         ));
     }
 
@@ -1067,13 +1114,10 @@ pub fn validate_template(
 /// * `template` - Template string using Jinja2 syntax (e.g., `{{ branch }}`)
 /// * `vars` - Variables to substitute
 /// * `escape_mode` - How to escape interpolated values:
-///   - [`ShellEscapeMode::Posix`] / [`ShellEscapeMode::PowerShell`] — escape
-///     for safe splicing into a command line of that shell. Callers that feed
-///     the result to `Cmd::shell` (hooks, aliases) always pass `Posix`; only
-///     the `--execute` payload, parsed by the active directive shell, may pass
-///     `PowerShell`.
+///   - [`ShellEscapeMode::Posix`] — escape for safe splicing into a command
+///     line passed to `Cmd::shell` (hooks and aliases).
 ///   - [`ShellEscapeMode::Literal`] — substitute values verbatim (filesystem
-///     paths).
+///     paths and `--execute` argv elements).
 /// * `repo` - Repository for looking up worktree paths
 ///
 /// # Filters
@@ -1189,8 +1233,8 @@ pub fn expand_template_with(
         .map_err(|e| build_template_error(&e, template, name, Vec::new()))?;
 
     // Inject vars data as a nested object: {{ vars.env }}, {{ vars["env"] }},
-    // {{ vars.config.port }}. When branch is present, always inject (even if
-    // empty map) so {{ vars.key | default(...) }} works in SemiStrict mode.
+    // {{ vars.config.port }}. Always inject (even as an empty map) so
+    // {{ vars.key | default(...) }} works in SemiStrict mode.
     // Only look up vars data if the parsed template references the top-level
     // `vars` object (avoids a git process spawn per expansion while supporting
     // every MiniJinja access form without false positives from literal text).
@@ -1205,23 +1249,37 @@ pub fn expand_template_with(
                 );
             }
             VarsMode::Resolve => {
-                if let Some(branch) = vars.get("branch") {
-                    context.insert(
-                        "vars".to_string(),
-                        vars_map_to_value(&repo.vars_entries(branch)),
-                    );
-                }
+                // A detached worktree leaves `branch` unset, and per-branch
+                // vars are keyed by branch — so there are none. Insert the
+                // empty map rather than nothing, so `{{ vars.key |
+                // default(…) }}` still renders under SemiStrict instead of
+                // erroring on an undefined `vars` (same reason
+                // `list::custom_columns` injects an empty map for a
+                // branchless row).
+                let entries = vars
+                    .get("branch")
+                    .map(|branch| repo.vars_entries(branch))
+                    .unwrap_or_default();
+                context.insert("vars".to_string(), vars_map_to_value(&entries));
             }
         }
     }
 
-    let result = tmpl
-        .render(minijinja::Value::from_object(context))
-        .map_err(|e| {
-            let mut keys: Vec<String> = vars.keys().map(|k| k.to_string()).collect();
-            keys.sort();
-            build_template_error(&e, template, name, keys)
-        })?;
+    let result = tmpl.render(Value::from_object(context)).map_err(|e| {
+        let mut keys = vars.keys().map(|key| key.to_string()).collect::<Vec<_>>();
+        keys.sort();
+        if e.kind() == ErrorKind::UndefinedError
+            && let Some(range) = e.range()
+            && let Some(analysis) = TemplateVars::of(template)
+            && let Some(var) = analysis.output_at(range)
+            && !vars.contains_key(var)
+            && var != "vars"
+            && env.globals().all(|(key, _)| key != var)
+        {
+            return build_undefined_vars_error(name, &[var.to_string()], keys, template, e.line());
+        }
+        build_template_error(&e, template, name, keys)
+    })?;
 
     // -vv: Full debug logging with result
     // Redact credentials from result to prevent leaking tokens in logs
@@ -1286,10 +1344,11 @@ impl Object for AnyKeyVars {
 /// Validate a `wt list` custom-column template.
 ///
 /// Checks syntax, restricts top-level variables to `LIST_COLUMN_VARS` ∪
-/// `{vars, git}`, and trial-renders with placeholder values so filter errors
-/// (e.g. a misspelled filter name) surface at config resolution rather than as
-/// silently empty cells. `vars.*` and `git.branch.*` access is unconstrained —
-/// any key validates, since which keys exist is per-branch runtime state.
+/// `{vars, git}` plus environment globals, and trial-renders with placeholder
+/// values so filter errors (e.g. a misspelled filter name) surface at config
+/// resolution rather than as silently empty cells. `vars.*` and `git.branch.*`
+/// access is unconstrained — any key validates, since which keys exist is
+/// per-branch runtime state.
 pub fn validate_list_column_template(
     template: &str,
     repo: &Repository,
@@ -1303,7 +1362,12 @@ pub fn validate_list_column_template(
     let mut undefined: Vec<String> = tmpl
         .undeclared_variables(false)
         .into_iter()
-        .filter(|var| var != "vars" && var != "git" && !LIST_COLUMN_VARS.contains(&var.as_str()))
+        .filter(|var| {
+            var != "vars"
+                && var != "git"
+                && !LIST_COLUMN_VARS.contains(&var.as_str())
+                && env.globals().all(|(key, _)| key != var)
+        })
         .collect();
     undefined.sort();
     if !undefined.is_empty() {
@@ -1314,6 +1378,8 @@ pub fn validate_list_column_template(
             name,
             &undefined,
             sorted_available_vars(&available),
+            template,
+            None,
         ));
     }
 
@@ -1564,11 +1630,7 @@ mod tests {
             "test",
         )
         .unwrap_err();
-        assert!(
-            err.message.contains("undefined value"),
-            "got: {}",
-            err.message
-        );
+        assert!(err.message.contains("undefined"), "got: {}", err.message);
     }
 
     #[test]
@@ -1660,8 +1722,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.message.contains("undefined value"),
-            "should mention undefined value: {}",
+            err.message.contains("undefined"),
+            "should mention undefined variable: {}",
             err.message
         );
         assert!(err.available_vars.contains(&"branch".to_string()));
@@ -1670,10 +1732,149 @@ mod tests {
 
         // Diagnostic::render produces source line and available vars hint
         assert_snapshot!(crate::git::Diagnostic::render(&err), @"
-        [31m✗[39m [31mFailed to expand test: undefined value @ line 1[39m
+        [31m✗[39m [31mFailed to expand test: undefined variable target @ line 1[39m
         [107m [0m echo {{ target }}
         [2m↳[22m [2mAvailable variables: [4mbranch[24m, [4mremote[24m[22m
         ");
+    }
+
+    #[test]
+    fn test_expand_template_names_reached_typo() {
+        let test = test_repo();
+        let vars = HashMap::from([("branch", "main")]);
+        for template in [
+            "{% if branch %}{{ brnch }}{% endif %}",
+            "{% for item in [1] %}{{ brnch }}{% endfor %}",
+            "{% if upstream %}{{ unvisited }}{% endif %}\necho {{ brnch | upper }}",
+            "{% set captured %}{{ brnch }}{% endset %}",
+            "{% autoescape true %}{{ brnch }}{% endautoescape %}",
+            "{% filter upper %}{{ brnch }}{% endfilter %}",
+            "{% with local = branch %}{{ brnch }}{% endwith %}",
+            "{% set ns = namespace() %}{% set ns.brnch = branch %}{{ brnch }}",
+        ] {
+            let err = expand_template(
+                template,
+                &vars,
+                ShellEscapeMode::Literal,
+                &test.repo,
+                "test",
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.message,
+                format!(
+                    "Failed to expand test: undefined variable brnch @ line {}",
+                    template.lines().count()
+                )
+            );
+            assert_eq!(err.suggestion.as_deref(), Some("branch"));
+            assert_eq!(err.source_line.as_deref(), template.lines().last());
+        }
+    }
+
+    /// A Worktrunk variable the operation left unset (`target` in a
+    /// `post-switch` hook to a detached worktree) is not a typo: suggesting a
+    /// similarly named variable would steer the user to the wrong value.
+    #[test]
+    fn test_unset_worktrunk_variable_gets_no_suggestion() {
+        let test = test_repo();
+        let vars = HashMap::from([("branch", "main"), ("target_worktree_path", "/tmp/wt")]);
+        let err = expand_template(
+            "echo {{ target }}",
+            &vars,
+            ShellEscapeMode::Literal,
+            &test.repo,
+            "test",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.message,
+            "Failed to expand test: undefined variable target @ line 1"
+        );
+        assert_eq!(err.suggestion, None);
+    }
+
+    #[test]
+    fn test_undefined_namespace_values_do_not_name_unreached_typos() {
+        let test = test_repo();
+        let vars = HashMap::from([("branch", "main"), ("args", "[]")]);
+        for template in [
+            "{{ args[0] }}{{ brnch }}",
+            "{{ vars.missing }}{{ brnch }}",
+            "{% if optional %}{{ brnch }}{% endif %}{{ vars.missing }}",
+            "{% set local = brnch %}{{ local }}",
+            "{{ brnch if branch else other_missing }}",
+            "{{ branch | replace(brnch, '-') }}",
+            "{% if false %}{{ brnch }}{% endif %}{% set brnch = vars.missing %}{{ brnch }}",
+            "{% if false %}{{ brnch }}{% endif %}{% with brnch = vars.missing %}{{ brnch }}{% endwith %}",
+            "{% if false %}{{ brnch }}{% endif %}{% for brnch in [vars.missing] %}{{ brnch }}{% endfor %}",
+            "{% if false %}{{ brnch }}{% endif %}{% for brnch, other in [[vars.missing, 1]] %}{{ brnch }}{% endfor %}",
+            "{% if false %}{{ brnch }}{% endif %}{% set captured %}{% set brnch = vars.missing %}{{ brnch }}{% endset %}",
+        ] {
+            let err = expand_template(
+                template,
+                &vars,
+                ShellEscapeMode::Literal,
+                &test.repo,
+                "test",
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.message,
+                "Failed to expand test: undefined value @ line 1"
+            );
+            assert_eq!(err.suggestion, None);
+        }
+    }
+
+    /// Custom filters must let MiniJinja reject undefined input rather than
+    /// silently turn a misspelled branch into an empty path or hash.
+    #[test]
+    fn test_custom_filters_reject_undefined_input() {
+        let test = test_repo();
+        for filter in [
+            "sanitize",
+            "sanitize_db",
+            "sanitize_hash",
+            "hash",
+            "hash_port",
+            "dirname",
+            "basename",
+            "codename",
+        ] {
+            let template = format!("{{{{ brnch | {filter} }}}}");
+            let err = expand_template(
+                &template,
+                &HashMap::new(),
+                ShellEscapeMode::Literal,
+                &test.repo,
+                "test",
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.message,
+                "Failed to expand test: undefined variable brnch @ line 1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_template_validation_uses_environment_globals() {
+        let test = test_repo();
+        let template = "{% for item in range(2) %}{{ item }}{% endfor %}";
+        validate_template(template, ValidationScope::Alias, &test.repo, "test").unwrap();
+        validate_list_column_template(template, &test.repo, "test").unwrap();
+        assert_eq!(
+            expand_template(
+                template,
+                &HashMap::new(),
+                ShellEscapeMode::Literal,
+                &test.repo,
+                "test",
+            )
+            .unwrap(),
+            "01"
+        );
     }
 
     #[test]
@@ -2440,67 +2641,52 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_credentials_https_token() {
-        // GitHub-style personal access token
-        assert_eq!(
-            redact_credentials("https://ghp_token123@github.com/owner/repo"),
-            "https://[REDACTED]@github.com/owner/repo"
-        );
-        // GitLab-style token
-        assert_eq!(
-            redact_credentials("https://glpat-xxxxxxxxxxxx@gitlab.com/owner/repo.git"),
-            "https://[REDACTED]@gitlab.com/owner/repo.git"
-        );
-    }
+    fn test_redact_credentials() {
+        let cases = [
+            (
+                "GitHub personal access token",
+                "https://ghp_token123@github.com/owner/repo",
+                "https://[REDACTED]@github.com/owner/repo",
+            ),
+            (
+                "GitLab personal access token",
+                "https://glpat-xxxxxxxxxxxx@gitlab.com/owner/repo.git",
+                "https://[REDACTED]@gitlab.com/owner/repo.git",
+            ),
+            (
+                "HTTPS username and password",
+                "https://user:password123@github.com/owner/repo",
+                "https://[REDACTED]@github.com/owner/repo",
+            ),
+            (
+                "HTTPS without credentials",
+                "https://github.com/owner/repo",
+                "https://github.com/owner/repo",
+            ),
+            (
+                "SSH URL",
+                "git@github.com:owner/repo.git",
+                "git@github.com:owner/repo.git",
+            ),
+            ("branch name", "main", "main"),
+            ("branch name with slash", "feature/auth", "feature/auth"),
+            ("filesystem path", "/path/to/worktree", "/path/to/worktree"),
+            ("empty value", "", ""),
+            (
+                "git protocol token",
+                "git://token@github.com/owner/repo.git",
+                "git://[REDACTED]@github.com/owner/repo.git",
+            ),
+            (
+                "path and query after credentials",
+                "https://token@github.com/owner/repo.git?ref=main",
+                "https://[REDACTED]@github.com/owner/repo.git?ref=main",
+            ),
+        ];
 
-    #[test]
-    fn test_redact_credentials_https_user_pass() {
-        // Username:password format
-        assert_eq!(
-            redact_credentials("https://user:password123@github.com/owner/repo"),
-            "https://[REDACTED]@github.com/owner/repo"
-        );
-    }
-
-    #[test]
-    fn test_redact_credentials_no_credentials() {
-        // Normal HTTPS URL without credentials - unchanged
-        assert_eq!(
-            redact_credentials("https://github.com/owner/repo"),
-            "https://github.com/owner/repo"
-        );
-        // SSH URL - unchanged (no credentials in URL format)
-        assert_eq!(
-            redact_credentials("git@github.com:owner/repo.git"),
-            "git@github.com:owner/repo.git"
-        );
-    }
-
-    #[test]
-    fn test_redact_credentials_non_url() {
-        // Non-URL values pass through unchanged
-        assert_eq!(redact_credentials("main"), "main");
-        assert_eq!(redact_credentials("feature/auth"), "feature/auth");
-        assert_eq!(redact_credentials("/path/to/worktree"), "/path/to/worktree");
-        assert_eq!(redact_credentials(""), "");
-    }
-
-    #[test]
-    fn test_redact_credentials_git_protocol() {
-        // git:// protocol with credentials
-        assert_eq!(
-            redact_credentials("git://token@github.com/owner/repo.git"),
-            "git://[REDACTED]@github.com/owner/repo.git"
-        );
-    }
-
-    #[test]
-    fn test_redact_credentials_preserves_path() {
-        // Full URL with path and query should preserve everything after host
-        assert_eq!(
-            redact_credentials("https://token@github.com/owner/repo.git?ref=main"),
-            "https://[REDACTED]@github.com/owner/repo.git?ref=main"
-        );
+        for (name, input, expected) in cases {
+            assert_eq!(redact_credentials(input), expected, "{name}: {input}");
+        }
     }
 
     #[test]
@@ -2604,7 +2790,7 @@ mod tests {
             .args([
                 "config",
                 "worktrunk.state.main.vars.config",
-                r#"{"port": 3000, "debug": true}"#,
+                r#"{"port": 3000, "debug": true, "note": null}"#,
             ])
             .current_dir(test.path())
             .run()
@@ -2643,6 +2829,9 @@ mod tests {
             .unwrap(),
             "3000"
         );
+        // A JSON bool or null reaches minijinja as a real bool/none, so each
+        // renders the way minijinja renders it: `True`/`False`/`None` since
+        // 2.22, which adopted Jinja2's spelling for all three together.
         assert_eq!(
             expand_template(
                 "{{ vars.config.debug }}",
@@ -2652,7 +2841,18 @@ mod tests {
                 "test"
             )
             .unwrap(),
-            "true"
+            "True"
+        );
+        assert_eq!(
+            expand_template(
+                "{{ vars.config.note }}",
+                &vars,
+                ShellEscapeMode::Literal,
+                &test.repo,
+                "test"
+            )
+            .unwrap(),
+            "None"
         );
 
         // Array index access
@@ -2739,17 +2939,20 @@ mod tests {
         let test = test_repo();
         let vars = HashMap::new(); // No branch var
 
-        // vars should be undefined (no branch to look up)
+        // A detached worktree leaves `branch` unset, and per-branch vars are
+        // keyed by branch — so there are none. `vars` is still the empty map
+        // rather than undefined, so `default` fires on the missing key instead
+        // of erroring on the missing object under SemiStrict.
         assert_eq!(
             expand_template(
-                "{{ vars | default('none') }}",
+                "{{ vars.env | default('dev') }}",
                 &vars,
                 ShellEscapeMode::Literal,
                 &test.repo,
                 "test"
             )
             .unwrap(),
-            "none"
+            "dev"
         );
     }
 
@@ -2946,8 +3149,24 @@ mod tests {
             .is_ok()
         );
 
-        // Deprecated vars still valid in every scope
-        assert!(validate_template("{{ main_worktree }}", hook, &test.repo, "test").is_ok());
+        // Remote-derived repo vars validate in every scope
+        assert!(
+            validate_template("{{ owner }}/{{ remote_repo }}", hook, &test.repo, "test").is_ok()
+        );
+        assert!(
+            validate_template(
+                "{{ remote_repo }}",
+                ValidationScope::Alias,
+                &test.repo,
+                "test"
+            )
+            .is_ok()
+        );
+
+        // Retired names resolve nowhere: the deprecation layer renames them
+        // before serde parses, so one reaching validation was typed on the
+        // command line and gets the undefined-variable error.
+        assert!(validate_template("{{ main_worktree }}", hook, &test.repo, "test").is_err());
 
         // `args` validates in both Hook and Alias scopes.
         assert!(validate_template("echo {{ args }}", hook, &test.repo, "test").is_ok());
@@ -2977,11 +3196,7 @@ mod tests {
             "test",
         )
         .unwrap_err();
-        assert!(
-            err.message.contains("undefined value"),
-            "got: {}",
-            err.message
-        );
+        assert!(err.message.contains("undefined"), "got: {}", err.message);
 
         // `base` is available in pre-start.
         assert!(
@@ -3013,11 +3228,7 @@ mod tests {
             "test",
         )
         .unwrap_err();
-        assert!(
-            err.message.contains("undefined value"),
-            "got: {}",
-            err.message
-        );
+        assert!(err.message.contains("undefined"), "got: {}", err.message);
         assert!(err.message.contains("targte"), "got: {}", err.message);
 
         // `pr_number`/`pr_url` are available in pre-start (populated when
@@ -3043,11 +3254,7 @@ mod tests {
             "test",
         )
         .unwrap_err();
-        assert!(
-            err.message.contains("undefined value"),
-            "got: {}",
-            err.message
-        );
+        assert!(err.message.contains("undefined"), "got: {}", err.message);
 
         // `args` is available in hook scope (forwarded via smart routing).
         assert!(
@@ -3068,11 +3275,7 @@ mod tests {
             "test",
         )
         .unwrap_err();
-        assert!(
-            err.message.contains("undefined value"),
-            "got: {}",
-            err.message
-        );
+        assert!(err.message.contains("undefined"), "got: {}", err.message);
     }
 
     #[test]
@@ -3128,14 +3331,37 @@ mod tests {
             "test",
         )
         .unwrap_err();
-        assert!(
-            err.message.contains("undefined value"),
-            "got: {}",
-            err.message
-        );
+        assert!(err.message.contains("undefined"), "got: {}", err.message);
         // Should list available vars in hint
         assert!(!err.available_vars.is_empty(), "should list available vars");
         assert!(err.available_vars.contains(&"branch".to_string()));
+
+        let err = validate_template(
+            "echo {{ brnch }}",
+            ValidationScope::Hook(HookType::PreMerge),
+            &test.repo,
+            "test",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.message,
+            "Failed to expand test: undefined variable brnch"
+        );
+        assert_eq!(err.source_line.as_deref(), Some("echo {{ brnch }}"));
+        assert_eq!(err.suggestion.as_deref(), Some("branch"));
+
+        let err = validate_template(
+            "{{ brnch }}{{ other_missing }}",
+            ValidationScope::Alias,
+            &test.repo,
+            "test",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.message,
+            "Failed to expand test: undefined variables brnch, other_missing"
+        );
+        assert_eq!(err.suggestion, None);
     }
 
     #[test]
@@ -3170,6 +3396,7 @@ mod tests {
         repo                  = demo
         repo_path             = /tmp/demo
         owner                 = (unset)
+        remote_repo           = (unset)
         primary_worktree_path = (unset)
         default_branch        = (unset)
         remote                = (unset)

@@ -8,37 +8,29 @@
 //! On Windows, Git for Windows must be installed — this is nearly universal among
 //! Windows developers since git itself is required.
 //!
+//! ## Spawning children
+//!
+//! Worktrunk's command spawns use [`spawn`] or [`spawn_shared_child`]. Their
+//! shared lock covers descriptor setup and process creation, never child waits:
+//! children still execute concurrently. On macOS, the standard library creates
+//! pipes and sockets before marking them close-on-exec. Serializing their setup
+//! with spawns prevents a child from retaining another command's output or wake.
+//!
 //! ## Process groups and signal handling (Unix, `Cmd::stream`)
 //!
-//! Foreground children spawned through `Cmd::stream()` fall into one of two
-//! shapes, selected by the `forward_signals` / `share_parent_pgroup` pair:
+//! Foreground children share the caller's process group, including concurrent
+//! hooks with piped output and closed stdin. Group membership is independent
+//! of input allocation: programs may still open `/dev/tty` for terminal control.
+//! The shell owns the foreground job and the kernel delivers Ctrl-C, Ctrl-Z
+//! and hangup to it. No terminal handoff or private foreground group is needed.
 //!
-//! - **Isolated** (`forward_signals()` alone): the child gets its own process
-//!   group via `process_group(0)`. A signal_hook listener catches SIGINT/
-//!   SIGTERM in wt and `killpg`s the child group with SIGINT→SIGTERM→SIGKILL
-//!   escalation. Used for non-interactive children that may fork further
-//!   subprocesses (hook pipelines, alias steps that read from stdin) — `killpg`
-//!   reaches the whole subtree, which a shared-pgroup approach cannot.
-//!
-//! - **Shared-tty** (`forward_signals().inherit_stdin()`): the child stays in
-//!   wt's process group so it can drive `/dev/tty` (raw mode, `tcsetattr`)
-//!   without the kernel raising SIGTTOU. Tty-initiated signals (Ctrl-C, hangup)
-//!   reach the child via the kernel's foreground-pgroup broadcast; the listener
-//!   additionally delivers externally-targeted signals (e.g. `kill -TERM
-//!   <wt-pid>`) to the child by PID, single-shot. Used for interactive TUIs
-//!   (skim picker, pagers, `$EDITOR`).
-//!
-//! In both cases the listener still records `seen_signal`, so a signal-derived
-//! exit surfaces as `WorktrunkError::ChildProcessExited { signal: Some(_) }` —
-//! the structured channel that loop callers (`for-each`, hook/alias pipelines)
-//! use to abort their loops on Ctrl-C rather than continuing to the next
-//! iteration. See `git/interrupt_signal` for the consumer side.
-//!
-//! Concurrent foreground children (`output/concurrent.rs`) and detached
-//! background children (`commands/process.rs::spawn_detached_*`) have separate
-//! spawn paths; both isolate-by-default for the same `killpg` reason. They
-//! never share wt's pgroup because they don't drive the tty (concurrent uses
-//! piped stdio, detached escapes the PTY entirely).
+//! [`Cmd::forward_signals`] observes direct exit while waiting, preserving a
+//! child's normal exit when it handles Ctrl-C.
+//! SIGTERM addressed only to wt is forwarded
+//! to owned direct children and cancels the command. Child signal exits propagate
+//! through `WorktrunkError::ChildProcessExited` to stop foreground loops.
+//! Detached background commands and timeout-bounded captures have separate
+//! ownership: those commands may create a private group for tree cancellation.
 //!
 //! ## Cancelling background children
 //!
@@ -46,11 +38,38 @@
 //! keep running as orphans. [`cancel_background_commands`] lets the foreground
 //! thread stop that work — both what is running and what has yet to start —
 //! once nobody is left to read its results.
+//!
+//! ## Timed waits
+//!
+//! [`wait_shared_child`] is the canonical wait for shared child handles. macOS
+//! kernel exit events avoid SharedChild's stop-sensitive `waitid` path while
+//! retaining its synchronized reaping and PID-safe signal delivery. Other
+//! platforms use SharedChild's native waits and deadlines. macOS waits do not
+//! change SIGCHLD dispositions or masks, including when a deadline expires.
+//! Foreground waits publish native INT/TERM to current foreground scopes.
+//! Captures and pagers do not publish cancellation themselves; command consumers
+//! decide whether to propagate their typed failures to the foreground operation.
+//!
+//! **Why not `wait-timeout`.** wt used it until #3856. Its `SIGCHLD` handler
+//! pokes an `AF_UNIX` socketpair with `send()` and `panic!`s on any errno but
+//! `WouldBlock`; the handler is `extern "C"`, so that panic cannot unwind and
+//! goes straight to `abort()`. Under a sandbox that denies the send (the Codex
+//! CLI's `workspace-write` mode) every timed wait in wt became an uncatchable
+//! `SIGABRT` with no diagnostic. `shared_child` reaches the same signal through
+//! `signal_hook`, whose wake deliberately discards write errors — a missed
+//! wakeup costs at worst a wait that runs to its deadline, which is what a
+//! deadline is for. It also probes the wake fd and falls back to `write()` on a
+//! pipe, so the syscall that sandbox denies is not even on the path.
+//!
+//! **When a timed wait fails.** A wall-clock deadline failure retires the
+//! owned child. An advisory output-delay failure switches to streaming and
+//! retries the canonical wait; if that wait also fails, it retires the child
+//! before joining output readers and returns the underlying error.
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,11 +77,70 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use wait_timeout::ChildExt;
+use shared_child::SharedChild;
 
-use crate::git::{GitError, WorktrunkError};
+use crate::git::WorktrunkError;
+use crate::path::format_path_for_display;
+use crate::styling::eprintln;
 use crate::sync::Semaphore;
 use crate::trace::CommandTrace;
+
+#[cfg(unix)]
+pub mod pipe;
+
+/// Prepare complete input before spawning, with no producer that can block.
+/// The anonymous file is removed when its last handle closes, even on interruption.
+/// This is seekable stdin, unlike the pipes connecting live pipeline stages.
+pub fn buffered_stdin(bytes: &[u8]) -> std::io::Result<Stdio> {
+    let mut file = tempfile::tempfile()?;
+    file.write_all(bytes)?;
+    file.rewind()?;
+    Ok(file.into())
+}
+
+// Published Linux/Windows targets use atomic descriptors or std's spawn lock.
+#[cfg(target_vendor = "apple")]
+static PROCESS_CREATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialize process creation with descriptor creation that sets close-on-exec
+/// after its native syscall. Otherwise a concurrent spawn can inherit endpoints
+/// between creation and CLOEXEC, keeping unrelated output or wakeups alive.
+pub(crate) fn with_process_creation_guard<T>(
+    create: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    #[cfg(target_vendor = "apple")]
+    let _guard = PROCESS_CREATION_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    create()
+}
+
+/// Spawn a child under the shared process-creation guard.
+pub fn spawn(command: &mut Command) -> std::io::Result<std::process::Child> {
+    with_process_creation_guard(|| command.spawn()).map_err(|error| spawn_error(command, error))
+}
+
+/// Spawn a shared child under the same process-creation lock as [`spawn`].
+pub fn spawn_shared_child(command: &mut Command) -> std::io::Result<SharedChild> {
+    // SharedChild::new calls try_wait and can reap a short-lived child here.
+    // Keep SharedChild::spawn's unreaped ownership for process-tree cleanup.
+    with_process_creation_guard(|| SharedChild::spawn(command))
+        .map_err(|error| spawn_error(command, error))
+}
+
+/// Create wakeup endpoints under the same guard as process creation.
+#[cfg(unix)]
+pub fn socket_pair() -> std::io::Result<(
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+)> {
+    with_process_creation_guard(std::os::unix::net::UnixStream::pair)
+}
+
+/// Create a stream socket without holding the spawn guard during connection I/O.
+pub fn stream_socket(domain: socket2::Domain) -> std::io::Result<socket2::Socket> {
+    with_process_creation_guard(|| socket2::Socket::new(domain, socket2::Type::STREAM, None))
+}
 
 /// Semaphore to limit concurrent command execution.
 /// Prevents resource exhaustion when spawning many parallel git commands.
@@ -99,7 +177,8 @@ fn is_foreground_thread() -> bool {
 /// foreground thread is the one that cancels, and is never itself inside a
 /// tracked command while doing so, so the work the user is actually waiting
 /// on is never a target; an [`uninterruptible`] thread finishes what it
-/// started.
+/// started. A command marked [`Cmd::finish_once_started`] doesn't register
+/// either, so it runs to completion once spawned.
 static BACKGROUND_PIDS: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 
 /// Deregisters a background command's PID however the command finishes.
@@ -158,9 +237,8 @@ fn is_cancellable_thread() -> bool {
 /// Register a freshly spawned child as cancellable for as long as the returned
 /// guard lives. Returns `None` when this thread's commands aren't subject to
 /// cancellation (see [`is_cancellable_thread`]).
-fn track_if_cancellable(child: &std::process::Child) -> Option<BackgroundPid> {
+fn track_if_cancellable(pid: u32) -> Option<BackgroundPid> {
     is_cancellable_thread().then(|| {
-        let pid = child.id();
         BACKGROUND_PIDS.lock().unwrap().insert(pid);
         let guard = BackgroundPid(pid);
         // Re-read after publishing the PID, closing the window between this
@@ -174,6 +252,12 @@ fn track_if_cancellable(child: &std::process::Child) -> Option<BackgroundPid> {
         }
         guard
     })
+}
+
+/// Whether a cancellation would signal `pid` right now.
+#[cfg(all(test, unix))]
+pub(crate) fn is_cancellable_pid(pid: u32) -> bool {
+    BACKGROUND_PIDS.lock().unwrap().contains(&pid)
 }
 
 /// Set once the foreground thread has cancelled background work, so commands
@@ -196,7 +280,8 @@ fn cancelled_error() -> std::io::Error {
 }
 
 /// Abandon background work: nothing further spawns, and whatever is already
-/// running is signalled rather than left to finish as an orphan.
+/// running is signalled rather than left to finish as an orphan — except
+/// commands marked [`Cmd::finish_once_started`], which run to completion.
 ///
 /// Callers see either as an ordinary command failure, which every background
 /// caller already treats as "no result".
@@ -212,7 +297,7 @@ pub fn cancel_background_commands() {
 /// stranding an `index.lock` in a worktree the user is about to work in.
 #[cfg(unix)]
 fn signal_background_pid(pid: u32) {
-    forward_signal_to_pid(pid as i32, signal_hook::consts::SIGTERM);
+    terminate_pid(pid as i32);
 }
 
 /// Windows has no signal to deliver to an unrelated PID, so a command already
@@ -363,20 +448,13 @@ fn semaphore() -> &'static Semaphore {
 /// Cached shell configuration for the current platform
 static SHELL_CONFIG: OnceLock<Result<ShellConfig, String>> = OnceLock::new();
 
-/// Shell configuration for command execution
+/// POSIX shell configuration for command execution (sh or Git Bash).
 #[derive(Debug, Clone)]
 pub struct ShellConfig {
     /// Path to the shell executable
     pub executable: PathBuf,
-    /// Arguments to pass before the command (e.g., ["-c"] for sh, ["/C"] for cmd)
+    /// Arguments to pass before the command (e.g., ["-c"] for sh)
     pub args: Vec<String>,
-    /// Whether this shell supports POSIX syntax (bash, sh, zsh, etc.).
-    ///
-    /// When true, commands can use POSIX features like:
-    /// - `{ cmd; } 1>&2` for stdout redirection
-    /// - `printf '%s' ... | cmd` for stdin piping
-    /// - `nohup ... &` for background execution
-    pub is_posix: bool,
     /// Human-readable name for error messages
     pub name: String,
 }
@@ -412,7 +490,6 @@ fn detect_shell() -> Result<ShellConfig, String> {
         Ok(ShellConfig {
             executable: PathBuf::from("sh"),
             args: vec!["-c".to_string()],
-            is_posix: true,
             name: "sh".to_string(),
         })
     }
@@ -433,7 +510,6 @@ fn detect_windows_shell() -> Result<ShellConfig, String> {
         return Ok(ShellConfig {
             executable: bash_path,
             args: vec!["-c".to_string()],
-            is_posix: true,
             name: "Git Bash".to_string(),
         });
     }
@@ -450,42 +526,32 @@ fn detect_windows_shell() -> Result<ShellConfig, String> {
 /// (WSL launcher) often comes before Git Bash in PATH.
 #[cfg(windows)]
 fn find_git_bash() -> Option<PathBuf> {
-    // Primary: find git in PATH and derive bash location
-    if let Ok(git_path) = which::which("git") {
-        // git.exe is typically at Git/cmd/git.exe or Git/bin/git.exe
-        // bash.exe is at Git/bin/bash.exe or Git/usr/bin/bash.exe
-        if let Some(git_dir) = git_path.parent().and_then(|p| p.parent()) {
-            let bash_path = git_dir.join("bin").join("bash.exe");
-            if bash_path.exists() {
-                return Some(bash_path);
-            }
-            let bash_path = git_dir.join("usr").join("bin").join("bash.exe");
-            if bash_path.exists() {
-                return Some(bash_path);
-            }
-        }
+    // Ask Git itself so PATH shims resolve to the installation they launch.
+    let git_path = which::which("git").ok()?;
+    let output = Cmd::new(git_path.to_string_lossy())
+        .arg("--exec-path")
+        .env_remove("GIT_EXEC_PATH") // User overrides name helpers, not the install.
+        .run()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let exec_path = std::str::from_utf8(&output.stdout).ok()?;
+    git_bash_from_exec_path(Path::new(exec_path.trim_end()))
+}
 
-    // Fallback: standard Git for Windows paths (needed on some CI environments
-    // where `which` doesn't find git even though it's installed)
-    let bash_path = PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
-    if bash_path.exists() {
-        return Some(bash_path);
+/// Git for Windows reports `<install>/<runtime>/libexec/git-core` for --exec-path.
+/// The runtime name varies by architecture; Bash belongs to the install root.
+#[cfg(any(windows, test))]
+fn git_bash_from_exec_path(exec_path: &Path) -> Option<PathBuf> {
+    if !exec_path.ends_with(Path::new("libexec").join("git-core")) {
+        return None;
     }
-
-    // Per-user Git for Windows installation (default path when installed without admin rights)
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        let bash_path = PathBuf::from(local_app_data)
-            .join("Programs")
-            .join("Git")
-            .join("bin")
-            .join("bash.exe");
-        if bash_path.exists() {
-            return Some(bash_path);
-        }
-    }
-
-    None
+    let root = exec_path.parent()?.parent()?.parent()?;
+    [root.join("bin"), root.join("usr").join("bin")]
+        .into_iter()
+        .map(|dir| dir.join("bash.exe"))
+        .find(|bash_path| bash_path.is_file())
 }
 
 /// Environment variable naming the directive file for `cd` path changes.
@@ -496,33 +562,96 @@ fn find_git_bash() -> Option<PathBuf> {
 /// injection surface — this is safe to pass through to alias/hook shell bodies.
 pub const DIRECTIVE_CD_FILE_ENV_VAR: &str = "WORKTRUNK_DIRECTIVE_CD_FILE";
 
-/// Environment variable naming the directive file for arbitrary exec commands.
+/// Retired shell-command directive variable.
 ///
-/// Shell wrappers set this to a temp file; wt writes shell commands (e.g. the
-/// body of `wt switch --execute`) to it and the wrapper sources the file after
-/// wt exits, so the command runs in the user's interactive shell. Because the
-/// file contents are arbitrary shell, wt scrubs this from project-alias and
-/// hook child environments — a body authored in shared config could inject
-/// shell into the parent shell. User-source aliases re-add it (issue #2101)
-/// since the body is user-authored just like a top-level `wt --execute`.
+/// Current wrappers no longer set it. Its presence tells `--execute` that the
+/// live shell still has an old wrapper loaded, and subprocesses must not
+/// inherit it: an older parent wrapper would source anything written there
+/// after wt exits.
 pub const DIRECTIVE_EXEC_FILE_ENV_VAR: &str = "WORKTRUNK_DIRECTIVE_EXEC_FILE";
 
-/// Legacy pre-split directive file env var. Honored for one release so users
-/// who upgraded `wt` without restarting their shell still get shell integration
-/// from their current session's old wrapper. When only this is set (no new
-/// vars), wt writes shell-format directives to it. Remove in the next breaking
-/// release.
-pub const DIRECTIVE_FILE_ENV_VAR: &str = "WORKTRUNK_DIRECTIVE_FILE";
+/// Retired single-file directive env var.
+///
+/// wt never writes to or passes this file through, but still removes the
+/// variable from child environments so an old wrapper cannot expose a file
+/// that its parent shell will source.
+pub const RETIRED_DIRECTIVE_FILE_ENV_VAR: &str = "WORKTRUNK_DIRECTIVE_FILE";
+
+/// Environment variable carrying the directory the user's shell is in.
+///
+/// A top-level `wt` reads that directory from its own process cwd, which is
+/// what subdirectory preservation resolves the user's position against (from
+/// `monorepo.feature/subproject/`, `wt switch main` lands in
+/// `monorepo/subproject/`). A `wt` nested inside an alias or hook body cannot:
+/// those bodies run with a wt-chosen working directory (the worktree root), so
+/// the nested process would resolve the user to that root and drop them there.
+///
+/// [`apply_cd_directive_env`] therefore sets this alongside the CD directive
+/// file — the same children that are allowed to move the user's shell are the
+/// ones that need to know where it currently is. Nesting composes because
+/// [`shell_cwd`] prefers the inherited value over the process cwd, so each
+/// layer forwards the shell's directory rather than its own. See issue #3723.
+///
+/// Private, unlike the directive-file vars above: the setter, the scrubber and
+/// the reader all live in this module, and a name spells the coupling between
+/// them that a repeated literal would leave to a spelling match.
+const SHELL_CWD_ENV_VAR: &str = "WORKTRUNK_SHELL_CWD";
+
+/// The directory the user's shell is in: the inherited `WORKTRUNK_SHELL_CWD`
+/// when a parent `wt` set it, otherwise this process's own startup cwd.
+///
+/// Callers that ask "where is the user physically standing?" use this rather
+/// than [`std::env::current_dir`]. `-C` is deliberately not consulted: it sets
+/// git's discovery path without moving the shell.
+pub fn shell_cwd() -> Option<PathBuf> {
+    shell_cwd_from(std::env::var_os(SHELL_CWD_ENV_VAR), startup_cwd())
+}
+
+/// Pure form of [`shell_cwd`], split out so the relative-value fall-through is
+/// unit-testable without mutating process-wide state — the same split
+/// [`compute_git_env_overrides`] makes for [`inherited_git_env_overrides`].
+fn shell_cwd_from(inherited: Option<OsString>, fallback: Option<&PathBuf>) -> Option<PathBuf> {
+    if let Some(value) = inherited {
+        let path = PathBuf::from(value);
+        // A relative value can't name the shell's position from a child that
+        // runs elsewhere, so fall through to the process cwd. A stale absolute
+        // one needs no guard here: the subdirectory it resolves to has to exist
+        // in the destination before anything `cd`s there.
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    fallback.cloned()
+}
 
 /// Scrub all directive file env vars from a `std::process::Command`.
 ///
 /// Prevents child processes from writing to the parent shell's directive
 /// files. Called by every code path that spawns external commands (Cmd,
 /// help pager, picker pager, background hooks, git credential helpers).
+///
+/// `WORKTRUNK_SHELL_CWD` goes with them: it is meaningful only to a child that
+/// can act on the shell's position, and those children get it back from
+/// [`apply_cd_directive_env`].
 pub fn scrub_directive_env_vars(cmd: &mut std::process::Command) {
     cmd.env_remove(DIRECTIVE_CD_FILE_ENV_VAR);
     cmd.env_remove(DIRECTIVE_EXEC_FILE_ENV_VAR);
-    cmd.env_remove(DIRECTIVE_FILE_ENV_VAR);
+    cmd.env_remove(RETIRED_DIRECTIVE_FILE_ENV_VAR);
+    cmd.env_remove(SHELL_CWD_ENV_VAR);
+}
+
+/// Re-add the CD directive file to a trusted child's environment, together
+/// with the shell cwd that makes its `cd` land where the user actually is.
+///
+/// The two travel together by construction: a child that can redirect the
+/// parent shell resolves the user's subdirectory against [`shell_cwd`], and
+/// without it every nested `wt switch` / `wt remove` inside an alias or hook
+/// body would `cd` to a worktree root (issue #3723).
+pub fn apply_cd_directive_env(cmd: &mut std::process::Command, cd_file: &std::path::Path) {
+    cmd.env(DIRECTIVE_CD_FILE_ENV_VAR, cd_file);
+    if let Some(cwd) = shell_cwd() {
+        cmd.env(SHELL_CWD_ENV_VAR, cwd);
+    }
 }
 
 /// Scrub the git-discovery path vars ([`INHERITED_GIT_PATH_VARS`]) from a child
@@ -535,10 +664,9 @@ pub fn scrub_directive_env_vars(cmd: &mut std::process::Command) {
 ///
 /// - **`wt` relocated a user command into a worktree it selected** — hooks
 ///   (run in the operation's worktree), `wt step for-each` (run in each
-///   worktree in turn), and the `--execute` no-integration fallback (run in
-///   the switch target when `wt` itself executes the payload) — the cwd
-///   carries `wt`'s intent, so the inherited context is scrubbed and the
-///   command's `git` calls discover the worktree from the cwd. The inherited
+///   worktree in turn), and the `--execute` program (run in the switch target)
+///   — the cwd carries `wt`'s intent, so the inherited context is scrubbed and
+///   the command's `git` calls discover the worktree from the cwd. The inherited
 ///   context is common, not exotic: `git` exports an absolute `GIT_DIR`
 ///   pinned to the invoking worktree's private gitdir when `wt` runs as a
 ///   `!wt` alias from a **linked worktree**, and git itself exports discovery
@@ -551,105 +679,105 @@ pub fn scrub_directive_env_vars(cmd: &mut std::process::Command) {
 /// - **The child runs where the user already was** — aliases (the user's own
 ///   top-level command, run from the invoking worktree) and `commit.generation`
 ///   commands (spawned with no `current_dir`) — the inherited context *is* the
-///   user's context, so it is forwarded untouched. Under shell integration the
-///   `--execute` payload also lands here: the wrapper shell evaluates it, so
-///   it sees that shell's own environment (which never contains the vars a
-///   `!wt` git alias exports — git's exports die with `wt`'s process tree).
-///   Scrubbing the fallback therefore *converges* the two `--execute` paths
-///   for the alias case; only a `GIT_DIR` the user globally exported in their
-///   interactive shell still differs, and such an env misdirects every plain
-///   `git` command they run anyway.
+///   user's context, so it is forwarded untouched.
 ///
-/// - **`wt`'s own git plumbing** ([`Cmd`] via `Repository::run_command`) keeps
-///   the inherited context on purpose (relative values absolutized, see issue
-///   #1914): `wt` honoring the context it was handed is the point of running
-///   `wt` under `git`.
+/// - **`wt`'s own git plumbing** splits on the same question. Repo-level
+///   ([`Cmd`] via `Repository::run_command`) keeps the inherited context on
+///   purpose (relative values absolutized, see issue #1914): `wt` honoring
+///   the context it was handed is the point of running `wt` under `git`. Its
+///   cwd is `discovery_path`, which is often but not always where the user
+///   invoked `wt` — `Repository::at` is handed a `wt`-chosen worktree at
+///   several sites (the post-switch hook repo, the pipeline repo, `finish`'s
+///   destination repo, the `pre-remove` render repo). The exemption rests on
+///   scope rather than cwd: repo-level questions are worktree-agnostic within
+///   one repository, and every worktree-scoped answer routes through
+///   [`crate::git::WorkingTree`], which scrubs.
+///   **Worktree-local** plumbing — [`crate::git::WorkingTree::run_command`],
+///   `TempIndex::command`, `list_ignored_entries` — relocates git into a
+///   worktree `wt` resolved, so it scrubs, the same way hooks and `for-each`
+///   do. Otherwise a `!wt` alias from a linked worktree (`GIT_DIR` pinned to
+///   that worktree's private gitdir) makes `status` / `read-tree` on a
+///   *different* worktree use the invoking tree's index.
 ///
-/// Any new spawn site that relocates a user command into a `wt`-chosen
-/// worktree must apply this scrub, via this helper or
-/// [`Cmd::scrub_git_discovery_env`].
+/// Every site uses this one list; a site that needs its own value for a
+/// scrubbed var sets it *after* the scrub rather than subsetting the list
+/// ([`Cmd::scrub_git_discovery_env`]). That includes `GIT_OBJECT_DIRECTORY`:
+/// a redirected repository re-sets its own immediately after, so the only
+/// value a worktree-local scrub drops is an **inherited** one — which git
+/// supplies to push-quarantine hooks, and which is pinned to the invoking
+/// context exactly as `GIT_DIR` is. Dropping it is the deliberate call, not
+/// an artifact of reusing the list.
+///
+/// Any new spawn site whose cwd names a `wt`-chosen worktree must apply this
+/// scrub, via this helper or [`Cmd::scrub_git_discovery_env`].
 pub fn scrub_git_discovery_env_vars(cmd: &mut std::process::Command) {
     for var in INHERITED_GIT_PATH_VARS {
         cmd.env_remove(var);
     }
 }
 
+/// The hermetic git-config floor for test processes: the deny pair points
+/// global and system config at a path that does not exist (git reads a
+/// missing config file as empty), and `GIT_CONFIG_COUNT` with its numbered
+/// keys and values — git's environment spelling of `-c` — supplies the two
+/// settings the suite needs in the denied config's place. What each entry is
+/// for, and why `-c` precedence keeps this list short: `tests/AGENTS.md` →
+/// Git Config Isolation.
+pub const HERMETIC_TEST_GIT_ENV: [(&str, &str); 7] = [
+    ("GIT_CONFIG_GLOBAL", "/nonexistent/wt/gitconfig"),
+    ("GIT_CONFIG_SYSTEM", "/nonexistent/wt/gitconfig"),
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_0", "user.useConfigOnly"),
+    ("GIT_CONFIG_VALUE_0", "true"),
+    ("GIT_CONFIG_KEY_1", "rerere.enabled"),
+    ("GIT_CONFIG_VALUE_1", "false"),
+];
+
+/// When latched, every child spawned through [`Cmd`] gets
+/// [`HERMETIC_TEST_GIT_ENV`] — including the git that *production* code
+/// spawns while a test drives it in-process, which no per-command harness
+/// hook can reach. The test harness latches it before the first fixture;
+/// production code never does. An in-process test cannot set its own
+/// environment instead — `std::env::set_var` races the other test threads —
+/// but an atomic latch is sound from any thread.
+///
+/// TODO(hermetic-env): a test-serving switch in production code, accepted as
+/// the pragmatic middle over its alternatives — a pre-`main` constructor
+/// crate every test target must link, or threading an explicit env value
+/// through `Repository`, which is the structural fix.
+static HERMETIC_TEST_ENV_LATCHED: AtomicBool = AtomicBool::new(false);
+
+/// Latch [`HERMETIC_TEST_GIT_ENV`] onto every future [`Cmd`] child in this
+/// process. Called by the `worktrunk::testing` harness; idempotent.
+pub fn enable_hermetic_test_env() {
+    HERMETIC_TEST_ENV_LATCHED.store(true, Ordering::Relaxed);
+}
+
+/// Apply [`HERMETIC_TEST_GIT_ENV`] to `cmd` if the latch is set. The unlatched
+/// path is production's: one relaxed load, no env writes.
+pub fn apply_hermetic_test_env(cmd: &mut std::process::Command) {
+    if HERMETIC_TEST_ENV_LATCHED.load(Ordering::Relaxed) {
+        for (key, val) in HERMETIC_TEST_GIT_ENV {
+            cmd.env(key, val);
+        }
+    }
+}
+
 // ============================================================================
-// Directive-Payload Shell Escaping
+// Shell Escaping
 // ============================================================================
 
-/// Environment variable a shell wrapper sets to identify itself.
+/// How to expand a value into a command template.
 ///
-/// The PowerShell wrapper sets `WORKTRUNK_SHELL=powershell` and the fish
-/// wrapper sets `WORKTRUNK_SHELL=fish`; bash, zsh, and nushell leave it unset.
-/// Absence therefore means "POSIX", which is correct for those three wrappers
-/// *and* for the non-integration path where wt runs the `--execute` payload
-/// itself through `sh -c`.
-pub const WORKTRUNK_SHELL_ENV_VAR: &str = "WORKTRUNK_SHELL";
-
-/// How to single-quote a value spliced into a directive payload.
-///
-/// `wt switch --execute` builds one command string and hands it to the active
-/// shell — directly (`sh -c`) or, under shell integration, by writing it to the
-/// EXEC directive file the wrapper evaluates. POSIX shells, PowerShell, and
-/// fish all single-quote, but escape the string body differently — POSIX takes
-/// `\` literally inside `'…'` while fish treats it as an escape — so the
-/// escaper must be keyed on which shell will parse the payload.
-///
-/// `Literal` is the no-escaping mode for filesystem-path templates that are
-/// never spliced into a shell command line.
+/// Hooks and aliases are POSIX shell command lines. Filesystem paths and
+/// `--execute` argv elements use literal expansion because no shell parses
+/// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellEscapeMode {
     /// Substitute values verbatim — used for filesystem paths.
     Literal,
-    /// POSIX single-quoting (`'it'\''s'`). The wrapper-independent default for
-    /// bash, zsh, and nushell, plus `Cmd::shell` (hooks, aliases).
+    /// POSIX single-quoting (`'it'\''s'`) for hooks and aliases.
     Posix,
-    /// PowerShell single-quoting (`'it''s'`), for the PowerShell wrapper's
-    /// `Invoke-Expression` of the EXEC directive file.
-    PowerShell,
-    /// fish single-quoting (`'it\'s'`), for the fish wrapper's `eval` of the
-    /// EXEC directive file. fish — unlike POSIX — treats `\` as an escape
-    /// inside `'…'`, so the POSIX escaper corrupts backslashes there.
-    Fish,
-}
-
-/// Escape mode for a payload the *active directive shell* will parse.
-///
-/// Reads [`WORKTRUNK_SHELL_ENV_VAR`] — the single source of truth for the
-/// per-shell escaping decision shared by `escape_legacy_cd`, the `--execute`
-/// command template, and its trailing args. `powershell` ⇒
-/// [`ShellEscapeMode::PowerShell`], `fish` ⇒ [`ShellEscapeMode::Fish`], any
-/// other value or absent ⇒ [`ShellEscapeMode::Posix`].
-pub fn directive_shell_escape_mode() -> ShellEscapeMode {
-    match std::env::var(WORKTRUNK_SHELL_ENV_VAR) {
-        Ok(v) if v.eq_ignore_ascii_case("powershell") => ShellEscapeMode::PowerShell,
-        Ok(v) if v.eq_ignore_ascii_case("fish") => ShellEscapeMode::Fish,
-        _ => ShellEscapeMode::Posix,
-    }
-}
-
-/// Single-quote `s` for PowerShell: wrap in `'…'`, doubling every embedded `'`.
-///
-/// PowerShell's literal string is `'…'` with `''` as the escape for one quote
-/// (`'can''t'` is `can't`). The POSIX `'\''` idiom is invalid here — that is
-/// the bug B1 fixes for the PowerShell wrapper's `Invoke-Expression` path.
-/// Empty input yields `''`.
-pub fn powershell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-/// Single-quote `s` for fish: wrap in `'…'`, backslash-escaping `\` and `'`.
-///
-/// fish's single-quoted string — unlike POSIX — treats `\` as an escape
-/// character, with only `\\` and `\'` recognized inside `'…'`. So `\` must be
-/// doubled and `'` backslash-escaped; backslash *before* quote, since escaping
-/// the quote introduces a backslash that must not be doubled again. The POSIX
-/// `'\''` idiom would corrupt backslashes (and leave a trailing-`\` argument
-/// as an unterminated string) under the fish wrapper's `eval`. Empty input
-/// yields `''`.
-pub fn fish_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\\', r"\\").replace('\'', r"\'"))
 }
 
 /// Shell-escape `s` for the given [`ShellEscapeMode`].
@@ -661,8 +789,6 @@ pub fn shell_escape_for(mode: ShellEscapeMode, s: &str) -> String {
         ShellEscapeMode::Posix => {
             shell_escape::unix::escape(std::borrow::Cow::Borrowed(s)).into_owned()
         }
-        ShellEscapeMode::PowerShell => powershell_escape(s),
-        ShellEscapeMode::Fish => fish_escape(s),
     }
 }
 
@@ -695,6 +821,7 @@ pub const SUBPROCESS_BOUNDED_TARGET: &str = "worktrunk::subprocess_bounded";
 /// that [`log_output`] prepends to each block in `subprocess.log`, so the two
 /// render the command identically.
 fn command_header(cmd: &str, context: Option<&str>) -> String {
+    let context = crate::trace::emit::diagnostic_context().or(context);
     match context {
         Some(ctx) => format!("$ {cmd} [{ctx}]"),
         None => format!("$ {cmd}"),
@@ -723,7 +850,12 @@ fn command_header(cmd: &str, context: Option<&str>) -> String {
 /// log even when nothing ran.
 ///
 /// Below Debug both targets are disabled and this is a no-op.
-fn log_output(trace: &CommandTrace, stdin: Option<&[u8]>, output: Option<&std::process::Output>) {
+fn log_output(
+    trace: &CommandTrace,
+    stdin: Option<&[u8]>,
+    output: Option<&std::process::Output>,
+    redact_stdout: Option<StdoutRedactor>,
+) {
     // `log::max_level` (held at the verbosity/`RUST_LOG` ceiling by the
     // `LogTracer` cap in `logging::init`) is the coarse "deep logging on at
     // all?" gate that skips building the full *and* bounded output strings
@@ -742,6 +874,12 @@ fn log_output(trace: &CommandTrace, stdin: Option<&[u8]>, output: Option<&std::p
     let (stdout, stderr) = output
         .map(|o| (o.stdout.as_slice(), o.stderr.as_slice()))
         .unwrap_or_default();
+    // Redact the *logged* stdout only. The caller already holds the real
+    // output; this copy is what reaches `trace.log` / `subprocess.log`, so a
+    // command carrying private data (the `worktrunk.config.*` git-config read)
+    // keeps it out of the `-vv` bundle without losing the rest of its output.
+    let redacted = redact_stdout.map(|f| f(stdout));
+    let stdout = redacted.as_deref().unwrap_or(stdout);
     if !stdin.is_empty() || !stdout.is_empty() || !stderr.is_empty() {
         tracing::debug!(
             target: SUBPROCESS_FULL_TARGET,
@@ -828,8 +966,8 @@ fn format_stream_bounded(bytes: &[u8], prefix: &str) -> Vec<String> {
 ///
 /// Spawns reader threads to drain stdout/stderr concurrently (preventing deadlock when
 /// output exceeds the OS pipe buffer), then waits with timeout. On timeout, tears down
-/// the child's whole process tree; scoped threads see EOF and join automatically before
-/// the function returns.
+/// the still-owned child's process tree; scoped readers share the same deadline,
+/// including when an exited child's descendants retain its pipes.
 ///
 /// **The teardown reaches the tree, not just the child, because otherwise the timeout
 /// doesn't bound anything.** A grandchild inherits the child's stderr pipe, so a
@@ -848,6 +986,7 @@ fn format_stream_bounded(bytes: &[u8], prefix: &str) -> Vec<String> {
 fn run_with_timeout_impl(
     cmd: &mut Command,
     timeout: std::time::Duration,
+    cancellable: bool,
 ) -> std::io::Result<std::process::Output> {
     #[cfg(unix)]
     {
@@ -855,15 +994,36 @@ fn run_with_timeout_impl(
         cmd.process_group(0);
     }
 
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let _tracked = track_if_cancellable(&child);
+    let child = spawn_shared_child(cmd)?;
+    let _tracked = cancellable
+        .then(|| track_if_cancellable(child.id()))
+        .flatten();
 
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
+    let deadline = Instant::now() + timeout;
+    let child_stdout = child.take_stdout();
+    let child_stderr = child.take_stderr();
+    #[cfg(unix)]
+    let readers = (|| {
+        Ok::<_, std::io::Error>((
+            child_stdout
+                .map(|stream| pipe::PipeReader::new(stream, Some(deadline), None))
+                .transpose()?,
+            child_stderr
+                .map(|stream| pipe::PipeReader::new(stream, Some(deadline), None))
+                .transpose()?,
+        ))
+    })();
+    #[cfg(not(unix))]
+    let readers = Ok::<_, std::io::Error>((child_stdout, child_stderr));
+    let (mut child_stdout, mut child_stderr) = match readers {
+        Ok(readers) => readers,
+        Err(error) => {
+            kill_timed_out_tree(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
 
     std::thread::scope(|s| {
         let stdout_thread = s.spawn(|| {
@@ -883,27 +1043,98 @@ fn run_with_timeout_impl(
             Ok::<_, std::io::Error>(buf)
         });
 
-        match child.wait_timeout(timeout)? {
-            Some(status) => {
-                let stdout = stdout_thread.join().unwrap()?;
-                let stderr = stderr_thread.join().unwrap()?;
-                Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                })
+        let collect = || {
+            let stdout = output_reader_result(stdout_thread.join());
+            let stderr = output_reader_result(stderr_thread.join());
+            Ok::<_, std::io::Error>((stdout?, stderr?))
+        };
+        // Keep the group leader unreaped until bounded EOF. A descendant-held
+        // pipe can then time out without surrendering the identity used by cleanup.
+        #[cfg(unix)]
+        let output = match collect() {
+            Ok(output) => output,
+            Err(error) => {
+                // A child already ended by a native INT/TERM stays cancelled even
+                // when a descendant holding its pipes ran the readers to the
+                // deadline; reporting `TimedOut` would let callers fall back as
+                // if the command were merely slow. The probe leaves the leader
+                // unreaped for the teardown, and signalling its zombie cannot
+                // change the status the final `wait` then reports.
+                let interrupted = exited_by_native_interrupt(child.id());
+                kill_timed_out_tree(child.id());
+                let _ = child.kill();
+                return match child.wait() {
+                    Ok(status) if interrupted => Ok(std::process::Output {
+                        status,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    }),
+                    _ => Err(error),
+                };
             }
-            None => {
+        };
+        let status = match wait_shared_child(&child, Some(deadline)) {
+            Ok(status) => status,
+            Err(error) => {
                 kill_timed_out_tree(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
-                Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    "command timed out",
-                ))
+                return Err(error);
             }
-        }
+        };
+        #[cfg(not(unix))]
+        let output = collect()?;
+        Ok(std::process::Output {
+            status,
+            stdout: output.0,
+            stderr: output.1,
+        })
     })
+}
+
+/// Whether SIGINT/SIGTERM already ended `pid`, read with `WNOWAIT` so the
+/// child stays unreaped and keeps pinning its pgid for the teardown.
+#[cfg(target_os = "linux")]
+fn exited_by_native_interrupt(pid: u32) -> bool {
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+    matches!(
+        waitid(
+            Id::Pid(nix::unistd::Pid::from_raw(pid as i32)),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT | WaitPidFlag::WNOHANG,
+        ),
+        Ok(WaitStatus::Signaled(_, Signal::SIGINT | Signal::SIGTERM, _))
+    )
+}
+
+/// Darwin's `waitid` with the same flags; nix doesn't wrap it there. Darwin
+/// leaves `siginfo` untouched for a running child, hence the zeroed buffer,
+/// and can report a stop through `WEXITED`, hence matching `CLD_KILLED` only.
+#[cfg(target_vendor = "apple")]
+#[allow(unsafe_code)]
+fn exited_by_native_interrupt(pid: u32) -> bool {
+    use nix::libc;
+    // SAFETY: `siginfo_t` is plain data; all-zero is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid, exclusively borrowed `siginfo_t`.
+    let ret = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    ret == 0
+        && info.si_signo == libc::SIGCHLD
+        && info.si_code == libc::CLD_KILLED
+        && matches!(info.si_status, libc::SIGINT | libc::SIGTERM)
+}
+
+/// No unreaped status probe here: a deadline-bound cancellation stays `TimedOut`.
+#[cfg(all(unix, not(target_os = "linux"), not(target_vendor = "apple")))]
+fn exited_by_native_interrupt(_pid: u32) -> bool {
+    false
 }
 
 /// Tear down the process tree of a child that outlived its timeout.
@@ -912,9 +1143,21 @@ fn run_with_timeout_impl(
 /// pid is the pgid and the TERM → KILL escalation reaches every member. SIGTERM
 /// first for the same reason [`signal_background_pid`] uses it: git's lockfile
 /// handlers run on TERM, so an interrupted git cleans up after itself.
+///
+/// Signalling by pid is safe here because the caller still holds an unreaped
+/// [`shared_child::SharedChild`]: bounded readers finish before waiting/reaping,
+/// and an expired direct wait leaves the child unreaped. An exited child stays
+/// a zombie reserving its pid until the caller's own `wait()`. It cannot name a different
+/// process group by the time the signal lands.
+///
+/// The same unreaped zombie means the escalation's liveness probe reads the
+/// group as alive for the entire grace, so its final SIGKILL fires even when
+/// every member exited on the TERM. Accepted: that sweep is a no-op against a
+/// dead group (see [`terminate_process_group`]), and holding the zombie
+/// is what pins the pgid.
 #[cfg(unix)]
 fn kill_timed_out_tree(pid: u32) {
-    forward_signal_with_escalation(pid as i32, signal_hook::consts::SIGTERM);
+    terminate_process_group(pid as i32);
 }
 
 /// `taskkill /T` walks the child tree Windows has no process group for; `/F`
@@ -922,16 +1165,22 @@ fn kill_timed_out_tree(pid: u32) {
 /// that detached from it.
 #[cfg(windows)]
 fn kill_timed_out_tree(pid: u32) {
-    let _ = Command::new("taskkill")
+    let mut command = Command::new("taskkill");
+    command
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    let _ = spawn(&mut command).and_then(|mut child| child.wait());
 }
 
 // ============================================================================
 // Builder-style command execution
 // ============================================================================
+
+/// Transform applied to a command's captured stdout before it is written to
+/// the debug/subprocess logs — never to the bytes returned to the caller. See
+/// [`Cmd::redact_logged_stdout`].
+type StdoutRedactor = fn(&[u8]) -> Vec<u8>;
 
 /// Builder for executing commands with two modes of operation.
 ///
@@ -971,26 +1220,31 @@ fn kill_timed_out_tree(pid: u32) {
 pub struct Cmd {
     /// Program name or shell command string (if shell_wrap is true)
     program: String,
-    args: Vec<String>,
+    args: Vec<OsString>,
     current_dir: Option<std::path::PathBuf>,
     context: Option<String>,
     stdin_data: Option<Vec<u8>>,
     timeout: Option<std::time::Duration>,
-    envs: Vec<(OsString, OsString)>,
-    env_removes: Vec<OsString>,
+    /// Environment mutations in call order: `Some(value)` sets, `None`
+    /// removes. One ordered list rather than a set list plus a remove list, so
+    /// the last builder call naming a variable wins — the property
+    /// [`Cmd::scrub_git_discovery_env`] relies on when a caller drops the whole
+    /// inherited git context and then supplies its own value for one of those
+    /// vars (`TempIndex`'s `GIT_INDEX_FILE`, a redirected repository's
+    /// `GIT_OBJECT_DIRECTORY`).
+    env_ops: Vec<(OsString, Option<OsString>)>,
     /// If true, wrap command through ShellConfig (for stream())
     shell_wrap: bool,
     /// Stdout configuration for stream() (defaults to inherit)
     stdout_cfg: Option<std::process::Stdio>,
-    /// Stdin configuration for stream() (defaults to null, or piped if stdin_data is set)
+    /// Stdin configuration for stream() (defaults to null, or a file for stdin_data)
     stdin_cfg: Option<std::process::Stdio>,
-    /// If true, the child shares the parent's process group instead of being
-    /// isolated in its own — required when the child reads the controlling
-    /// terminal (interactive TUI pickers, pagers). Set via `.inherit_stdin()`.
-    /// See the comment in `stream()` for the SIGTTOU rationale.
-    share_parent_pgroup: bool,
-    /// If true, forward signals to child process group (for stream(), Unix only)
+    /// Observe terminal signals and forward PID-targeted cancellation during stream().
     forward_signals: bool,
+    /// If true, treat a SIGPIPE exit as success. This is the default for pager
+    /// producers, where the consumer closing early is expected. Direct user
+    /// programs can opt out with [`Cmd::propagate_sigpipe`].
+    ignore_sigpipe: bool,
     /// When set, log this command to the command log after execution.
     /// The label identifies what triggered the command (e.g., "pre-merge user:lint").
     external_label: Option<String>,
@@ -999,16 +1253,18 @@ pub struct Cmd {
     /// shell bodies may emit cd directives (the file holds a raw path, no shell
     /// injection surface).
     directive_cd_file: Option<std::path::PathBuf>,
-    /// When set, re-adds `WORKTRUNK_DIRECTIVE_EXEC_FILE` after the security
-    /// scrub. Set only by user-source aliases (issue #2101): the body is the
-    /// user's own config, so a nested `wt --execute` is no different from the
-    /// user typing it at the top level. Project aliases and hooks must NEVER
-    /// set this — they could inject arbitrary shell into the parent session.
-    directive_exec_file: Option<std::path::PathBuf>,
-    /// When set, re-adds the legacy `WORKTRUNK_DIRECTIVE_FILE` env var. Used in
-    /// legacy-wrapper compat mode to preserve pre-split behavior for alias/hook
-    /// bodies running under an old shell wrapper.
-    directive_legacy_file: Option<std::path::PathBuf>,
+    /// When set, this transform is applied to captured stdout **before it is
+    /// written to the debug/subprocess logs** — never to the bytes returned to
+    /// the caller. It lets a command whose output carries private data keep
+    /// that data out of the `-vv` diagnostic bundle while still logging the
+    /// rest. The one user is the bulk `git config --list -z` read, which scrubs
+    /// `worktrunk.config.*` values (the experimental private project-config
+    /// source, #3454). Applied only when deep logging is on, so it costs
+    /// nothing on a normal run.
+    redact_logged_stdout: Option<StdoutRedactor>,
+    /// If true, cancellation stops this command from spawning but never
+    /// signals it once running. Set via [`Cmd::finish_once_started`].
+    finish_once_started: bool,
 }
 
 struct ExternalCommandLog {
@@ -1047,6 +1303,7 @@ fn record_captured(
     trace: &mut CommandTrace,
     stdin: Option<&[u8]>,
     result: &std::io::Result<std::process::Output>,
+    redact_stdout: Option<StdoutRedactor>,
 ) {
     match result {
         Ok(output) => trace.complete(output.status.success()),
@@ -1054,7 +1311,67 @@ fn record_captured(
     }
     // stdin is logged either way; stdout/stderr only when the command produced
     // output — a command that failed to spawn still leaves its input behind.
-    log_output(trace, stdin, result.as_ref().ok());
+    log_output(trace, stdin, result.as_ref().ok(), redact_stdout);
+}
+
+/// A child from [`Cmd::spawn_captured`], traced from spawn until
+/// [`Self::wait`] reaps it.
+struct CapturedChild {
+    child: std::process::Child,
+    trace: CommandTrace,
+    _tracked: Option<BackgroundPid>,
+}
+
+impl CapturedChild {
+    fn wait(self) -> std::io::Result<std::process::Output> {
+        let CapturedChild {
+            child,
+            mut trace,
+            _tracked,
+        } = self;
+        let result = child.wait_with_output();
+        record_captured(&mut trace, None, &result, None);
+        result
+    }
+}
+
+/// A spawn failure identifies the program and cwd actually supplied to the OS.
+/// `NotFound` can mean a missing program, cwd, or interpreter, so it does not
+/// establish which is absent. Keep the original I/O error as the source.
+#[derive(Debug)]
+struct SpawnError {
+    program: std::ffi::OsString,
+    cwd: Option<std::path::PathBuf>,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Failed to execute {}", self.program.to_string_lossy())?;
+        if let Some(cwd) = &self.cwd {
+            write!(f, " @ {}", format_path_for_display(cwd))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Enrich an OS spawn failure without changing its kind or guessing its cause.
+fn spawn_error(command: &std::process::Command, source: std::io::Error) -> std::io::Error {
+    let cwd = command.get_current_dir().map(std::path::Path::to_path_buf);
+    std::io::Error::new(
+        source.kind(),
+        SpawnError {
+            program: command.get_program().to_os_string(),
+            cwd,
+            source,
+        },
+    )
 }
 
 /// Structured error from [`Cmd::delayed_stream`].
@@ -1071,8 +1388,8 @@ pub struct StreamCommandError {
     pub output: String,
     /// The command string, e.g., "git worktree add /path -b fix main".
     pub command: String,
-    /// Exit information, e.g., "exit code 255" or "killed by signal".
-    pub exit_info: String,
+    /// Native status, retaining signal identity for cancellation and rendering.
+    pub status: std::process::ExitStatus,
 }
 
 impl std::fmt::Display for StreamCommandError {
@@ -1084,51 +1401,154 @@ impl std::fmt::Display for StreamCommandError {
     }
 }
 
+impl StreamCommandError {
+    pub fn exit_info(&self) -> String {
+        #[cfg(unix)]
+        let signal = std::os::unix::process::ExitStatusExt::signal(&self.status);
+        #[cfg(not(unix))]
+        let signal = None;
+        crate::git::process_exit_description(self.status.code(), signal)
+    }
+}
+
 impl std::error::Error for StreamCommandError {}
+
+/// Shared state between [`Cmd::delayed_stream`] and its two reader threads.
+///
+/// `streaming` lives *inside* the mutex rather than beside it as an atomic so
+/// that a reader cannot consult it without also holding the buffer. The
+/// ordering guarantee this type exists for depends on the check and the write
+/// being one critical section (see [`spawn_delayed_reader`]), and an atomic
+/// makes a lock-free read the natural thing to write.
+#[derive(Default)]
+struct DelayedOutput {
+    /// Once set, readers write to stderr instead of buffering.
+    streaming: bool,
+    /// Lines held back before the switch: drained to stderr behind the
+    /// progress message, or joined into the error body when the command fails
+    /// before streaming ever starts.
+    lines: Vec<String>,
+}
 
 /// Convert a finished child's exit status into `Ok(())` or a
 /// [`StreamCommandError`] carrying the buffered output.
 fn stream_exit_result(
     status: std::process::ExitStatus,
-    buffer: &Arc<Mutex<Vec<String>>>,
+    state: &Arc<Mutex<DelayedOutput>>,
     cmd_str: &str,
 ) -> anyhow::Result<()> {
     if status.success() {
         return Ok(());
     }
-    let lines = buffer.lock().unwrap();
-    let exit_info = status
-        .code()
-        .map(|c| format!("exit code {c}"))
-        .unwrap_or_else(|| "killed by signal".to_string());
+    let lines = &state.lock().unwrap().lines;
     Err(StreamCommandError {
         output: lines.join("\n"),
         command: cmd_str.to_string(),
-        exit_info,
+        status,
     }
     .into())
 }
 
+/// Decode a streamed line, trimming a trailing newline/carriage return and
+/// replacing invalid UTF-8 without dropping later command diagnostics.
+pub fn output_line(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    String::from_utf8_lossy(bytes)
+}
+
 /// Spawn a reader thread for [`Cmd::delayed_stream`]: each line is written to
-/// stderr live once `streaming` is set, or buffered (for the quiet-fast and
-/// pre-threshold cases) until then. Both the child's stdout and stderr use
-/// this; everything routes to stderr to keep our stdout clean.
+/// stderr live once the switch to streaming has happened, or buffered (for the
+/// quiet-fast and pre-threshold cases) until then. Both the child's stdout and
+/// stderr use this; everything routes to stderr to keep our stdout clean.
+///
+/// One [`DelayedOutput`] guard covers both reading `streaming` and writing the
+/// line, and the switch sets that same field under that same lock. So each
+/// line lands on one side of the switch or the other: it is either buffered,
+/// and so drained in order behind the progress message, or written after that
+/// drain has finished. Were the flag readable without the lock, a reader could
+/// observe the flip and print between the progress message and the drain — or
+/// ahead of the progress message entirely, which is what a zero delay makes
+/// routine, since nothing has to be buffered first.
 fn spawn_delayed_reader<R: Read + Send + 'static>(
     stream: R,
-    streaming: Arc<AtomicBool>,
-    buffer: Arc<Mutex<Vec<String>>>,
-) -> std::thread::JoinHandle<()> {
+    state: Arc<Mutex<DelayedOutput>>,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
     std::thread::spawn(move || {
-        let reader = BufReader::new(stream);
-        for line in reader.lines().map_while(Result::ok) {
-            if streaming.load(Ordering::Relaxed) {
-                let _ = writeln!(std::io::stderr(), "{}", line);
-                let _ = std::io::stderr().flush();
+        let mut reader = BufReader::new(stream);
+        let mut bytes = Vec::new();
+        while reader.read_until(b'\n', &mut bytes)? != 0 {
+            let line = output_line(&bytes);
+            let mut state = state
+                .lock()
+                .map_err(|_| std::io::Error::other("Command output state poisoned"))?;
+            if state.streaming {
+                eprintln!("{}", line);
             } else {
-                buffer.lock().unwrap().push(line);
+                state.lines.push(line.into_owned());
             }
+            bytes.clear();
         }
+        Ok(())
     })
+}
+
+/// Convert a reader's thread panic or I/O failure into the output error channel.
+fn output_reader_result<T>(joined: std::thread::Result<std::io::Result<T>>) -> std::io::Result<T> {
+    joined
+        .map_err(|_| std::io::Error::other("Command output reader panicked"))
+        .and_then(|result| result)
+}
+
+/// Join every reader before returning the first I/O or thread failure.
+fn join_delayed_readers(
+    handles: [std::thread::JoinHandle<std::io::Result<()>>; 2],
+) -> std::io::Result<()> {
+    let mut result = Ok(());
+    for handle in handles {
+        let reader_result = output_reader_result(handle.join());
+        result = result.and(reader_result);
+    }
+    result
+}
+
+/// The batch launcher a bare program name resolves to on PATH, if any.
+///
+/// `std::process::Command` resolves a bare name like `az` to `az.exe` only: it
+/// neither walks `PATHEXT` nor falls back to `az.cmd`. Some CLIs ship only a
+/// batch launcher — Azure CLI's WinGet install has `az.cmd` plus an
+/// extensionless bash script, and no `az.exe` — so a bare spawn fails with
+/// `NotFound` although the shell runs them. `which` follows `PATHEXT` and skips
+/// files Windows can't execute; when what it finds is a `.cmd` or `.bat`, its
+/// full path is what to spawn, and std then applies its batch-file argument
+/// quoting. Any other result keeps the bare name and std's own search order.
+///
+/// Resolved once per name: PATH doesn't change during a run, and the search
+/// stats every `PATHEXT` candidate in every PATH directory.
+#[cfg(windows)]
+fn windows_batch_launcher(program: &str) -> Option<PathBuf> {
+    use std::collections::HashMap;
+
+    static RESOLVED: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+
+    let path = Path::new(program);
+    if path.extension().is_some() || path.components().count() != 1 {
+        return None;
+    }
+    let mut resolved = RESOLVED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    resolved
+        .entry(program.to_string())
+        .or_insert_with(|| {
+            which::which(program).ok().filter(|found| {
+                found.extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                })
+            })
+        })
+        .clone()
 }
 
 impl Cmd {
@@ -1140,18 +1560,29 @@ impl Cmd {
             context: None,
             stdin_data: None,
             timeout: None,
-            envs: Vec::new(),
-            env_removes: Vec::new(),
+            env_ops: Vec::new(),
             shell_wrap,
             stdout_cfg: None,
             stdin_cfg: None,
-            share_parent_pgroup: false,
             forward_signals: false,
+            ignore_sigpipe: true,
             external_label: None,
             directive_cd_file: None,
-            directive_exec_file: None,
-            directive_legacy_file: None,
+            redact_logged_stdout: None,
+            finish_once_started: false,
         }
+    }
+
+    /// Redact captured stdout before it reaches the debug/subprocess logs.
+    ///
+    /// The transform never touches the output returned from `run()`; it applies
+    /// only to the copy `log_output` writes when deep logging is on. Use it for
+    /// a command whose stdout carries data that must not land in the `-vv`
+    /// diagnostic bundle — currently the bulk `git config --list -z` read,
+    /// which passes [`crate::config::redact_worktrunk_config_z`].
+    pub fn redact_logged_stdout(mut self, redactor: StdoutRedactor) -> Self {
+        self.redact_logged_stdout = Some(redactor);
+        self
     }
 
     /// Create a new command builder for the given program.
@@ -1176,33 +1607,61 @@ impl Cmd {
         if self.shell_wrap || self.args.is_empty() {
             self.program.clone()
         } else {
-            format!("{} {}", self.program, self.args.join(" "))
+            format!(
+                "{} {}",
+                self.program,
+                self.args
+                    .iter()
+                    .map(|arg| arg.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
         }
     }
 
     fn direct_command(&self) -> Command {
+        #[cfg(windows)]
+        let mut cmd = match windows_batch_launcher(&self.program) {
+            Some(launcher) => Command::new(launcher),
+            None => Command::new(&self.program),
+        };
+        #[cfg(not(windows))]
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         cmd
     }
 
-    fn check_spawn_preconditions(&self) -> std::io::Result<()> {
-        if let Some(dir) = &self.current_dir {
-            let metadata = std::fs::metadata(dir)?;
-            if !metadata.is_dir() {
-                return Err(std::io::Error::new(
-                    ErrorKind::NotADirectory,
-                    format!("{} is not a directory", dir.display()),
-                ));
+    /// [`Self::check_spawn_preconditions`], after checking that this thread's
+    /// commands haven't been cancelled. Background callers check after taking
+    /// their semaphore permit: a command can be cancelled while parked on the
+    /// semaphore, and that is the common case in a large fan-out.
+    fn check_before_spawn(&self, command: &Command) -> std::io::Result<()> {
+        if background_cancelled() {
+            return Err(cancelled_error());
+        }
+        self.check_spawn_preconditions(command)
+    }
+
+    fn check_spawn_preconditions(&self, command: &Command) -> std::io::Result<()> {
+        (|| {
+            if let Some(dir) = &self.current_dir {
+                let metadata = std::fs::metadata(dir)?;
+                if !metadata.is_dir() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::NotADirectory,
+                        format!("{} is not a directory", dir.display()),
+                    ));
+                }
             }
-        }
 
-        let program = Path::new(&self.program);
-        if !self.shell_wrap && program.is_absolute() {
-            ensure_executable_path(program)?;
-        }
+            let program = Path::new(&self.program);
+            if !self.shell_wrap && program.is_absolute() {
+                ensure_executable_path(program)?;
+            }
 
-        Ok(())
+            Ok(())
+        })()
+        .map_err(|error| spawn_error(command, error))
     }
 
     fn apply_common_settings(&self, cmd: &mut Command) {
@@ -1218,18 +1677,21 @@ impl Cmd {
             cmd.env(key, val);
         }
 
-        for (key, val) in &self.envs {
-            cmd.env(key, val);
-        }
-        for key in &self.env_removes {
-            cmd.env_remove(key);
+        // Before `self.env_ops`, so a per-command env can override the floor.
+        apply_hermetic_test_env(cmd);
+
+        // In builder-call order, so the last mutation naming a variable wins.
+        for (key, val) in &self.env_ops {
+            match val {
+                Some(val) => cmd.env(key, val),
+                None => cmd.env_remove(key),
+            };
         }
 
         // Prevent subprocesses from writing shell directives (security).
         // Applied last so it can't be re-added by user-provided envs.
-        // `stream()` selectively re-adds `WORKTRUNK_DIRECTIVE_CD_FILE` (and
-        // the legacy var, in compat mode) for trusted contexts — but never
-        // `WORKTRUNK_DIRECTIVE_EXEC_FILE`, which carries arbitrary shell.
+        // `stream()` selectively re-adds `WORKTRUNK_DIRECTIVE_CD_FILE` for
+        // trusted contexts.
         scrub_directive_env_vars(cmd);
     }
 
@@ -1254,8 +1716,8 @@ impl Cmd {
     }
 
     /// Add a single argument.
-    pub fn arg(mut self, arg: impl Into<String>) -> Self {
-        self.args.push(arg.into());
+    pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.args.push(arg.as_ref().to_os_string());
         self
     }
 
@@ -1263,9 +1725,10 @@ impl Cmd {
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: AsRef<OsStr>,
     {
-        self.args.extend(args.into_iter().map(Into::into));
+        self.args
+            .extend(args.into_iter().map(|arg| arg.as_ref().to_os_string()));
         self
     }
 
@@ -1281,10 +1744,10 @@ impl Cmd {
         self
     }
 
-    /// Set data to pipe to the command's stdin.
+    /// Set complete input bytes, delivered through an anonymous temporary file.
     ///
-    /// For `.run()`, the data is written to a piped stdin.
-    /// For `.stream()`, this takes precedence over `.stdin(Stdio)`.
+    /// The child reads these bytes followed by EOF, without a pipe writer that
+    /// can block on an unread input. This takes precedence over `.stdin(Stdio)`.
     pub fn stdin_bytes(mut self, data: impl Into<Vec<u8>>) -> Self {
         self.stdin_data = Some(data.into());
         self
@@ -1303,35 +1766,66 @@ impl Cmd {
         self
     }
 
+    /// Let this command run to completion once spawned, even if background
+    /// work is cancelled meanwhile ([`cancel_background_commands`]). A
+    /// cancelled command that hasn't spawned yet still never does.
+    ///
+    /// For commands whose interruption leaves debris SIGTERM doesn't clean:
+    /// `git merge-tree` writes its external merge driver's inputs as
+    /// `.merge_file_XXXXXX` files in its cwd and removes them only on a normal
+    /// return, so a signal mid-driver strands them in the user's worktree.
+    ///
+    /// Only affects `.run()`.
+    pub fn finish_once_started(mut self) -> Self {
+        self.finish_once_started = true;
+        self
+    }
+
+    /// [`track_if_cancellable`], unless [`Cmd::finish_once_started`] opted out.
+    fn track_if_cancellable(&self, pid: u32) -> Option<BackgroundPid> {
+        (!self.finish_once_started)
+            .then(|| track_if_cancellable(pid))
+            .flatten()
+    }
+
     /// Set an environment variable.
     ///
     /// Accepts the same types as [`Command::env`]: string literals, `String`,
     /// `&Path`, `PathBuf`, `OsString`, etc.
     pub fn env(mut self, key: impl AsRef<OsStr>, val: impl AsRef<OsStr>) -> Self {
-        self.envs
-            .push((key.as_ref().to_os_string(), val.as_ref().to_os_string()));
+        self.env_ops.push((
+            key.as_ref().to_os_string(),
+            Some(val.as_ref().to_os_string()),
+        ));
         self
     }
 
     /// Remove an environment variable.
+    ///
+    /// A later [`Cmd::env`] for the same variable overrides this.
     pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
-        self.env_removes.push(key.as_ref().to_os_string());
+        self.env_ops.push((key.as_ref().to_os_string(), None));
         self
     }
 
     /// Scrub inherited git-discovery vars ([`INHERITED_GIT_PATH_VARS`]) from the
-    /// child environment. Applied by spawn sites that relocate a user command
-    /// into a `wt`-chosen worktree (hooks, `wt step for-each`) so the command's
-    /// `git` calls discover the repository from the working directory `wt` sets,
-    /// not a `GIT_DIR`/`GIT_WORK_TREE` `wt` inherited. See
+    /// child environment. Applied by every spawn site whose `current_dir` names
+    /// a worktree `wt` chose — relocated user commands (hooks, `wt step
+    /// for-each`, the `--execute` program) and `wt`'s own worktree-local
+    /// plumbing ([`crate::git::WorkingTree::run_command`], `TempIndex`) alike —
+    /// so git discovers the repository from that working directory, not a
+    /// `GIT_DIR`/`GIT_WORK_TREE` `wt` inherited. See
     /// [`scrub_git_discovery_env_vars`] for the site classification (issue #3373).
     ///
     /// Applied after the inherited-`GIT_*` absolutization in
-    /// `apply_common_settings` (env-removes run last), so it also overrides the
-    /// relative-path absolutization that would otherwise re-add these vars.
+    /// `apply_common_settings`, so it also drops the relative-path
+    /// absolutization that would otherwise re-add these vars.
+    ///
+    /// A site that supplies its own value for one of the scrubbed vars calls
+    /// [`Cmd::env`] *after* this: `env_ops` is call-ordered, so the set wins.
     pub fn scrub_git_discovery_env(mut self) -> Self {
         for var in INHERITED_GIT_PATH_VARS {
-            self.env_removes.push(OsString::from(*var));
+            self.env_ops.push((OsString::from(*var), None));
         }
         self
     }
@@ -1350,9 +1844,8 @@ impl Cmd {
     /// Set stdin configuration for `.stream()`.
     ///
     /// Defaults to `Stdio::null()`. For interactive commands that need the
-    /// parent's controlling terminal, use [`Cmd::inherit_stdin()`] instead —
-    /// it also makes `.forward_signals()` keep the child in the parent's
-    /// process group (required to avoid SIGTTOU stopping the child mid-render).
+    /// parent's input, use [`Cmd::inherit_stdin()`] instead. Foreground group
+    /// membership and access to `/dev/tty` are independent of stdin.
     ///
     /// Only affects `.stream()`. For `.run()`, stdin defaults to null unless
     /// data is provided via `.stdin_bytes()`.
@@ -1361,45 +1854,32 @@ impl Cmd {
         self
     }
 
-    /// Inherit the parent's stdin, including the controlling terminal.
+    /// Inherit the parent's stdin for interactive input.
     ///
-    /// Required for children that read from a TTY (interactive TUI pickers,
-    /// pagers, anything that calls `tcsetattr` on `/dev/tty`). When combined
-    /// with [`Cmd::forward_signals()`], the child is *not* isolated in its
-    /// own process group — it shares the parent's. A child reading the
-    /// parent's tty must share the foreground pgroup, or the kernel sends
-    /// SIGTTOU when the child manipulates terminal settings, suspending it.
-    ///
-    /// In the shared-pgroup case the kernel already delivers tty-initiated
-    /// signals (SIGINT from Ctrl-C, SIGTSTP from Ctrl-Z, SIGHUP on hangup)
-    /// to every process in the foreground pgroup. For externally-delivered
-    /// signals that only reach wt (e.g. `kill -TERM <wt-pid>`), the listener
-    /// re-delivers to the child by PID so the child also exits — without
-    /// escalation, since the caller chose the signal and a premature SIGKILL
-    /// would skip the child's tty restore.
+    /// Foreground group membership is independent of this setting.
     pub fn inherit_stdin(mut self) -> Self {
         self.stdin_cfg = Some(std::process::Stdio::inherit());
-        self.share_parent_pgroup = true;
         self
     }
 
-    /// Forward signals (SIGINT, SIGTERM) to child process group.
+    /// Preserve terminal Ctrl-C delivery and forward SIGTERM to live children.
     ///
-    /// On Unix, spawns the child in its own process group and forwards signals
-    /// with escalation (SIGINT → SIGTERM → SIGKILL). This enables clean shutdown
-    /// of the entire process tree on Ctrl-C.
-    ///
-    /// When combined with [`Cmd::inherit_stdin()`], the new-pgroup isolation
-    /// is skipped (the child shares the parent's pgroup so it can drive the
-    /// controlling terminal); the listener then forwards by PID single-shot
-    /// rather than `killpg`-with-escalation, so externally-delivered signals
-    /// (e.g. `kill -TERM <wt-pid>`) still reach the child. Either way,
-    /// signal-derived child exits surface as
-    /// `WorktrunkError::ChildProcessExited { signal: .. }`.
-    ///
+    /// The child shares the caller's foreground group. A handled Ctrl-C keeps
+    /// its normal status; cancellation and signal exits stop foreground loops.
     /// Only affects `.stream()` on Unix. No-op on Windows.
     pub fn forward_signals(mut self) -> Self {
         self.forward_signals = true;
+        self
+    }
+
+    /// Preserve SIGPIPE as exit status 141 instead of treating it as pager
+    /// completion.
+    ///
+    /// `Cmd::stream()` historically ignores SIGPIPE because many callers feed
+    /// a pager that may quit before consuming all output. Use this for a child
+    /// whose status belongs to the user, such as `wt switch --execute`.
+    pub fn propagate_sigpipe(mut self) -> Self {
+        self.ignore_sigpipe = false;
         self
     }
 
@@ -1424,31 +1904,6 @@ impl Cmd {
         self
     }
 
-    /// Pass the EXEC directive file through to the child process.
-    ///
-    /// Re-adds `WORKTRUNK_DIRECTIVE_EXEC_FILE`, allowing the child to request
-    /// arbitrary shell execution in the parent shell (the wrapper sources the
-    /// file after wt exits). This is only safe when the child's command body
-    /// is itself trusted user-authored input — currently just user-source
-    /// aliases, where the alias body lives in the user's own config and
-    /// nesting `wt --execute` is no different from the user typing it. Project
-    /// aliases and hooks must not call this — see issue #2101.
-    pub fn directive_exec_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.directive_exec_file = Some(path.into());
-        self
-    }
-
-    /// Pass the legacy (pre-split) directive file through to the child process.
-    ///
-    /// Used only in legacy-wrapper compat mode. Preserves pre-split behavior
-    /// for alias/hook bodies running under an old shell wrapper that still
-    /// sets `WORKTRUNK_DIRECTIVE_FILE`. Remove together with the legacy env
-    /// var in the next breaking release.
-    pub fn directive_legacy_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.directive_legacy_file = Some(path.into());
-        self
-    }
-
     /// Execute the command and return its output.
     ///
     /// Captures stdout/stderr and returns them in `Output`. For interactive
@@ -1465,9 +1920,7 @@ impl Cmd {
             "Cmd::shell() commands must use .stream(), not .run()"
         );
         debug_assert!(
-            self.directive_cd_file.is_none()
-                && self.directive_exec_file.is_none()
-                && self.directive_legacy_file.is_none(),
+            self.directive_cd_file.is_none(),
             "directive_*_file is only applied by .stream(), not .run()"
         );
 
@@ -1481,81 +1934,123 @@ impl Cmd {
         let mut trace = CommandTrace::new(self.context.as_deref(), &cmd_str)
             .reads_stdin(self.stdin_data.is_some());
 
-        // Checked after the permit, not before: a command can be cancelled
-        // while parked on the semaphore, and that is the common case in a
-        // large fan-out.
-        if background_cancelled() {
-            let e = cancelled_error();
-            trace.fail(&e);
-            external_log.record(None);
-            return Err(e);
-        }
-
-        if let Err(e) = self.check_spawn_preconditions() {
-            trace.fail(&e);
-            external_log.record(None);
-            return Err(e);
-        }
-
         let mut cmd = self.direct_command();
         self.apply_common_settings(&mut cmd);
 
-        // Execute with or without stdin. Every branch produces a single
-        // `Result<Output>` so spawn/write failures resolve the trace through
-        // `record_captured` rather than `?`-ing past it (which would leave the
-        // command unattributed and trip CommandTrace's drop assertion).
-        let result = if let Some(stdin_data) = self.stdin_data.as_deref() {
-            // Stdin piping requires spawn/write/wait
-            // Note: stdin path doesn't support timeout (would need async I/O)
-            cmd.stdin(Stdio::piped())
+        if let Err(e) = self.check_before_spawn(&cmd) {
+            trace.fail(&e);
+            external_log.record(None);
+            return Err(e);
+        }
+
+        // Preparation failures and child outcomes resolve the same trace.
+        let result = (|| {
+            let stdin = self
+                .stdin_data
+                .as_deref()
+                .map(buffered_stdin)
+                .transpose()?
+                .unwrap_or_else(Stdio::null);
+            cmd.stdin(stdin)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    let _tracked = track_if_cancellable(&child);
-                    // Write stdin data in an inner scope so the handle DROPS
-                    // (closing the pipe) before `wait_with_output` — otherwise a
-                    // child that reads stdin to EOF (e.g. `git … --stdin`) blocks
-                    // forever. (ignore BrokenPipe - some commands exit early)
-                    let write_result = {
-                        let mut stdin = child.stdin.take().expect("stdin was configured as piped");
-                        stdin.write_all(stdin_data)
-                    };
-                    match write_result {
-                        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e),
-                        _ => child.wait_with_output(),
-                    }
-                }
-                Err(e) => Err(e),
+            if let Some(timeout) = self.timeout {
+                run_with_timeout_impl(&mut cmd, timeout, !self.finish_once_started)
+            } else {
+                let child = spawn(&mut cmd)?;
+                let _tracked = self.track_if_cancellable(child.id());
+                child.wait_with_output()
             }
-        } else if let Some(timeout_duration) = self.timeout {
-            // Timeout handling uses the existing impl
-            run_with_timeout_impl(&mut cmd, timeout_duration)
-        } else {
-            // Simple case: run and capture output. Spawned explicitly rather
-            // than via `cmd.output()` — which matches these stdio defaults —
-            // because `output()` hands back only the finished result, never
-            // the running child, and a background command has to be
-            // registered as cancellable while it runs (see BACKGROUND_PIDS).
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            match cmd.spawn() {
-                Ok(child) => {
-                    let _tracked = track_if_cancellable(&child);
-                    child.wait_with_output()
-                }
-                Err(e) => Err(e),
-            }
-        };
+        })();
 
-        record_captured(&mut trace, self.stdin_data.as_deref(), &result);
+        record_captured(
+            &mut trace,
+            self.stdin_data.as_deref(),
+            &result,
+            self.redact_logged_stdout,
+        );
 
         let exit_code = result.as_ref().ok().and_then(|output| output.status.code());
         external_log.record(exit_code);
 
         result
+    }
+
+    /// Run `cmds` as concurrent child processes and return each one's output,
+    /// in input order.
+    ///
+    /// Every child is spawned before any is waited on, so a batch of short
+    /// commands costs about one command's latency without a thread per
+    /// command. Outputs are read one child at a time, in order, so a child
+    /// that writes more than a pipe buffer blocks until its turn: use this
+    /// for commands with small output.
+    ///
+    /// The caller waits only on its own children, which makes this safe where
+    /// a thread pool is not: inside a cache initializer that pool jobs also
+    /// read. A rayon thread that waits runs other pool jobs, and a job that
+    /// reads the cache being initialized then deadlocks.
+    ///
+    /// On a background thread the batch takes one semaphore permit, as
+    /// [`Self::pipe_into`] does: one permit per child could deadlock two
+    /// batches that each hold part of the pool. A batch runs at most
+    /// `max_concurrent_commands()` children at once; other threads' commands
+    /// are not counted against it. Stdin, timeouts,
+    /// `external()` logging and shell commands are not supported.
+    pub fn run_concurrently(cmds: &[Cmd]) -> Vec<std::io::Result<std::process::Output>> {
+        assert!(
+            cmds.iter().all(|cmd| !cmd.shell_wrap
+                && cmd.stdin_data.is_none()
+                && cmd.timeout.is_none()
+                && cmd.external_label.is_none()),
+            "run_concurrently supports captured commands without stdin, timeout, external() or shell"
+        );
+
+        let _guard = (!is_foreground_thread()).then(|| semaphore().acquire());
+
+        let mut results = Vec::with_capacity(cmds.len());
+        for chunk in cmds.chunks(max_concurrent_commands()) {
+            let children: Vec<_> = chunk.iter().map(Cmd::spawn_captured).collect();
+            results.extend(
+                children
+                    .into_iter()
+                    .map(|child| child.and_then(CapturedChild::wait)),
+            );
+        }
+        results
+    }
+
+    /// Spawn `self` with piped stdout/stderr and null stdin, without waiting.
+    /// A failure to spawn resolves the trace before returning.
+    fn spawn_captured(&self) -> std::io::Result<CapturedChild> {
+        let cmd_str = self.command_string();
+        self.log_run_start(&cmd_str);
+        let mut trace = CommandTrace::new(self.context.as_deref(), &cmd_str);
+
+        let mut cmd = self.direct_command();
+        self.apply_common_settings(&mut cmd);
+
+        if let Err(e) = self.check_before_spawn(&cmd) {
+            trace.fail(&e);
+            return Err(e);
+        }
+
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match spawn(&mut cmd) {
+            Ok(child) => {
+                let tracked = self.track_if_cancellable(child.id());
+                Ok(CapturedChild {
+                    child,
+                    trace,
+                    _tracked: tracked,
+                })
+            }
+            Err(e) => {
+                trace.fail(&e);
+                Err(e)
+            }
+        }
     }
 
     /// Run `self` with its stdout piped directly into `next`'s stdin, and
@@ -1599,17 +2094,23 @@ impl Cmd {
             self.timeout.is_none() && next.timeout.is_none(),
             "pipe_into does not support timeouts"
         );
+        // The source's stdout is routed into the pipe (empty capture), so its
+        // redactor would be a no-op; the sink's stdout *is* captured and logged,
+        // but there's no correct place to apply the source's redactor to a
+        // different program's output. A redactor's whole job is keeping private
+        // bytes out of the bundle, so refuse rather than silently drop it —
+        // matching every other field pipe_into can't honor. No config read uses
+        // pipe_into today.
+        assert!(
+            self.redact_logged_stdout.is_none() && next.redact_logged_stdout.is_none(),
+            "pipe_into does not support redact_logged_stdout"
+        );
         assert!(
             self.external_label.is_none() && next.external_label.is_none(),
             "pipe_into does not support external() logging"
         );
         debug_assert!(
-            self.directive_cd_file.is_none()
-                && self.directive_exec_file.is_none()
-                && self.directive_legacy_file.is_none()
-                && next.directive_cd_file.is_none()
-                && next.directive_exec_file.is_none()
-                && next.directive_legacy_file.is_none(),
+            self.directive_cd_file.is_none() && next.directive_cd_file.is_none(),
             "directive_*_file is only applied by .stream(), not pipe_into"
         );
 
@@ -1620,23 +2121,16 @@ impl Cmd {
 
         let _guard = (!is_foreground_thread()).then(|| semaphore().acquire());
 
-        // Cancelled, possibly while parked on the semaphore above (see
-        // `background_cancelled`). Nothing has spawned, so neither half runs.
-        if background_cancelled() {
-            let e = cancelled_error();
-            CommandTrace::record_failed(
-                self.context.as_deref(),
-                &first_cmd_str,
-                self.stdin_data.is_some(),
-                &e,
-            );
-            return Err(e);
-        }
+        let mut first = self.direct_command();
+        self.apply_common_settings(&mut first);
+        let mut second = next.direct_command();
+        next.apply_common_settings(&mut second);
 
         // Validate both commands before spawning either. Nothing has spawned
-        // yet, so a precondition failure emits a one-shot failed record rather
-        // than holding a guard across an execution that never happens.
-        if let Err(e) = self.check_spawn_preconditions() {
+        // yet, so a cancellation or precondition failure emits a one-shot
+        // failed record rather than holding a guard across an execution that
+        // never happens.
+        if let Err(e) = self.check_before_spawn(&first) {
             // stdin_data is still owned here (taken below), so it reflects
             // whether the source would have read a buffer; the sink always reads
             // the upstream pipe.
@@ -1648,53 +2142,39 @@ impl Cmd {
             );
             return Err(e);
         }
-        if let Err(e) = next.check_spawn_preconditions() {
+        if let Err(e) = next.check_spawn_preconditions(&second) {
             CommandTrace::record_failed(next.context.as_deref(), &second_cmd_str, true, &e);
             return Err(e);
         }
 
         let source_stdin = self.stdin_data.take();
 
-        let mut first = self.direct_command();
-        self.apply_common_settings(&mut first);
-        first
-            .stdin(if source_stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Trace each command from just before its own spawn so the duration
-        // brackets the real spawn → wait span. The source reads stdin only when
-        // fed a buffer; the sink always reads it (the source's piped stdout).
         let mut first_trace = CommandTrace::new(self.context.as_deref(), &first_cmd_str)
             .reads_stdin(source_stdin.is_some());
-        let mut first_child = match first.spawn() {
+        let input = source_stdin
+            .as_deref()
+            .map(buffered_stdin)
+            .transpose()
+            .inspect_err(|error| {
+                first_trace.fail(error);
+            })?
+            .unwrap_or_else(Stdio::null);
+        first
+            .stdin(input)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut first_child = match spawn(&mut first) {
             Ok(child) => child,
             Err(e) => {
                 first_trace.fail(&e);
                 return Err(e);
             }
         };
-        let _first_tracked = track_if_cancellable(&first_child);
+        let _first_tracked = track_if_cancellable(first_child.id());
         let first_stdout = first_child
             .stdout
             .take()
             .expect("stdout was configured as piped");
-        // Take the source's stdin pipe, keeping `source_stdin` owned so it can
-        // also be logged below; a writer thread (in the scope) drains it
-        // concurrently with the rest of the pipeline.
-        let source_stdin_pipe = source_stdin.as_ref().map(|_| {
-            first_child
-                .stdin
-                .take()
-                .expect("stdin was configured as piped")
-        });
-
-        let mut second = next.direct_command();
-        next.apply_common_settings(&mut second);
         second
             .stdin(Stdio::from(first_stdout))
             .stdout(Stdio::piped())
@@ -1705,7 +2185,7 @@ impl Cmd {
         // `self`). If the spawn itself fails, clean up `self` before returning.
         let mut second_trace =
             CommandTrace::new(next.context.as_deref(), &second_cmd_str).reads_stdin(true);
-        let second_child = match second.spawn() {
+        let second_child = match spawn(&mut second) {
             Ok(child) => child,
             Err(e) => {
                 second_trace.fail(&e);
@@ -1718,7 +2198,7 @@ impl Cmd {
                 return Err(e);
             }
         };
-        let _second_tracked = track_if_cancellable(&second_child);
+        let _second_tracked = track_if_cancellable(second_child.id());
 
         // `first`'s stderr must be drained concurrently with `second`'s
         // execution; otherwise pathological stderr volume (~64 KiB pipe
@@ -1735,27 +2215,12 @@ impl Cmd {
                 first_stderr_pipe.read_to_end(&mut buf).map(|_| buf)
             });
 
-            // Feed the source's stdin (e.g. a `git rev-list` commit list
-            // piped into `git diff-tree --stdin`) on a thread, concurrent
-            // with the drain below — writing it all up front would deadlock
-            // once the source's stdout pipe fills. A short write (the source
-            // exited early) surfaces as its non-zero exit status, which
-            // callers already inspect. The scoped thread only borrows the
-            // data, so `source_stdin` stays available to log after the
-            // pipeline reaps the source.
-            if let (Some(mut stdin), Some(data)) = (source_stdin_pipe, source_stdin.as_deref()) {
-                s.spawn(move || {
-                    let _ = stdin.write_all(data);
-                    // `stdin` drops here, closing the pipe so the source sees EOF.
-                });
-            }
-
             // Drain `next` first (its `wait_with_output` reads its own
             // stdout/stderr), so `first`'s writes can complete. Its stdin is the
             // source's stdout (the OS pipe), not its own input, so it is logged
             // with `None` — the intermediate stream stays out of the deep log.
             let second_result = second_child.wait_with_output();
-            record_captured(&mut second_trace, None, &second_result);
+            record_captured(&mut second_trace, None, &second_result, None);
 
             // Reap `first`. Its stderr is already being drained; combine
             // the captured stderr with the exit status into an Output.
@@ -1772,7 +2237,13 @@ impl Cmd {
             // The source's own stdin (the commit list) is logged under `  < `,
             // symmetric with `run`. Only the intermediate diff stream — the
             // source's stdout, routed to the sink via OS pipe — stays out.
-            record_captured(&mut first_trace, source_stdin.as_deref(), &first_result);
+            // `None`: the assert above rejects a redactor on either stage.
+            record_captured(
+                &mut first_trace,
+                source_stdin.as_deref(),
+                &first_result,
+                None,
+            );
 
             (first_result, second_result)
         });
@@ -1786,7 +2257,7 @@ impl Cmd {
     /// - Inherits stderr to preserve TTY behavior (colors, progress bars)
     /// - Optionally redirects stdout to stderr (via `.stdout(Stdio::from(io::stderr()))`)
     /// - Optionally inherits stdin for interactive commands (via `.stdin(Stdio::inherit())`)
-    /// - Optionally forwards signals to child process group (via `.forward_signals()`)
+    /// - Optionally observes terminal signals and forwards cancellation (`.forward_signals()`)
     /// - Does not use concurrency limiting (streaming commands run sequentially by nature)
     /// - Does not support timeout (interactive commands should not be time-limited)
     ///
@@ -1796,7 +2267,7 @@ impl Cmd {
     /// Returns error if command exits with non-zero status.
     pub fn stream(mut self) -> anyhow::Result<()> {
         #[cfg(unix)]
-        use {signal_hook::consts::SIGPIPE, std::os::unix::process::CommandExt};
+        use signal_hook::consts::SIGPIPE;
 
         // Shell-wrapped commands don't use args (the command string is the full command)
         assert!(
@@ -1819,21 +2290,12 @@ impl Cmd {
         self.apply_common_settings(&mut cmd);
 
         // Re-add directive files after security scrub for trusted contexts.
-        // CD file is always safe to pass through (raw path, no shell). EXEC
-        // file is only re-added for user-source aliases (issue #2101); project
-        // aliases and hooks leave it scrubbed so their bodies cannot inject
-        // shell into the parent session.
+        // The CD file is safe to pass through because it contains a raw path.
         if let Some(ref path) = self.directive_cd_file {
-            cmd.env(DIRECTIVE_CD_FILE_ENV_VAR, path);
-        }
-        if let Some(ref path) = self.directive_exec_file {
-            cmd.env(DIRECTIVE_EXEC_FILE_ENV_VAR, path);
-        }
-        if let Some(ref path) = self.directive_legacy_file {
-            cmd.env(DIRECTIVE_FILE_ENV_VAR, path);
+            apply_cd_directive_env(&mut cmd, path);
         }
 
-        if let Err(e) = self.check_spawn_preconditions() {
+        if let Err(e) = self.check_spawn_preconditions(&cmd) {
             // Nothing spawned yet — emit a one-shot failed record (the trace
             // guard is constructed just before spawn, below).
             CommandTrace::record_failed(
@@ -1842,9 +2304,7 @@ impl Cmd {
                 self.stdin_data.is_some(),
                 &e,
             );
-            return Err(anyhow::Error::from(GitError::Other {
-                message: format!("Failed to execute command ({}): {}", exec_mode, e),
-            }));
+            return Err(e.into());
         }
 
         #[cfg(not(unix))]
@@ -1853,12 +2313,15 @@ impl Cmd {
         // Determine stdout handling (default: inherit)
         let stdout_mode = self.stdout_cfg.unwrap_or_else(std::process::Stdio::inherit);
 
-        // Determine stdin handling (stdin_bytes takes precedence, then stdin cfg, then null)
-        let stdin_mode = if self.stdin_data.is_some() {
-            std::process::Stdio::piped()
-        } else {
-            self.stdin_cfg.unwrap_or_else(std::process::Stdio::null)
+        let stdin = match self.stdin_data.as_deref() {
+            Some(data) => buffered_stdin(data)
+                .inspect_err(|error| {
+                    CommandTrace::record_failed(self.context.as_deref(), &cmd_str, true, error);
+                })
+                .context("Failed to prepare command input")?,
+            None => self.stdin_cfg.unwrap_or_else(Stdio::null),
         };
+        cmd.stdin(stdin);
 
         // Install the SIGINT/SIGTERM handler BEFORE spawn so a signal arriving
         // mid-spawn is queued, not default-killed.
@@ -1869,23 +2332,8 @@ impl Cmd {
             None
         };
 
-        #[cfg(unix)]
-        if self.forward_signals && !self.share_parent_pgroup {
-            // Isolate the child in its own process group so we can signal the whole tree.
-            //
-            // Skipped when the caller used `.inherit_stdin()`: a child that
-            // reads the parent's controlling terminal must share the
-            // foreground pgroup, otherwise calls like skim's (crossterm)
-            // `tcsetattr` on `/dev/tty` raise SIGTTOU and stop the child
-            // mid-render. The kernel already delivers tty-initiated signals
-            // (Ctrl-C, Ctrl-Z, hangup) to every process in the shared
-            // pgroup, so explicit forwarding is redundant in that case.
-            cmd.process_group(0);
-        }
-
         // Apply environment and spawn
-        cmd.stdin(stdin_mode)
-            .stdout(stdout_mode)
+        cmd.stdout(stdout_mode)
             .stderr(std::process::Stdio::inherit()) // Preserve TTY for errors
             // Prevent vergen "overridden" warning in nested cargo builds
             .env_remove("VERGEN_GIT_DESCRIBE");
@@ -1895,104 +2343,53 @@ impl Cmd {
         // guard unresolved, and the duration brackets the child.
         let mut trace = CommandTrace::new(self.context.as_deref(), &cmd_str)
             .reads_stdin(self.stdin_data.is_some());
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                trace.fail(&e);
-                return Err(anyhow::Error::from(GitError::Other {
-                    message: format!("Failed to execute command ({}): {}", exec_mode, e),
-                }));
+        #[cfg(unix)]
+        let spawned = match &signals {
+            Some(signals) => signals.spawn(&mut cmd),
+            None => spawn_shared_child(&mut cmd).map_err(anyhow::Error::from),
+        };
+        #[cfg(not(unix))]
+        let spawned = spawn_shared_child(&mut cmd).map_err(anyhow::Error::from);
+        let child = match spawned {
+            Ok(child) => Arc::new(child),
+            Err(error) => {
+                trace.fail(error.as_ref());
+                return Err(error);
             }
         };
 
-        // Write stdin content if provided (ignore BrokenPipe - child may exit early)
-        if let Some(ref content) = self.stdin_data
-            && let Some(mut stdin) = child.stdin.take()
-            && let Err(e) = stdin.write_all(content)
-            && e.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            trace.fail(&e);
-            return Err(e.into());
-        }
-        // stdin handle is dropped here, closing the pipe
-
-        // Start the listener now that the child PID is known. The handler
-        // installed pre-spawn has been queueing signals; the listener
-        // processes any queued signal on its first poll.
         #[cfg(unix)]
-        let forwarder =
-            signals.map(|s| s.forward_to_pid(child.id() as i32, self.share_parent_pgroup));
-
-        let wait_result = child.wait();
-
-        // Always tear down the listener, even on wait error, so the
-        // signal-hook handle is released and the thread doesn't leak.
-        #[cfg(unix)]
-        let seen_signal = forwarder.and_then(|f| f.stop());
-
-        let status = match wait_result {
-            Ok(status) => status,
-            Err(e) => {
-                trace.fail(&e);
-                return Err(anyhow::Error::from(GitError::Other {
-                    message: format!("Failed to wait for command: {}", e),
-                }));
-            }
+        let waited = match signals {
+            Some(signals) => signals
+                .wait(&child)
+                .map(|outcome| (outcome.status, outcome.cancellation)),
+            None => wait_shared_child(&child, None).map(|status| (status, None)),
         };
-
-        // Handle signals (Unix only).
-        //
-        // `seen_signal` records any signal forwarded by the listener thread,
-        // covering the case where the child caught the signal and exited with
-        // a code (no kernel `status.signal()` to read). The clean-exit gate
-        // closes the wait-vs-handle.close window: if `child.wait()` returned
-        // success and a signal then landed before `handle.close()` ran, the
-        // signal arrived too late to have killed anything — the contract on
-        // `signal: Some(_)` is "this child was killed by the signal" and
-        // `interrupt_signal` callers in pipeline loops break on it.
+        #[cfg(not(unix))]
+        let waited = wait_shared_child(&child, None).map(|status| (status, None::<i32>));
+        let (status, cancellation) = waited
+            .inspect_err(|error| {
+                let _ = child.kill();
+                let _ = child.wait();
+                trace.fail(error);
+            })
+            .context("Failed to wait for command")?;
         #[cfg(unix)]
-        if let Some(sig) = seen_signal
-            && !status.success()
-        {
-            trace.complete(false);
-            external_log.record(Some(128 + sig));
-            return Err(WorktrunkError::ChildProcessExited {
-                code: 128 + sig,
-                message: format!("terminated by signal {}", sig),
-                signal: Some(sig),
-            }
-            .into());
+        let child_signal = std::os::unix::process::ExitStatusExt::signal(&status);
+
+        // SIGPIPE is expected when a pager exits before its producer finishes.
+        #[cfg(unix)]
+        if child_signal == Some(SIGPIPE) && self.ignore_sigpipe && cancellation.is_none() {
+            trace.complete(true);
+            external_log.record(Some(0));
+            return Ok(());
         }
 
-        #[cfg(unix)]
-        if let Some(sig) = std::os::unix::process::ExitStatusExt::signal(&status) {
-            // SIGPIPE (13) is expected when a pager (less, bat) exits before the
-            // child finishes writing — not an error from the user's perspective.
-            if sig == SIGPIPE {
-                trace.complete(true);
-                external_log.record(Some(0));
-                return Ok(());
-            }
-            trace.complete(false);
-            external_log.record(Some(128 + sig));
-            return Err(WorktrunkError::ChildProcessExited {
-                code: 128 + sig,
-                message: format!("terminated by signal {}", sig),
-                signal: Some(sig),
-            }
-            .into());
-        }
-
-        if !status.success() {
-            let code = status.code().unwrap_or(1);
-            trace.complete(false);
-            external_log.record(status.code());
-            return Err(WorktrunkError::ChildProcessExited {
-                code,
-                message: format!("exit status: {}", code),
-                signal: None,
-            }
-            .into());
+        if !status.success() || cancellation.is_some() {
+            let error = WorktrunkError::from_child_status(&status, cancellation);
+            trace.complete(status.success());
+            external_log.record(error.exit_code());
+            return Err(error.into());
         }
 
         trace.complete(true);
@@ -2010,7 +2407,15 @@ impl Cmd {
     /// to never switch to streaming (always buffer); `0` streams immediately.
     ///
     /// `progress_message`, when set, prints to stderr at the moment streaming
-    /// starts (the delay threshold is crossed).
+    /// starts. It arrives pre-rendered with its ANSI already in it, so — like
+    /// every relayed line — it goes out through [`crate::styling`]'s
+    /// `eprintln!` rather than a raw handle: anstream is the only thing that
+    /// strips those escapes when stderr is redirected and honors `NO_COLOR`,
+    /// and a single raw write here is enough to make one line of a log
+    /// disagree with the rest. No `flush()` follows, and none did any work
+    /// before: `AutoStream<Stderr>` writes through a locked `std::io::Stderr`,
+    /// which is unbuffered. anstream's macro does not flush either, so a
+    /// buffered stream would still need one.
     ///
     /// Like [`Cmd::stream`], this does **not** acquire the concurrency
     /// semaphore: a delayed-stream command runs in the foreground and would
@@ -2036,9 +2441,7 @@ impl Cmd {
             self.stdin_data.is_none()
                 && self.timeout.is_none()
                 && self.external_label.is_none()
-                && self.directive_cd_file.is_none()
-                && self.directive_exec_file.is_none()
-                && self.directive_legacy_file.is_none(),
+                && self.directive_cd_file.is_none(),
             "delayed_stream does not support stdin/timeout/external/directive options"
         );
 
@@ -2060,67 +2463,95 @@ impl Cmd {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = match cmd.spawn() {
+        let child = match spawn_shared_child(&mut cmd) {
             Ok(child) => child,
             Err(e) => {
                 trace.fail(&e);
-                return Err(e).with_context(|| format!("Failed to spawn: {}", cmd_str));
+                return Err(e.into());
             }
         };
 
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let stderr = child.stderr.take().expect("stderr was piped");
+        let stdout = child.take_stdout().expect("stdout was piped");
+        let stderr = child.take_stderr().expect("stderr was piped");
+        #[cfg(unix)]
+        let prepared = (|| {
+            let (control, cancel) = socket_pair()?;
+            let control = Arc::new(control);
+            Ok::<_, std::io::Error>((
+                pipe::PipeReader::new(stdout, None, Some(control.clone()))?,
+                pipe::PipeReader::new(stderr, None, Some(control))?,
+                cancel,
+            ))
+        })();
+        #[cfg(unix)]
+        let (stdout, stderr, cancel) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                trace.fail(&error);
+                return Err(error).context("Failed to prepare command output");
+            }
+        };
+        #[cfg(unix)]
+        let mut cancel = Some(cancel);
 
-        // Shared state: when true, output streams directly; when false, buffers.
-        let streaming = Arc::new(AtomicBool::new(false));
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let stdout_handle = spawn_delayed_reader(stdout, streaming.clone(), buffer.clone());
-        let stderr_handle = spawn_delayed_reader(stderr, streaming.clone(), buffer.clone());
+        // Shared state: readers stream directly once `streaming` is set, and
+        // buffer until then.
+        let state = Arc::new(Mutex::new(DelayedOutput::default()));
+        let stdout_handle = spawn_delayed_reader(stdout, state.clone());
+        let stderr_handle = spawn_delayed_reader(stderr, state.clone());
 
         let start = Instant::now();
 
-        // Phase 1: If the delay threshold is enabled, wait that long for the
-        // child to exit. If it finishes before the threshold, output stays
-        // buffered (quiet).
-        if delay_ms >= 0 {
-            let delay = Duration::from_millis(delay_ms as u64);
-            let remaining = delay.saturating_sub(start.elapsed());
+        let wait_result = 'wait: {
+            // Phase 1: wait up to the presentation threshold; an early exit stays quiet.
+            if delay_ms >= 0 {
+                let delay = Duration::from_millis(delay_ms as u64);
+                let remaining = delay.saturating_sub(start.elapsed());
 
-            // Zero delay means "stream immediately", not "try a zero-timeout reap".
-            if !remaining.is_zero() {
-                match child.wait_timeout(remaining) {
-                    Ok(Some(status)) => {
-                        let _ = stdout_handle.join();
-                        let _ = stderr_handle.join();
-                        trace.complete(status.success());
-                        return stream_exit_result(status, &buffer, &cmd_str);
+                // Zero delay streams immediately, without a zero-timeout reap.
+                if !remaining.is_zero() {
+                    match wait_shared_child(&child, Some(Instant::now() + remaining)) {
+                        Ok(status) => break 'wait Ok(status),
+                        // This deadline controls presentation, not child lifetime.
+                        // On a timeout or wait-setup error, stream output and retry.
+                        outcome => {
+                            tracing::debug!(?outcome, "No exit status yet; switching to streaming");
+                        }
                     }
-                    // Threshold exceeded — fall through to streaming.
-                    Ok(None) => {}
-                    Err(e) => {
-                        let _ = stdout_handle.join();
-                        let _ = stderr_handle.join();
-                        trace.fail(&e);
-                        return Err(e).context("Failed to wait for command");
-                    }
+                }
+
+                // Switch to streaming under the readers' lock so no line can
+                // print between the progress message and the buffered output.
+                let mut state = state.lock().unwrap();
+                state.streaming = true;
+                if let Some(ref msg) = progress_message {
+                    eprintln!("{}", msg);
+                }
+                for line in state.lines.drain(..) {
+                    eprintln!("{}", line);
                 }
             }
 
-            // Delay threshold exceeded — switch to streaming.
-            streaming.store(true, Ordering::Relaxed);
-            if let Some(ref msg) = progress_message {
-                let _ = writeln!(std::io::stderr(), "{}", msg);
-            }
-            for line in buffer.lock().unwrap().drain(..) {
-                let _ = writeln!(std::io::stderr(), "{}", line);
-            }
-            let _ = std::io::stderr().flush();
+            // Phase 2: block until the child exits.
+            wait_shared_child(&child, None)
+        };
+        #[cfg(unix)]
+        if match &wait_result {
+            Ok(status) => matches!(
+                std::os::unix::process::ExitStatusExt::signal(status),
+                Some(signal_hook::consts::SIGINT | signal_hook::consts::SIGTERM)
+            ),
+            Err(_) => true,
+        } {
+            cancel.take();
         }
-
-        // Phase 2: Block until the child exits (no polling).
-        let wait_result = child.wait();
-        let _ = stdout_handle.join();
-        let _ = stderr_handle.join();
+        if wait_result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let output_result = join_delayed_readers([stdout_handle, stderr_handle]);
         let status = match wait_result {
             Ok(status) => status,
             Err(e) => {
@@ -2128,8 +2559,12 @@ impl Cmd {
                 return Err(e).context("Failed to wait for command");
             }
         };
+        if let Err(error) = output_result {
+            trace.fail(&error);
+            return Err(error).context("Failed to read command output");
+        }
         trace.complete(status.success());
-        stream_exit_result(status, &buffer, &cmd_str)
+        stream_exit_result(status, &state, &cmd_str)
     }
 }
 
@@ -2137,6 +2572,114 @@ impl Cmd {
 // Signal forwarding helpers (Unix only)
 // ============================================================================
 
+/// Wait for a shared child without holding its signaling lock while stopped.
+///
+/// Darwin can return a stop from SharedChild's waitid(WEXITED) path. Its
+/// subsequent blocking Child::wait holds that lock, preventing CONT and kill.
+/// On macOS, subscribe to kernel exit events before try_wait so exit cannot
+/// be lost between check and sleep. Other platforms use SharedChild directly.
+/// A deadline returns TimedOut without reaping a still-running child.
+pub fn wait_shared_child(
+    child: &SharedChild,
+    deadline: Option<Instant>,
+) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(target_os = "macos")]
+    let status = wait_macos_child(child, deadline)?;
+    #[cfg(not(target_os = "macos"))]
+    let status = match deadline {
+        Some(deadline) => child.wait_deadline(deadline)?,
+        None => Some(child.wait()?),
+    };
+    let status =
+        status.ok_or_else(|| std::io::Error::new(ErrorKind::TimedOut, "command timed out"))?;
+    Ok(status)
+}
+
+/// Wait for a foreground child and publish native cancellation to current scopes.
+/// Captures and diff-preview pagers use the neutral wait instead; their command
+/// consumers decide whether to propagate typed cancellation.
+pub fn wait_foreground_child(child: &SharedChild) -> std::io::Result<std::process::ExitStatus> {
+    let status = wait_shared_child(child, None)?;
+    #[cfg(unix)]
+    if let Some(signal @ (signal_hook::consts::SIGINT | signal_hook::consts::SIGTERM)) =
+        std::os::unix::process::ExitStatusExt::signal(&status)
+    {
+        crate::signal_forwarder::cancel_foreground(signal);
+    }
+    Ok(status)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_macos_child(
+    child: &SharedChild,
+    deadline: Option<Instant>,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use nix::errno::Errno;
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+    let queue = Kqueue::new()?;
+    let exit = KEvent::new(
+        child.id() as usize,
+        EventFilter::EVFILT_PROC,
+        EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
+        FilterFlag::NOTE_EXIT,
+        0,
+        0,
+    );
+    loop {
+        let subscribe = queue.kevent(
+            &[exit],
+            &mut [],
+            Some(nix::libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }),
+        );
+        // A cached status wins over ESRCH if another waiter reaped the child.
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        match subscribe {
+            Err(Errno::EINTR) => continue,
+            // Darwin can remove the owned process from kqueue lookup before
+            // its exit is waitable. Like NOTE_EXIT below, ESRCH means it can
+            // no longer stop; finish synchronized reaping rather than fail.
+            Err(Errno::ESRCH) => return child.wait().map(Some),
+            Err(error) => return Err(error.into()),
+            Ok(_) => break,
+        }
+    }
+    let mut events = [exit];
+    loop {
+        let timeout = deadline.map(|deadline| {
+            let duration = deadline.saturating_duration_since(Instant::now());
+            nix::libc::timespec {
+                tv_sec: duration.as_secs().min(i64::MAX as u64) as _,
+                tv_nsec: duration.subsec_nanos().into(),
+            }
+        });
+        let count = match queue.kevent(&[], &mut events, timeout) {
+            Ok(count) => count,
+            Err(Errno::EINTR) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let observed = child.try_wait()?;
+        if let Some(status) = observed {
+            return Ok(Some(status));
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+        if events[0].flags().contains(EvFlags::EV_ERROR) {
+            return Err(Errno::from_raw(events[0].data() as i32).into());
+        }
+        // NOTE_EXIT precedes waitable zombie state on Darwin. Once exit has
+        // begun, this child cannot stop again; the ordinary synchronized wait
+        // is now safe and closes the exit-event vs waitable-status gap.
+        return child.wait().map(Some);
+    }
+}
+
+/// Probe whether an owned background process group still exists.
 #[cfg(unix)]
 fn process_group_alive(pgid: i32) -> bool {
     match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None) {
@@ -2146,59 +2689,258 @@ fn process_group_alive(pgid: i32) -> bool {
     }
 }
 
+/// Poll [`process_group_alive`] until the group is gone or `grace` expires,
+/// returning `true` when the group died within the grace. The first probe is
+/// immediate, so an already-empty group costs no sleep at all, and a group
+/// whose members exit (and are reaped) mid-grace is noticed within one poll
+/// interval rather than at the deadline.
 #[cfg(unix)]
-fn wait_for_exit(pgid: i32, grace: std::time::Duration) -> bool {
-    std::thread::sleep(grace);
-    !process_group_alive(pgid)
+fn group_died_within(pgid: i32, grace: Duration) -> bool {
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    let deadline = Instant::now() + grace;
+    loop {
+        if !process_group_alive(pgid) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(POLL_INTERVAL));
+    }
 }
 
-/// Single-shot signal delivery to a specific PID. Used in shared-pgroup mode
-/// where the child isn't a pgroup leader (so `killpg` would target a non-
-/// existent group), and where the kernel has already broadcast tty signals
-/// to the foreground pgroup — explicit forwarding only matters for
-/// externally-delivered signals (e.g. `kill -TERM <wt-pid>`). No escalation:
-/// see the call site in `Cmd::stream` for the rationale.
+/// Request cancellation of a recorded background worker by PID. Foreground
+/// delivery instead uses SharedChild's synchronized signaling ownership.
 #[cfg(unix)]
-pub fn forward_signal_to_pid(pid: i32, sig: i32) {
-    let nix_sig = match sig {
-        signal_hook::consts::SIGINT => nix::sys::signal::Signal::SIGINT,
-        signal_hook::consts::SIGTERM => nix::sys::signal::Signal::SIGTERM,
-        _ => return,
-    };
-    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix_sig);
+pub fn terminate_pid(pid: i32) {
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    );
 }
 
+/// Terminate an owned timeout or tether group: TERM, 200 ms grace, then KILL.
+/// Foreground cancellation uses native job delivery instead of this teardown.
+///
+/// The group probe counts unreaped exits as alive. Capture timeouts retain
+/// their leader, so they always use the full grace; signaling an already dead
+/// group cannot change its exit status. Live survivors, including stopped or
+/// TERM-ignoring processes, are killed at the deadline.
+///
+/// Tether may have reaped its leader, allowing an early return once the group
+/// disappears. Reaping unpins the numeric pgid, leaving the existing recycling
+/// exposure between the group probe and the subsequent signal.
 #[cfg(unix)]
-pub fn forward_signal_with_escalation(pgid: i32, sig: i32) {
+pub fn terminate_process_group(pgid: i32) {
+    use nix::sys::signal::Signal;
+
     let pgid = nix::unistd::Pid::from_raw(pgid);
-    let initial_signal = match sig {
-        signal_hook::consts::SIGINT => nix::sys::signal::Signal::SIGINT,
-        signal_hook::consts::SIGTERM => nix::sys::signal::Signal::SIGTERM,
-        _ => return,
-    };
-
-    let _ = nix::sys::signal::killpg(pgid, initial_signal);
-
-    let grace = std::time::Duration::from_millis(200);
-    // Escalate if process doesn't exit gracefully
-    if sig == signal_hook::consts::SIGINT {
-        if !wait_for_exit(pgid.as_raw(), grace) {
-            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
-            if !wait_for_exit(pgid.as_raw(), grace) {
-                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-            }
-        }
-    } else {
-        // SIGTERM - escalate directly to SIGKILL
-        if !wait_for_exit(pgid.as_raw(), grace) {
-            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-        }
+    let _ = nix::sys::signal::killpg(pgid, Signal::SIGTERM);
+    if !group_died_within(pgid.as_raw(), Duration::from_millis(200)) {
+        let _ = nix::sys::signal::killpg(pgid, Signal::SIGKILL);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS sets close-on-exec after creating stdio pipes and wakeup sockets.
+    /// Concurrent spawns must not inherit these endpoints and delay EOF.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_parallel_commands_do_not_inherit_sibling_descriptors() {
+        const SCRIPT: &str = "
+import errno, os, stat
+counts = [0, 0]
+for name in os.listdir('/dev/fd'):
+    fd = int(name)
+    if fd <= 2:
+        continue
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError as error:
+        if error.errno != errno.EBADF:
+            raise
+        continue
+    counts[0] += stat.S_ISFIFO(mode)
+    counts[1] += stat.S_ISSOCK(mode)
+print(*counts)
+";
+        let inspect = || Cmd::new("/usr/bin/python3").args(["-c", SCRIPT]).run();
+        let descriptor_counts = |output: std::io::Result<std::process::Output>| {
+            let output = output.unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .split_whitespace()
+                .map(|count| count.parse::<usize>().unwrap())
+                .collect::<Vec<_>>()
+        };
+        // A test runner may itself have passed inheritable descriptors.
+        let inherited = descriptor_counts(inspect());
+        let barrier = std::sync::Barrier::new(16);
+        let stop = AtomicBool::new(false);
+        struct StopCreators<'a>(&'a AtomicBool);
+        impl Drop for StopCreators<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let results = std::thread::scope(|scope| {
+            // Stop creators before scope joins its threads, including on panic.
+            let _stop_creators = StopCreators(&stop);
+            for index in 0..8 {
+                let stop = &stop;
+                scope.spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        match index % 3 {
+                            0 => drop(socket_pair().unwrap()),
+                            1 => drop(stream_socket(socket2::Domain::UNIX).unwrap()),
+                            _ => drop(stream_socket(socket2::Domain::IPV4).unwrap()),
+                        }
+                    }
+                });
+            }
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..32)
+                            .map(|_| {
+                                barrier.wait();
+                                inspect()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for output in results {
+            assert_eq!(
+                descriptor_counts(output),
+                inherited,
+                "inherited sibling pipe or wakeup socket"
+            );
+        }
+    }
+
+    /// The property the worktree-local scrub sites rest on: `TempIndex` and a
+    /// redirected repository's object store scrub the whole
+    /// [`INHERITED_GIT_PATH_VARS`] list and then set their own value for one of
+    /// those vars. If `Cmd` ever applies removes after sets again, that set is
+    /// silently dropped and those sites fall back to the ambient index / object
+    /// store — so pin call order rather than the split-vector shape.
+    #[test]
+    fn test_env_mutations_apply_in_call_order() {
+        let scrubbed = Cmd::new("child")
+            .scrub_git_discovery_env()
+            .env("GIT_INDEX_FILE", "chosen-index");
+        let mut cmd = std::process::Command::new("child");
+        scrubbed.apply_common_settings(&mut cmd);
+
+        let env = |var: &str| {
+            cmd.get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(var))
+                .map(|(_, value)| value)
+        };
+
+        assert_eq!(
+            env("GIT_INDEX_FILE"),
+            Some(Some(std::ffi::OsStr::new("chosen-index"))),
+            "a set after the scrub must win"
+        );
+        for var in INHERITED_GIT_PATH_VARS
+            .iter()
+            .filter(|var| **var != "GIT_INDEX_FILE")
+        {
+            assert_eq!(
+                env(var),
+                Some(None),
+                "{var} should be removed from the child environment"
+            );
+        }
+
+        // And the reverse order still removes, so `env_remove` isn't inert.
+        let set_then_removed = Cmd::new("child")
+            .env("GIT_INDEX_FILE", "chosen-index")
+            .scrub_git_discovery_env();
+        let mut cmd = std::process::Command::new("child");
+        set_then_removed.apply_common_settings(&mut cmd);
+        assert_eq!(
+            cmd.get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("GIT_INDEX_FILE"))
+                .map(|(_, value)| value),
+            Some(None),
+            "a scrub after the set must win"
+        );
+    }
+
+    #[test]
+    fn test_scrub_directive_env_vars_covers_every_directive_variable() {
+        assert_eq!(RETIRED_DIRECTIVE_FILE_ENV_VAR, "WORKTRUNK_DIRECTIVE_FILE");
+        assert_eq!(DIRECTIVE_EXEC_FILE_ENV_VAR, "WORKTRUNK_DIRECTIVE_EXEC_FILE");
+
+        let mut cmd = std::process::Command::new("child");
+        for var in [
+            DIRECTIVE_CD_FILE_ENV_VAR,
+            DIRECTIVE_EXEC_FILE_ENV_VAR,
+            RETIRED_DIRECTIVE_FILE_ENV_VAR,
+            SHELL_CWD_ENV_VAR,
+        ] {
+            cmd.env(var, "directive");
+        }
+
+        scrub_directive_env_vars(&mut cmd);
+
+        for var in [
+            DIRECTIVE_CD_FILE_ENV_VAR,
+            DIRECTIVE_EXEC_FILE_ENV_VAR,
+            RETIRED_DIRECTIVE_FILE_ENV_VAR,
+            SHELL_CWD_ENV_VAR,
+        ] {
+            assert!(
+                cmd.get_envs()
+                    .any(|(key, value)| { key == std::ffi::OsStr::new(var) && value.is_none() }),
+                "{var} should be removed from the child environment"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shell_cwd_from_prefers_absolute_inherited_value() {
+        // Built from `temp_dir()` rather than platform literals: `/shell/cwd`
+        // isn't absolute on Windows (no prefix), and a `cfg!(windows)` pair
+        // would leave whichever arm this platform didn't take uncovered.
+        // Neither path is touched — the predicate only inspects its shape.
+        let root = std::env::temp_dir();
+        let fallback = root.join("wt-shell-cwd-fallback");
+        let absolute = root.join("wt-shell-cwd");
+        assert!(absolute.is_absolute(), "temp_dir() should be absolute");
+
+        // An absolute inherited value wins over the process cwd.
+        assert_eq!(
+            shell_cwd_from(Some(OsString::from(&absolute)), Some(&fallback)),
+            Some(absolute.clone())
+        );
+        // A relative one names nothing from a child that runs elsewhere.
+        assert_eq!(
+            shell_cwd_from(Some(OsString::from("apps/gateway")), Some(&fallback)),
+            Some(fallback.clone())
+        );
+        assert_eq!(
+            shell_cwd_from(None, Some(&fallback)),
+            Some(fallback.clone())
+        );
+        assert_eq!(
+            shell_cwd_from(Some(OsString::from("apps/gateway")), None),
+            None
+        );
+    }
 
     /// The only test allowed to set `FOREGROUND_THREAD` (a process-wide
     /// set-once): with it unset, `is_foreground_thread()` is false everywhere,
@@ -2214,45 +2956,6 @@ mod tests {
     }
 
     #[test]
-    fn test_powershell_escape() {
-        // Plain word: wrapped but unchanged inside the quotes.
-        assert_eq!(powershell_escape("rg"), "'rg'");
-        // Embedded single quote: doubled (PowerShell's only escape).
-        assert_eq!(powershell_escape("can't"), "'can''t'");
-        // `$(...)` is inert inside a PowerShell single-quoted string — no
-        // expansion, no doubling needed.
-        assert_eq!(powershell_escape("$(whoami)"), "'$(whoami)'");
-        // Spaces are covered by the surrounding quotes.
-        assert_eq!(powershell_escape("with space"), "'with space'");
-        // Empty string still produces a valid empty literal.
-        assert_eq!(powershell_escape(""), "''");
-        // Multiple quotes each double independently.
-        assert_eq!(powershell_escape("a'b'c"), "'a''b''c'");
-    }
-
-    #[test]
-    fn test_fish_escape() {
-        // Plain word: wrapped but unchanged inside the quotes.
-        assert_eq!(fish_escape("rg"), "'rg'");
-        // Two consecutive backslashes: each doubled, so fish's `eval`
-        // collapses `\\\\` back to `\\` — POSIX `'…'` would corrupt this.
-        assert_eq!(fish_escape(r"a\\b"), r"'a\\\\b'");
-        // Trailing backslash: doubled, so the closing `'` is not swallowed
-        // (the POSIX form `'end\'` is an unterminated string for fish).
-        assert_eq!(fish_escape(r"end\"), r"'end\\'");
-        // Embedded single quote: backslash-escaped (fish's escape inside `'…'`).
-        assert_eq!(fish_escape("can't"), r"'can\'t'");
-        // `$(...)` and backticks are inert inside a fish single-quoted string.
-        assert_eq!(fish_escape("$(whoami)"), "'$(whoami)'");
-        assert_eq!(fish_escape("`whoami`"), "'`whoami`'");
-        // Empty string still produces a valid empty literal.
-        assert_eq!(fish_escape(""), "''");
-        // Backslash then quote: `\` doubled first, then `'` escaped, so the
-        // escaping backslash of `\'` is not itself doubled.
-        assert_eq!(fish_escape(r"\'"), r"'\\\''");
-    }
-
-    #[test]
     fn test_shell_escape_for_dispatch() {
         // Literal passes the value through untouched.
         assert_eq!(shell_escape_for(ShellEscapeMode::Literal, "can't"), "can't");
@@ -2260,16 +2963,6 @@ mod tests {
         assert_eq!(
             shell_escape_for(ShellEscapeMode::Posix, "can't"),
             r"'can'\''t'"
-        );
-        // PowerShell doubles the embedded quote.
-        assert_eq!(
-            shell_escape_for(ShellEscapeMode::PowerShell, "can't"),
-            "'can''t'"
-        );
-        // Fish backslash-escapes the embedded quote.
-        assert_eq!(
-            shell_escape_for(ShellEscapeMode::Fish, "can't"),
-            r"'can\'t'"
         );
     }
 
@@ -2367,9 +3060,8 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_unix_shell_is_posix() {
+    fn test_unix_shell_is_sh() {
         let config = ShellConfig::get().unwrap();
-        assert!(config.is_posix);
         assert_eq!(config.name, "sh");
     }
 
@@ -2407,11 +3099,36 @@ mod tests {
     }
 
     #[test]
+    fn test_git_bash_from_exec_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Git");
+        let bin_bash = root.join("bin/bash.exe");
+        let usr_bash = root.join("usr/bin/bash.exe");
+        std::fs::create_dir_all(bin_bash.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(usr_bash.parent().unwrap()).unwrap();
+        std::fs::write(&bin_bash, "").unwrap();
+        std::fs::write(&usr_bash, "").unwrap();
+
+        // ARM uses a different runtime prefix; discovery must not enumerate them.
+        let exec_path = root.join("clangarm64/libexec/git-core");
+        assert_eq!(git_bash_from_exec_path(&exec_path), Some(bin_bash.clone()));
+        assert_eq!(git_bash_from_exec_path(&root.join("x/y/z")), None);
+        std::fs::remove_file(&bin_bash).unwrap();
+        assert_eq!(git_bash_from_exec_path(&exec_path), Some(usr_bash.clone()));
+
+        // MinGit can report the same layout without shipping Bash. Never climb
+        // outside that installation to select an unrelated executable.
+        std::fs::remove_file(&usr_bash).unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/bash.exe"), "outside install").unwrap();
+        assert_eq!(git_bash_from_exec_path(&exec_path), None);
+    }
+
+    #[test]
     #[cfg(windows)]
     fn test_windows_uses_git_bash() {
         let config = ShellConfig::get().unwrap();
         assert_eq!(config.name, "Git Bash");
-        assert!(config.is_posix, "Git Bash should support POSIX syntax");
         assert!(
             config.args.contains(&"-c".to_string()),
             "Git Bash should use -c flag"
@@ -2460,7 +3177,6 @@ mod tests {
         let config = ShellConfig::get().unwrap();
         let cloned = config.clone();
         assert_eq!(config.name, cloned.name);
-        assert_eq!(config.is_posix, cloned.is_posix);
         assert_eq!(config.args, cloned.args);
     }
 
@@ -2485,10 +3201,47 @@ mod tests {
     fn test_cmd_timeout_kills_slow_command() {
         let result = Cmd::new("sleep")
             .arg("10")
+            .stdin_bytes("unconsumed input")
             .timeout(Duration::from_millis(50))
             .run();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// The `wait-timeout` crate has to stay out of the dependency graph, however
+    /// it gets there.
+    ///
+    /// Its `SIGCHLD` handler pokes a socketpair with `send()` and `panic!`s on any
+    /// errno but `WouldBlock`. That handler is `extern "C"`, so the panic cannot
+    /// unwind — it goes straight to `abort()`. Under a sandbox that denies the send
+    /// (the Codex CLI's `workspace-write` mode), every timed wait in `wt` became an
+    /// uncatchable `SIGABRT` with no diagnostic (#3856). `shared_child` wakes
+    /// through `signal_hook`, which discards wake-write errors by design.
+    ///
+    /// The lockfile is read at runtime, not `include_str!`d: a compile-time embed
+    /// has to ship in every packaged build, which `embedded_assets_ship_in_package`
+    /// enforces and `Cargo.lock` doesn't satisfy. Tests only ever run from the
+    /// source tree, so the manifest dir is always there.
+    #[test]
+    fn test_wait_timeout_crate_stays_out_of_the_dependency_graph() {
+        let lockfile = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
+        let lockfile = std::fs::read_to_string(&lockfile).expect("read Cargo.lock");
+        assert!(
+            !lockfile.contains("name = \"wait-timeout\""),
+            "wait-timeout is back in the dependency graph; its SIGCHLD handler \
+             aborts wt when the self-pipe write fails (#3856)"
+        );
+    }
+
+    /// A command that can't be spawned at all fails as a spawn error, not as a
+    /// timeout — the deadline path never starts, so the caller doesn't wait it out.
+    #[test]
+    fn test_cmd_timeout_surfaces_a_spawn_failure() {
+        let err = Cmd::new("worktrunk-no-such-program-3856")
+            .timeout(Duration::from_secs(30))
+            .run()
+            .unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
     /// The timeout has to bound wall-clock, not just signal the direct child.
@@ -2516,6 +3269,26 @@ mod tests {
         );
     }
 
+    /// A child that INT/TERM already ended keeps that status when a descendant
+    /// holds its pipes past the deadline, instead of reading as `TimedOut`.
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_timeout_keeps_native_interrupt_with_pipe_holding_descendant() {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        use std::os::unix::process::ExitStatusExt;
+        for (name, signal) in [("INT", SIGINT), ("TERM", SIGTERM)] {
+            let start = std::time::Instant::now();
+            let output = Cmd::new("sh")
+                .args(["-c", &format!("sleep 30 & kill -{name} $$")])
+                // Long enough that `kill` lands first even under suite load.
+                .timeout(Duration::from_secs(2))
+                .run()
+                .unwrap();
+            assert_eq!(output.status.signal(), Some(signal));
+            assert!(start.elapsed() < Duration::from_secs(20));
+        }
+    }
+
     #[test]
     fn test_cmd_without_timeout_completes() {
         let result = Cmd::new("echo").arg("no timeout").run();
@@ -2533,11 +3306,13 @@ mod tests {
 
     #[test]
     fn test_cmd_with_stdin() {
-        let result = Cmd::new("cat").stdin_bytes("hello from stdin").run();
-        assert!(result.is_ok());
-        let output = result.unwrap();
-        assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout).contains("hello from stdin"));
+        // A complete buffer can exceed both input and output pipe capacity.
+        // Empty input must still supply EOF rather than inherit the caller.
+        for input in [Vec::new(), b"hello from stdin\n".repeat(100_000)] {
+            let output = Cmd::new("cat").stdin_bytes(input.as_slice()).run().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, input);
+        }
     }
 
     // ========================================================================
@@ -2582,6 +3357,27 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn test_cmd_stream_can_propagate_sigpipe() {
+        use crate::git::WorktrunkError;
+
+        let err = Cmd::new("sh")
+            .args(["-c", "kill -PIPE $$"])
+            .propagate_sigpipe()
+            .stream()
+            .unwrap_err();
+        let wt_err = err.downcast_ref::<WorktrunkError>().unwrap();
+        assert!(matches!(
+            wt_err,
+            WorktrunkError::ChildProcessExited {
+                code: 141,
+                physical_signal: Some(13),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn test_cmd_stream_other_signals_are_errors() {
         use crate::git::WorktrunkError;
 
@@ -2600,9 +3396,156 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_real_process_failure_descriptions() {
+        for (script, description) in [
+            ("exit 7", "exit code 7"),
+            ("kill -9 $$", "killed by signal 9"),
+        ] {
+            let output = Cmd::new("sh").args(["-c", script]).run().unwrap();
+            let error =
+                crate::git::CommandError::from_failed_output("sh", &["-c", script], &output);
+            assert!(
+                error
+                    .to_string()
+                    .ends_with(&format!("failed ({description})"))
+            );
+            let error = Cmd::new("sh").args(["-c", script]).stream().unwrap_err();
+            assert_eq!(error.to_string(), description);
+            let error = Cmd::new("sh")
+                .args(["-c", script])
+                .delayed_stream(1000, None)
+                .unwrap_err();
+            let (_, command) = crate::git::Repository::extract_failed_command(&error);
+            assert_eq!(command.unwrap().exit_info, description);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_spawn_errors_identify_program_and_cwd_without_guessing_cause() {
+        use crate::git::ErrorExt;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("broken-interpreter");
+        std::fs::write(&script, "#!/no/such/interpreter-7f3a9b2c\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let missing_cwd = dir.path().join("missing");
+        for (program, cwd) in [
+            ("missing-program-7f3a9b2c".to_string(), dir.path()),
+            ("/bin/sh".to_string(), missing_cwd.as_path()),
+            (script.to_string_lossy().into_owned(), dir.path()),
+        ] {
+            for command in [
+                Cmd::new(&program).current_dir(cwd),
+                Cmd::new(&program).current_dir(cwd).stdin_bytes("{}"),
+                Cmd::new(&program)
+                    .current_dir(cwd)
+                    .timeout(Duration::from_secs(1)),
+            ] {
+                let error = command.run().unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::NotFound);
+                assert!(error.to_string().contains(&program), "{error}");
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&cwd.to_string_lossy().to_string()),
+                    "{error}"
+                );
+                let source = std::error::Error::source(error.get_ref().unwrap()).unwrap();
+                assert_eq!(
+                    source
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(2)
+                );
+                let cause = source.to_string();
+                // The borrowed detail used by captured-command traces and the
+                // embedded Git-failure detail both retain the OS cause once.
+                let trace_detail = crate::git::error_chain_message(&error);
+                let error: anyhow::Error = error.into();
+                let detail = error.display_message();
+                assert_eq!(detail, trace_detail);
+                assert_eq!(detail.matches(&cause).count(), 1, "{detail}");
+                let (extracted, command) = crate::git::Repository::extract_failed_command(&error);
+                assert_eq!(extracted, detail);
+                assert!(command.is_none());
+            }
+            let error = Cmd::new(&program).current_dir(cwd).stream().unwrap_err();
+            assert!(error.to_string().contains(&program), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&cwd.to_string_lossy().to_string()),
+                "{error}"
+            );
+            assert_eq!(error.exit_code(), None);
+            assert!(
+                error
+                    .chain()
+                    .any(|source| source.downcast_ref::<std::io::Error>().is_some())
+            );
+        }
+    }
+
+    #[test]
     fn test_cmd_run_spawn_failure_is_errored() {
         let err = Cmd::new("/no/such/binary-7f3a9b2c").run().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    /// Every runner reports the native OS cause once through the same trace owner.
+    /// A scoped subscriber records real failures without changing the process logger.
+    #[test]
+    #[cfg(all(feature = "cli", unix))]
+    fn test_spawn_trace_retains_io_cause_once_in_every_execution_mode() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::sync::Arc::new(log.reopen().unwrap()))
+            .finish();
+        let causes = tracing::subscriber::with_default(subscriber, || {
+            let missing = "worktrunk-no-such-program-trace";
+            [
+                Cmd::new(missing).run().unwrap_err().into(),
+                Cmd::new(missing)
+                    .stdin_bytes("{}")
+                    .run()
+                    .unwrap_err()
+                    .into(),
+                Cmd::new(missing)
+                    .timeout(Duration::from_secs(1))
+                    .run()
+                    .unwrap_err()
+                    .into(),
+                Cmd::new(missing).stream().unwrap_err(),
+                Cmd::new(missing).delayed_stream(-1, None).unwrap_err(),
+                Cmd::new(missing)
+                    .pipe_into(Cmd::new("cat"))
+                    .unwrap_err()
+                    .into(),
+                Cmd::new("true")
+                    .pipe_into(Cmd::new(missing))
+                    .unwrap_err()
+                    .into(),
+            ]
+            .into_iter()
+            .map(|error: anyhow::Error| error.root_cause().to_string())
+            .collect::<Vec<_>>()
+        });
+        let output = std::fs::read_to_string(log.path()).unwrap();
+        let events: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("cmd_errored"))
+            .collect();
+        assert_eq!(events.len(), causes.len(), "{output}");
+        for (event, cause) in events.into_iter().zip(causes) {
+            assert!(event.contains("Failed to execute worktrunk-no-such-program-trace"));
+            assert_eq!(event.matches(&cause).count(), 1, "{event}");
+        }
     }
 
     #[test]
@@ -2656,7 +3599,7 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("Failed to execute command"),
+            msg.contains("Failed to execute /no/such/binary"),
             "expected spawn-failure message, got: {msg}"
         );
     }
@@ -2678,21 +3621,99 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_cmd_run_with_stdin_closes_pipe() {
-        // `cat` reads stdin to EOF; it can only exit once the pipe is closed,
-        // so this pins the "drop stdin before wait" behavior (a regression here
-        // hangs forever rather than failing).
-        let output = Cmd::new("cat").stdin_bytes("piped body").run().unwrap();
-        assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "piped body");
-    }
-
-    #[test]
-    #[cfg(unix)]
     fn test_cmd_delayed_stream_quiet_success() {
         // A fast command under a generous threshold exits during phase 1
         // (wait_timeout returns Some) and stays buffered/quiet.
         Cmd::new("true").delayed_stream(5_000, None).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_delayed_stream_retains_output_after_invalid_utf8() {
+        let error = Cmd::new("python3")
+            .args([
+                "-c",
+                "import sys; sys.stdout.buffer.write(b'\\xffinvalid\\r\\n' + b'x' * 250000 + b'\\nTAIL'); sys.stdout.flush(); sys.exit(17)",
+            ])
+            .delayed_stream(-1, None)
+            .unwrap_err();
+        let command = error.downcast_ref::<StreamCommandError>().unwrap();
+        assert_eq!(command.status.code(), Some(17), "{error:?}");
+        assert_eq!(
+            command.output,
+            format!("�invalid\n{}\nTAIL", "x".repeat(250000)),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_delayed_stream_crosses_the_threshold() {
+        // A command that outlives the threshold leaves phase 1 with no status
+        // (`wait_timeout` returns `Ok(None)`), which switches the readers to
+        // streaming, and phase 2 then reports the real exit.
+        //
+        // What pins the switch is where the late output goes: a streamed line
+        // is written to stderr instead of the buffer, so the error carries
+        // none of it. Had phase 1 returned a status instead, `late` would
+        // still be buffered and would show up here. The other thresholds never
+        // reach this arm — `0` streams without waiting, `-1` skips phase 1.
+        //
+        // The child writes 450 ms after the threshold passes. Only the switch
+        // has to land in that window, and it follows the wait immediately, so
+        // the margin covers a deschedule far longer than anything the suite
+        // produces. The threshold stays well above zero for the opposite
+        // reason: were `remaining` to reach it already spent, phase 1 would
+        // skip the wait entirely and the test would pass without reaching the
+        // arm it exists to cover.
+        let err = Cmd::new("sh")
+            .args(["-c", "sleep 0.5; echo late 1>&2; exit 3"])
+            .delayed_stream(50, None)
+            .unwrap_err();
+        let stream_err = err
+            .downcast_ref::<StreamCommandError>()
+            .expect("non-zero delayed_stream exit should be a StreamCommandError");
+        assert_eq!(stream_err.exit_info(), "exit code 3");
+        assert_eq!(
+            stream_err.output, "",
+            "output written after the switch must stream, not buffer"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_delayed_stream_flushes_what_it_buffered() {
+        // Output written *before* the threshold is buffered, and the switch to
+        // streaming drains that buffer to stderr before phase 2 begins. This
+        // ordering is what reaches the drain loop:
+        // `test_cmd_delayed_stream_crosses_the_threshold` writes after the
+        // switch, so its line streams from the reader thread and the buffer
+        // stays empty throughout.
+        //
+        // The error's `output` is empty either way — the reader relays a line
+        // it picks up after the switch, and the drain empties one it picked up
+        // before — so the assertion pins the switch, not the drain itself. A
+        // unit test cannot capture stderr, so the window is the only lever on
+        // which of the two runs; the integration test next door
+        // (`test_delayed_stream_progress_strips_ansi_when_piped`) is what
+        // asserts on the relayed text.
+        //
+        // The threshold is the whole window the reader has to get `early` into
+        // the buffer: spawning `sh` and reading its first line has to land
+        // inside it, or the switch goes first and the drain runs over nothing.
+        // 250 ms absorbs a slow spawn on a loaded runner, and the child's
+        // 500 ms still outlasts the threshold by the same margin.
+        let err = Cmd::new("sh")
+            .args(["-c", "echo early 1>&2; sleep 0.5; exit 3"])
+            .delayed_stream(250, None)
+            .unwrap_err();
+        let stream_err = err
+            .downcast_ref::<StreamCommandError>()
+            .expect("non-zero delayed_stream exit should be a StreamCommandError");
+        assert_eq!(stream_err.exit_info(), "exit code 3");
+        assert_eq!(
+            stream_err.output, "",
+            "output buffered before the switch must be drained to stderr, not reported"
+        );
     }
 
     #[test]
@@ -2708,7 +3729,7 @@ mod tests {
         let stream_err = err
             .downcast_ref::<StreamCommandError>()
             .expect("non-zero delayed_stream exit should be a StreamCommandError");
-        assert_eq!(stream_err.exit_info, "exit code 3");
+        assert_eq!(stream_err.exit_info(), "exit code 3");
     }
 
     #[test]
@@ -2716,7 +3737,35 @@ mod tests {
         // delay_ms=-1 disables phase 1; the spawn failure resolves the trace
         // via `fail` rather than dropping it unresolved.
         let err = Cmd::new(MISSING_CMD).delayed_stream(-1, None).unwrap_err();
-        assert!(err.to_string().contains("Failed to spawn"), "{err}");
+        assert!(err.to_string().contains("Failed to execute"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_run_concurrently_overlaps_children_and_keeps_order() {
+        // The first child waits for a file that only the last child creates, so
+        // it succeeds only if both run at once. A spawn failure in between
+        // stays in its own slot rather than shifting the results after it.
+        let dir = tempfile::tempdir().unwrap();
+        let flag = dir.path().join("flag");
+        let wait_for_flag = format!(
+            "for _ in $(seq 500); do [ -e '{}' ] && exit 0; sleep 0.01; done; exit 1",
+            flag.display()
+        );
+        let results = Cmd::run_concurrently(&[
+            Cmd::new("sh").args(["-c", wait_for_flag.as_str()]),
+            Cmd::new(MISSING_CMD),
+            Cmd::new("sh").args(["-c", "exit 3"]),
+            Cmd::new("touch").arg(flag.to_str().unwrap()),
+        ]);
+        let [waiter, missing, exit3, toucher]: [_; 4] = results.try_into().unwrap();
+        assert!(
+            waiter.unwrap().status.success(),
+            "children ran one at a time"
+        );
+        assert_eq!(missing.unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(exit3.unwrap().status.code(), Some(3));
+        assert!(toucher.unwrap().status.success());
     }
 
     #[test]
@@ -2788,12 +3837,17 @@ mod tests {
 
     #[test]
     fn test_stream_command_error_display_is_the_output() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
         // The Display impl exists only for the Error bound; callers read fields
         // via Repository::extract_failed_command, so nothing else exercises it.
         let err = StreamCommandError {
             output: "fatal: ref exists".to_string(),
             command: "git worktree add /x".to_string(),
-            exit_info: "exit code 128".to_string(),
+            status: std::process::ExitStatus::from_raw(if cfg!(unix) { 128 << 8 } else { 128 }),
         };
         assert_eq!(err.to_string(), "fatal: ref exists");
     }
@@ -2879,11 +3933,76 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_forward_signal_with_escalation_unknown_signal() {
-        // Unknown signal should return early without doing anything
-        // Use a signal number that's not SIGINT or SIGTERM
-        super::forward_signal_with_escalation(1, 999);
-        // No panic = success (function returns early for unknown signals)
+    fn test_group_died_within_immediate_for_reaped_group() {
+        // A reaped child leaves an empty group: the first (immediate) probe
+        // reads ESRCH and the grace loop returns without sleeping. This pins
+        // the early exit that keeps escalation cheap for the callers whose
+        // children are reaped concurrently (tether).
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", ":"]).process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pgid = child.id() as i32;
+        child.wait().unwrap();
+
+        let start = Instant::now();
+        // Grace far longer than any plausible scheduling stall, so returning
+        // early is structurally distinguishable from having slept it, and the
+        // bound below is a safety net rather than a race.
+        assert!(super::group_died_within(pgid, Duration::from_secs(30)));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "an empty group must exit the grace loop on the first probe; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_group_died_within_times_out_on_live_group() {
+        // Probing our own (live) process group runs the full grace and
+        // reports the group still alive.
+        let pgid = nix::unistd::getpgrp().as_raw();
+        let grace = Duration::from_millis(50);
+        let start = Instant::now();
+        assert!(!super::group_died_within(pgid, grace));
+        assert!(start.elapsed() >= grace);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_escalation_full_grace_and_inert_sweep_when_leader_unreaped() {
+        // Replays `kill_timed_out_tree`'s position: the caller holds the group
+        // leader unreaped while escalating. The child has already exited when
+        // escalation starts (stdout EOF is the barrier — the pipe closes when
+        // the process exits, so this needs no scheduling assumptions), but
+        // nobody reaps it, so the liveness probe counts the zombie, the grace
+        // runs to its deadline, and the final group SIGKILL fires against the
+        // dead group. The recorded exit must come through untouched — signals
+        // to a fully-exited group are discarded.
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "exit 7"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        let mut eof = Vec::new();
+        child.stdout.take().unwrap().read_to_end(&mut eof).unwrap();
+
+        let start = Instant::now();
+        super::terminate_process_group(pid);
+        assert!(
+            start.elapsed() >= Duration::from_millis(200),
+            "with the leader unreaped the group must read alive for the whole grace"
+        );
+
+        let status = child.wait().unwrap();
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the TERM and the post-grace SIGKILL must not alter the recorded exit"
+        );
     }
 
     #[test]

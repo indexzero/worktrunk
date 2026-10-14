@@ -14,30 +14,58 @@
 //!
 //! See: <https://github.com/max-sixty/worktrunk/issues/764>
 
+use dashmap::DashMap;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use worktrunk::git::Repository;
 
 use super::{
     CiBranchName, CiSource, CiStatus, MAX_PRS_TO_FETCH, PrRef, PrStatus, ReviewState,
-    is_retriable_error, non_interactive_cmd, parse_json,
+    non_interactive_cmd, parse_json,
 };
+
+/// Project IDs already resolved in this process, keyed by the worktree root
+/// `glab` was run from.
+///
+/// Keyed by path rather than held in a bare static, matching the path-keyed
+/// process-wide caches in `git::repository`: two `Repository` instances
+/// pointed at the same path see the same answer, and a second repository
+/// resolved in the same process can't inherit the first's. A failed lookup
+/// caches as `None` too — retrying it per row is the cost this exists to
+/// remove — so a transient failure degrades MR detection for the rest of the
+/// process.
+static GITLAB_PROJECT_IDS: LazyLock<DashMap<PathBuf, Option<u64>>> = LazyLock::new(DashMap::new);
 
 /// Get the GitLab project ID for a repository.
 ///
-/// Used for client-side filtering of MRs by source project.
-/// This is the GitLab equivalent of `get_origin_owner` for GitHub.
+/// Used for client-side filtering of MRs by source project. The GitHub
+/// equivalent is [`branch_owner_repo`](super::branch_owner_repo), which reads
+/// local git config; this one has to ask the GitLab API, so it is memoized for
+/// the process. [`detect_gitlab`] runs once per branch and the project ID is a
+/// repo-level constant, so without that a `wt list --full` over N worktrees
+/// would spend N round trips resolving the same value — and `wt list` cannot
+/// finish until every row's task returns.
+///
+/// The `entry` API holds the shard lock across the fetch, so concurrent rows
+/// sharing the key wait on the first call rather than each spawning their own.
 ///
 /// Returns None if glab is not configured for this repo (e.g., non-GitLab
 /// remote, auth issues).
 fn gitlab_project_id(repo: &Repository) -> Option<u64> {
     let repo_root = repo.current_worktree().root().ok()?;
+    *GITLAB_PROJECT_IDS
+        .entry(repo_root.clone())
+        .or_insert_with(|| fetch_gitlab_project_id(&repo_root))
+}
 
+/// Ask `glab` for this repository's project ID.
+fn fetch_gitlab_project_id(repo_root: &Path) -> Option<u64> {
     // Use glab repo view to get the project info as JSON
     // Disable color/pager to avoid ANSI noise in JSON output
     let output = non_interactive_cmd("glab")
         .args(["repo", "view", "--output", "json"])
-        .current_dir(&repo_root)
+        .current_dir(repo_root)
         .env("PAGER", "cat")
         .run()
         .ok()?;
@@ -113,13 +141,7 @@ pub(super) fn detect_gitlab(
     };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Return error status for retriable failures (rate limit, network) so they
-        // surface as warnings instead of being cached as "no CI"
-        if is_retriable_error(&stderr) {
-            return Some(PrStatus::error());
-        }
-        return None;
+        return Some(PrStatus::error());
     }
 
     // Step 1: Parse mr list output to find matching MR.
@@ -259,13 +281,7 @@ pub(super) fn detect_gitlab_pipeline(
     };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Return error status for retriable failures (rate limit, network) so they
-        // surface as warnings instead of being cached as "no CI"
-        if is_retriable_error(&stderr) {
-            return Some(PrStatus::error());
-        }
-        return None;
+        return Some(PrStatus::error());
     }
 
     let pipelines: Vec<GitLabPipeline> = parse_json(&output.stdout, "glab ci list", branch)?;
@@ -296,6 +312,13 @@ pub(super) fn detect_gitlab_pipeline(
     })
 }
 
+/// The `author` object nested in a `glab mr list` entry.
+#[derive(Debug, Default, Deserialize)]
+struct GitLabMrAuthor {
+    #[serde(default)]
+    username: String,
+}
+
 /// Basic MR info from `glab mr list --output json`.
 ///
 /// Note: `glab mr list` does NOT return `head_pipeline` or `pipeline` fields.
@@ -303,12 +326,6 @@ pub(super) fn detect_gitlab_pipeline(
 ///
 /// We include `source_project_id` for client-side filtering by source project.
 /// See the `# Filtering Strategy` docs on [`detect_gitlab`] for why we filter by source, not by author.
-#[derive(Debug, Default, Deserialize)]
-struct GitLabMrAuthor {
-    #[serde(default)]
-    username: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct GitLabMrListEntry {
     /// The internal MR ID (used to fetch full details via `glab mr view <iid>`)
@@ -413,20 +430,34 @@ pub(super) struct GitLabPipeline {
     pub web_url: Option<String>,
 }
 
+/// Map a GitLab pipeline `status` to a [`CiStatus`].
+///
+/// The arms cover every value GitLab documents for the field
+/// ([pipelines API](https://docs.gitlab.com/api/pipelines/)): `created`,
+/// `waiting_for_resource`, `preparing`, `waiting_for_callback`, `pending`,
+/// `running`, `success`, `failed`, `canceling`, `canceled`, `skipped`,
+/// `manual`, `scheduled`. Every non-terminal status groups as `Running` — a
+/// pipeline still moving, whatever it's waiting on — so a status GitLab adds
+/// later is the only thing that reaches the `_` fallback.
 fn parse_gitlab_status(status: Option<&str>) -> CiStatus {
     match status {
-        // "manual" = pipeline waiting for user to trigger a manual job (not failed)
+        // Non-terminal. "manual" = waiting for a user to trigger a manual job;
+        // "canceling" = cancellation in flight, not yet the terminal "canceled".
         Some(
             "running"
             | "pending"
             | "preparing"
             | "waiting_for_resource"
+            | "waiting_for_callback"
             | "created"
             | "scheduled"
-            | "manual",
+            | "manual"
+            | "canceling",
         ) => CiStatus::Running,
         Some("failed" | "canceled") => CiStatus::Failed,
         Some("success") => CiStatus::Passed,
+        // "skipped" and an absent status carry no signal, as does any status
+        // GitLab introduces after the list above.
         Some("skipped") | None => CiStatus::NoCI,
         _ => CiStatus::NoCI,
     }
@@ -497,15 +528,19 @@ mod tests {
 
     #[test]
     fn test_parse_gitlab_status() {
-        // Running states (includes "manual" - waiting for user to trigger)
+        // Non-terminal states. "manual" waits for a user to trigger a job;
+        // "canceling" is cancellation in flight (the terminal form is
+        // "canceled"); "waiting_for_callback" waits on an external system.
         for status in [
             "running",
             "pending",
             "preparing",
             "waiting_for_resource",
+            "waiting_for_callback",
             "created",
             "scheduled",
             "manual",
+            "canceling",
         ] {
             assert_eq!(
                 parse_gitlab_status(Some(status)),

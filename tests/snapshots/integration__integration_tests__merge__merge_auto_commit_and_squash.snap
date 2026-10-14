@@ -7,12 +7,23 @@ info:
     - main
   env:
     APPDATA: "[TEST_CONFIG_HOME]"
+    CLAUDE_CONFIG_DIR: "[TEST_CLAUDE_CONFIG]"
     CLICOLOR_FORCE: "1"
     COLUMNS: "500"
+    GIT_ALLOW_PROTOCOL: file
     GIT_AUTHOR_DATE: "2025-01-01T00:00:00Z"
+    GIT_AUTHOR_EMAIL: test@example.com
+    GIT_AUTHOR_NAME: Test User
     GIT_COMMITTER_DATE: "2025-01-01T00:00:00Z"
-    GIT_CONFIG_GLOBAL: "[TEST_GIT_CONFIG]"
-    GIT_CONFIG_SYSTEM: /dev/null
+    GIT_COMMITTER_EMAIL: test@example.com
+    GIT_COMMITTER_NAME: Test User
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_GLOBAL: /nonexistent/wt/gitconfig
+    GIT_CONFIG_KEY_0: user.useConfigOnly
+    GIT_CONFIG_KEY_1: rerere.enabled
+    GIT_CONFIG_SYSTEM: /nonexistent/wt/gitconfig
+    GIT_CONFIG_VALUE_0: "true"
+    GIT_CONFIG_VALUE_1: "false"
     GIT_TERMINAL_PROMPT: "0"
     HOME: "[TEST_HOME]"
     LANG: C
@@ -35,8 +46,10 @@ info:
     WORKTRUNK_TEST_MOCK_CONFIG_DIR: "[TEST_MOCK_CONFIG]"
     WORKTRUNK_TEST_NUSHELL_ENV: "0"
     WORKTRUNK_TEST_OPENCODE_INSTALLED: "0"
+    WORKTRUNK_TEST_PARENT_SHELL: ""
     WORKTRUNK_TEST_POWERSHELL_ENV: "0"
     WORKTRUNK_TEST_POWERSHELL_INSTALLED: "0"
+    WORKTRUNK_TEST_PROBE_TIMEOUT_MS: "60000"
     WORKTRUNK_TEST_SKIP_URL_HEALTH_CHECK: "1"
     WORKTRUNK_TEST_ZSH_INSTALLED: "0"
     XDG_CONFIG_HOME: "[TEST_CONFIG_HOME]"
@@ -47,7 +60,8 @@ exit_code: 0
 
 ----- stderr -----
 [36m◎[39m [36mSquashing 2 commits & working tree changes into a single commit [90m(2 files, [32m+2[39m[39m[90m)[39m...[39m
-[2m↳[22m [2mBackup created @ d5452aa[22m
+[2m↳[22m [2mBackup created @ [4mrefs/wt-backup/feature[24m (650fba7)[22m
+[2m↳[22m [2mTo recover in a new worktree, run [4mwt switch --create --base 650fba7c9c04204ce4928e32c12e9c5b79d6d1a5 --no-hooks recovery/650fba7[24m[22m
 [36m◎[39m [36mGenerating squash commit message...[39m
 [107m [0m [1mfix: update file 1 content[22m
 [32m✓[39m [32mSquashed @ [HASH][39m
@@ -58,5 +72,5 @@ exit_code: 0
 [107m [0m  2 files changed, 2 insertions(+)
 [32m✓[39m [32mMerged to [1mmain[22m [90m(1 commit, 2 files, [32m+2[39m[39m[90m)[39m[39m
 [36m◎[39m [36mRemoving [1mfeature[22m worktree & branch in background (same commit as [1mmain[22m,[39m [2m_[22m[36m)[39m
-[33m▲[39m [33mCannot change directory — shell integration not installed[39m
+[33m▲[39m [33mWorktree for [1mmain[22m @ [1m_REPO_[22m, but cannot change directory — shell integration not installed[39m
 [2m↳[22m [2mTo enable automatic cd, run [4mwt config shell install[24m[22m

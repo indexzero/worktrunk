@@ -6,7 +6,7 @@ Worktrees are addressed by branch name; paths are computed from a configurable t
 
 ## Examples
 
-```bash
+```console
 $ wt switch feature-auth           # Switch to worktree
 $ wt switch -                      # Previous worktree (like cd -)
 $ wt switch --create new-feature   # Create new branch and worktree
@@ -19,22 +19,36 @@ $ wt switch https://github.com/owner/repo/pull/123   # ...or paste the PR's URL
 
 The `--create` flag creates a new branch from `--base` — the default branch unless specified. Without `--create`, the branch must already exist. Switching to a remote branch (e.g., `wt switch feature` when only `origin/feature` exists) creates a local tracking branch.
 
+A new branch tracks the remote branch it starts from only when the two share a name: `--create release --base origin/release` tracks `origin/release`, while `--create feature --base origin/release` gets no upstream. Publish such a branch with `git push --set-upstream origin <branch>`, or set git's `push.autoSetupRemote = true` once.
+
 ## Creating worktrees
 
 If the branch already has a worktree, `wt switch` changes directories to it. Otherwise, it creates one:
 
 1. Runs [pre-switch hooks](https://worktrunk.dev/hook/#hook-types), blocking until complete
-2. Creates worktree at configured path
+2. Creates worktree at configured path (or at `--path`)
 3. Switches to new directory
 4. Runs [pre-start hooks](https://worktrunk.dev/hook/#hook-types), blocking until complete
 5. Spawns [post-start](https://worktrunk.dev/hook/#hook-types) and [post-switch hooks](https://worktrunk.dev/hook/#hook-types) in the background
 
-```bash
+```console
 $ wt switch feature                        # Existing branch → creates worktree
 $ wt switch --create feature               # New branch and worktree
 $ wt switch --create fix --base release    # New branch from release
 $ wt switch --create temp --no-hooks       # Skip hooks
 ```
+
+### Custom path [experimental]
+
+`--path` places one worktree outside the `worktree-path` template, keeping the branch name intact:
+
+```console
+$ wt switch --create feature/JIRA-1234 --path ../dark-mode
+$ wt switch ../dark-mode                   # Switch by path...
+$ wt switch feature/JIRA-1234              # ...or by branch
+```
+
+Worktrunk finds the worktree from git's own records, so commands reach it by branch or path as usual. [`wt list`](https://worktrunk.dev/list/#worktree) marks it `⚐`, since it isn't at the path its branch implies, and [`wt step relocate`](https://worktrunk.dev/step/#wt-step-relocate) offers to move it back to the template path.
 
 ## Naming a worktree
 
@@ -50,7 +64,7 @@ Worktrees are addressed by branch name, and every argument that takes one also a
 | `pr:{N}` | GitHub PR #N's branch |
 | `mr:{N}` | GitLab MR !N's branch |
 
-```bash
+```console
 $ wt switch -                           # Back to previous
 $ wt switch ^                           # Default branch worktree
 $ wt switch --create fix --base=@       # Branch from current HEAD
@@ -59,7 +73,7 @@ $ wt switch pr:123                      # PR #123's branch
 $ wt switch mr:101                      # MR !101's branch
 ```
 
-Shortcuts also apply to `--base`. For a fork PR/MR, the head commit is fetched and used as the base SHA without creating a tracking branch.
+Shortcuts also apply to `--base`.
 
 ## Interactive picker
 
@@ -75,48 +89,46 @@ The CI column shows each row's PR/MR CI and review status, the same as [`wt list
 | (type) | Filter worktrees |
 | `Enter` | Switch to selected worktree |
 | `Alt-c` | Create new worktree named as entered text |
-| `Alt-x` | Remove selected worktree/branch |
+| `Alt-x` | Remove selected worktree/branch (never forces; not the current worktree) |
 | `Alt-y` | Copy selected branch name to the clipboard |
 | `Alt-o` | Open the selected row's PR/MR URL in the browser |
 | `Alt-r` | Refresh the list (pick up worktrees created elsewhere) |
 | `Esc` | Cancel |
-| `Alt-1`–`Alt-7` | Jump to a preview tab |
-| `Tab`/`Shift-Tab` | Cycle preview tabs forward/backward |
+| `Alt-1`–`Alt-8` | Jump to a preview tab |
+| `Tab`/`Shift-Tab` | Cycle available preview tabs forward/backward |
 | `Alt-p` | Toggle preview panel |
 | `Ctrl-u`/`Ctrl-d` | Scroll preview up/down |
 
-`Alt-o` is a no-op on a row with no PR/MR (or whose status hasn't loaded yet).
-
-`Alt-x` is a no-op on the current worktree (the `@` row) — removing the worktree in use would have to switch elsewhere first, so switch away and remove it from there.
-
-Each row filters by its branch, path, and — when it has a PR/MR — the PR/MR's number, title, and author, the same fields whether the PR is checked out (a worktree row) or listed via `--prs`. Plain digits go to the filter, so a number can be typed directly and the preview tabs move to `Alt`.
-
-Typing a gutter sigil filters by row kind: `+` narrows to linked worktrees and `@` to the current worktree. The other sigils don't filter cleanly — `^` and `|` are skim's prefix-anchor and OR query operators (so `^` matches every row and `|` none), and `/` matches most rows because every worktree path contains it.
+The filter matches each row's branch, path, and — when it has a PR/MR — the PR/MR's number, title, and author. Typing `+` narrows to linked worktrees, and `@` to the current worktree.
 
 **Preview tabs:**
 
-1. **HEAD±** — Diff of uncommitted changes
-2. **log** — Recent commits; commits already on the default branch have dimmed hashes
-3. **main…±** — Diff of changes since the merge-base with the default branch
-4. **remote⇅** — Ahead/behind diff vs upstream tracking branch
-5. **summary** — LLM-generated branch summary; requires `[list] summary = true` and [`commit.generation`](https://worktrunk.dev/config/#commit)
-6. **pr** — The selected row's PR/MR, for any row whose branch has one
-7. **comments** — The PR/MR's comment thread, fetched from the forge on `--prs` rows
+1. **diff** — One net diff from the comparison base through the current worktree: committed, staged, unstaged, and untracked changes
+2. **working** — Staged, unstaged, and untracked changes against `HEAD`
+3. **committed** — Committed changes since the comparison base
+4. **log** — Recent commits; commits already on the default branch have dimmed hashes
+5. **remote⇅** — Ahead/behind diff vs upstream tracking branch
+6. **summary** — LLM-generated branch summary; requires `[list] summary = true` and [`commit.generation`](https://worktrunk.dev/config/#commit)
+7. **pr** — The selected row's PR/MR, for any row whose branch has one
+8. **comments** — The PR/MR's comment thread, fetched from the forge for any row whose branch has one
 
-On narrow previews the tab bar compacts to digits — only the active tab keeps its label — so every `Alt-N` accelerator stays visible.
+The comparison base is the merge-base with the default branch, or with its upstream when the local default branch lags. The picker opens on **diff** for local rows and **pr** for a PR/MR listed by `--prs` but not available locally. A tab with no content for the selected row has a dimmed label, and the active tab's label is underlined. `Tab` and `Shift-Tab` skip the dimmed tabs; `Alt-1` through `Alt-8` open any tab directly. After you choose a tab, that choice stays active while you navigate.
 
 **Pager configuration:** The preview panel pipes diff output through git's pager. Override in user config:
 
 ```toml
+# ~/.config/worktrunk/config.toml
 [switch.picker]
 pager = "delta --paging=never --width=$COLUMNS"
 ```
+
+**Starting list-only:** Set `preview = false` under `[switch.picker]` to open the picker with the preview hidden; `Alt-p` still shows it.
 
 ## Pull requests and merge requests
 
 The `pr:<number>` / `mr:<number>` shortcut and the PR/MR's web URL both resolve to its branch. For same-repo PRs/MRs, worktrunk switches to the branch directly. For fork PRs/MRs, it fetches the ref (`refs/pull/N/head` or `refs/merge-requests/N/head`) and configures `pushRemote` to the fork URL.
 
-```bash
+```console
 $ wt switch pr:101                                  # GitHub PR #101
 $ wt switch https://github.com/owner/repo/pull/101  # ...the same PR, by URL
 $ wt switch mr:101                                  # GitLab MR !101
@@ -128,7 +140,7 @@ Both work anywhere a branch is accepted, including `--base`. The `--create` flag
 
 If the PR or MR is on a fork, the local branch uses its branch name directly, so `git push` works normally. A pre-existing local branch with that name tracking something else requires renaming first.
 
-The `--prs` flag adds the repository's open PRs (GitHub) or MRs (GitLab) to the interactive picker — only the ones not already there: a PR whose branch is already shown (as a worktree, or a local or remote branch) isn't listed twice, so `--prs` only adds the rest and the two pickers differ solely by those extra rows. Each added row resolves to the same `pr:`/`mr:` shortcut, so selecting one fetches the ref and switches to its branch. A `--prs` row has no local worktree, so its `pr` and `comments` preview tabs load the PR/MR's metadata and comments from the forge in the background. The `log` tab uses a local `git log` — graph and merge-base dimming included — whenever the head commit is already in the object store (a same-repo PR off a fetched remote), falling back to a flat forge-fetched commit list otherwise.
+The `--prs` flag adds the repository's open PRs (GitHub) or MRs (GitLab) that aren't already in the interactive picker. Selecting one switches to it as `pr:<number>` / `mr:<number>` would.
 
 Requires `gh` (GitHub), `glab` (GitLab), or an equivalent CLI installed and authenticated; see [forge platform](https://worktrunk.dev/config/#forge-platform) for Gitea, Azure DevOps, and other supported platforms.
 
@@ -157,8 +169,7 @@ Arguments:
   [EXECUTE_ARGS]...
           Additional arguments for --execute command (after --)
 
-          Arguments after -- are appended to the execute command. Each argument is expanded for
-          templates, then POSIX shell-escaped.
+          Each argument is expanded for templates and passed directly to the program.
 
 Options:
   -c, --create
@@ -170,18 +181,38 @@ Options:
           Defaults to default branch. Supports the same shortcuts as the branch argument: ^, @, -,
           pr:{N}, mr:{N}.
 
-  -x, --execute <EXECUTE>
-          Command to run after switch
+      --path <PATH>
+          Worktree directory for a new worktree [experimental]
 
-          Replaces the wt process with the command after switching, giving it full terminal control.
-          Useful for launching editors, AI agents, or other interactive tools.
+          Overrides the worktree-path template for this worktree. Relative paths resolve from the
+          current directory, as with git worktree add. The branch keeps its own name; afterwards,
+          switch by branch or by path.
+
+  -x, --execute <EXECUTE>
+          Program to run after switch
+
+          Runs one external program after switching, with full terminal control. Arguments after --
+          go directly to that program without Worktrunk shell parsing. Program lookup and argument
+          decoding follow the operating system. Shell syntax requires an explicit shell, for example
+          -x sh -- -c 'npm install && npm test'. On Windows, shell shims need their extension (-x
+          code.cmd) or an explicit shell such as -x cmd.exe -- /C code.
 
           Without a branch argument, the interactive picker opens and the command runs against the
           selected worktree — so wt switch -x claude picks a worktree, then launches Claude Code
           there.
 
+          The program starts in the worktree the switch selected, whether or not your shell follows
+          it there: --no-cd governs only the shell.
+
           Supports hook template variables ({{ branch }}, {{ worktree_path }}, etc.) and filters. {{
-          base }} and {{ base_worktree_path }} require --create.
+          base }} and {{ base_worktree_path }} describe the source: the selected base with --create,
+          or the invoking worktree when switching to an existing worktree.
+
+          A variable inside a shell body is substituted before that shell parses it, so a path with
+          spaces splits into several arguments. Pass it as a separate argument instead — sh binds
+          the first one to $0, so the path arrives as $1:
+
+            wt switch feature -x sh -- -c 'cd "$1" && npm test' sh '{{ worktree_path }}'
 
           Especially useful with shell aliases:
 
@@ -201,8 +232,10 @@ Options:
       --no-cd
           Skip directory change after switching
 
-          Hooks still run normally. Useful when hooks handle navigation (e.g., tmux workflows) or
-          for CI/automation. Use --cd to override.
+          Hooks still run normally, and an --execute program still starts in the worktree — only
+          your shell stays put, so wt switch feature --no-cd -x code -- . opens the worktree in an
+          editor and leaves your terminal where it was. Useful when hooks handle navigation (e.g.,
+          tmux workflows) or for CI/automation. Use --cd to override.
 
   -h, --help
           Print help (see a summary with '-h')

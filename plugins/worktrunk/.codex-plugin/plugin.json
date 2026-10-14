@@ -16,7 +16,8 @@
           "hooks": [
             {
               "type": "command",
-              "command": "bash \"$PLUGIN_ROOT/hooks/wt.sh\" config state marker set 🤖 || true"
+              "command": "bash \"$PLUGIN_ROOT/hooks/wt.sh\" config state marker set 🤖 || true",
+              "commandWindows": "cmd /d /c call \"${PLUGIN_ROOT}\\hooks\\wt.cmd\" config state marker set 🤖"
             }
           ]
         }
@@ -27,7 +28,8 @@
           "hooks": [
             {
               "type": "command",
-              "command": "bash \"$PLUGIN_ROOT/hooks/wt.sh\" config state marker set 💬 || true"
+              "command": "bash \"$PLUGIN_ROOT/hooks/wt.sh\" config state marker set 💬 || true",
+              "commandWindows": "cmd /d /c call \"${PLUGIN_ROOT}\\hooks\\wt.cmd\" config state marker set 💬"
             }
           ]
         }
@@ -37,7 +39,20 @@
           "hooks": [
             {
               "type": "command",
-              "command": "bash \"$PLUGIN_ROOT/hooks/wt.sh\" config state marker set 💬 || true"
+              "command": "bash \"$PLUGIN_ROOT/hooks/wt.sh\" config state marker set 💬 || true",
+              "commandWindows": "cmd /d /c call \"${PLUGIN_ROOT}\\hooks\\wt.cmd\" config state marker set 💬"
+            }
+          ]
+        }
+      ],
+      "SessionEnd": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "bash \"$PLUGIN_ROOT/hooks/wt.sh\" config state marker clear || true",
+              "commandWindows": "cmd /d /c call \"${PLUGIN_ROOT}\\hooks\\wt.cmd\" config state marker clear",
+              "timeout": 3
             }
           ]
         }
@@ -46,6 +61,8 @@
   },
   "interface": {
     "displayName": "Worktrunk",
+    "logo": "./.claude-plugin/icon.png",
+    "composerIcon": "./.claude-plugin/icon.png",
     "shortDescription": "Git worktree workflows for parallel Codex sessions.",
     "longDescription": "Use Worktrunk from Codex to manage linked worktrees, set up LLM commit workflows, and configure project hooks.",
     "developerName": "Worktrunk",

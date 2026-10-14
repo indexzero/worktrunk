@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use worktrunk::config::{ConfigFileKind, require_config_path};
 use worktrunk::git::Repository;
 use worktrunk::path::format_path_for_display;
-use worktrunk::styling::{eprintln, hint_message, info_message, success_message};
+use worktrunk::styling::{eprintln, hint_message, info_message, success_message, warning_message};
 
 /// Example user configuration file content (displayed in help with values uncommented)
 const USER_CONFIG_EXAMPLE: &str = include_str!("../../../dev/config.example.toml");
@@ -63,7 +63,26 @@ pub fn handle_config_create(project: bool) -> anyhow::Result<()> {
                 "See https://worktrunk.dev/hook/ for hook documentation",
             ],
             user_config_exists,
-        )
+        )?;
+        // Born superseded: existing worktrunk.config.* keys in git config are
+        // the project config (all-or-nothing), so the file just created will
+        // not be read until they are removed. Say so now, not at first use.
+        if !repo.worktrunk_config_git_pairs()?.is_empty() {
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "<bold>worktrunk.config.*</> keys exist in git config; the new project config will be ignored until they are removed"
+                ))
+            );
+            eprintln!(
+                "{}",
+                hint_message(cformat!(
+                    "To list the keys and their origins, run <underline>{}</>",
+                    worktrunk::config::GIT_CONFIG_LIST_COMMAND
+                ))
+            );
+        }
+        Ok(())
     } else {
         let project_config_exists = Repository::current()
             .and_then(|repo| repo.project_config_path())
@@ -124,10 +143,23 @@ fn create_config_file(
         std::fs::create_dir_all(parent).context("Failed to create config directory")?;
     }
 
-    // Write the example config with all values commented out
+    // Write the example config with all values commented out. The path was
+    // observed absent above, so a file that occupies it now is one wt never
+    // read, and is not replaced by an example. A dangling symlink is the case
+    // worth naming — `exists()` reads false through it, so a dotfile manager's
+    // link reaches this write every time; a file another process created in
+    // the window is a plain write failure.
     let commented_config = comment_out_config(content);
-    worktrunk::utils::write_atomically(&path, &commented_config)
-        .context("Failed to write config file")?;
+    worktrunk::utils::write_new_atomically(&path, &commented_config).map_err(|e| {
+        let display_path = format_path_for_display(&path);
+        if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_symlink() && !path.exists() {
+            anyhow::anyhow!(
+                "Failed to create {display_path}: path is a dangling symlink; restore its target or remove the link, then rerun"
+            )
+        } else {
+            anyhow::Error::new(e).context(format!("Failed to write {display_path}"))
+        }
+    })?;
 
     // Success message
     eprintln!(

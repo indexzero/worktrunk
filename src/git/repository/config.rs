@@ -6,11 +6,12 @@ use std::time::Duration;
 use anyhow::Context;
 use color_print::cformat;
 
-use crate::config::ProjectConfig;
+use crate::config::{LoadError, ProjectConfig};
 
 use crate::git::CommandError;
+use crate::path::format_path_for_display;
 
-use super::{DefaultBranchName, GitError, Repository};
+use super::{DefaultBranchName, GitError, Repository, Selector};
 
 /// How long `git ls-remote` may run before default-branch detection gives up.
 ///
@@ -130,20 +131,59 @@ impl Repository {
         Ok(existed)
     }
 
-    /// Run `git config --get-regexp <pattern>` and return stdout.
+    /// The `worktrunk.config.*` entries from the merged effective git config,
+    /// with the prefix stripped (experimental project-config source, #3454).
     ///
-    /// Distinguishes exit 1 (no matching keys — expected, returns empty
-    /// string) from real config errors (corrupt config, permission denied —
-    /// surfaced as `Err`). Use this instead of `run_command` + `.unwrap_or_default()`,
-    /// which conflates the two.
-    pub fn get_config_regexp(&self, pattern: &str) -> anyhow::Result<String> {
-        let args = ["config", "--get-regexp", pattern];
+    /// An in-memory prefix scan over the bulk config map — no subprocess.
+    /// Git has already merged the scopes (system → global → local, plus any
+    /// includes) before `--list` emits, and for a repeated key the last
+    /// value wins, so the returned pairs carry git's own precedence.
+    /// Per git's key model the middle path segments are case-sensitive;
+    /// only exact-lowercase keys (the schema's own spelling) match.
+    ///
+    /// A `WORKTRUNK_PROJECT_CONFIG_PATH` override — any value, including
+    /// empty — returns no pairs: the override names the config source
+    /// outright (see [`project_config_path`](Self::project_config_path)),
+    /// and the object-store fallback already defers to it for the same
+    /// reason. The empty-value form is the "no project config" kill switch
+    /// test harnesses rely on; ambient git keys must not resurrect config
+    /// behind it. Enforcing the deferral here, in the sole accessor, means
+    /// every consumer (`ProjectConfig::load`, `wt config show`,
+    /// `wt --diagnose`) inherits it by construction.
+    ///
+    /// Any non-empty result means the git-config source supersedes
+    /// `.config/wt.toml` — the selection lives in `ProjectConfig::load`.
+    pub fn worktrunk_config_git_pairs(&self) -> anyhow::Result<Vec<(String, String)>> {
+        if std::env::var_os("WORKTRUNK_PROJECT_CONFIG_PATH").is_some() {
+            return Ok(Vec::new());
+        }
+        let guard = self.all_config()?.read().unwrap();
+        Ok(guard
+            .iter()
+            .filter_map(|(key, values)| {
+                let rest = key.strip_prefix(crate::config::GIT_CONFIG_PREFIX)?;
+                Some((rest.to_string(), values.last()?.clone()))
+            })
+            .collect())
+    }
+
+    /// Read matching config entries without using newlines as record boundaries.
+    ///
+    /// `git config --null --get-regexp` emits `key\nvalue\0` records, so values
+    /// containing newlines remain intact. Valueless keys are emitted as
+    /// `key\0` and read as `"true"`, git's boolean reading of them (see
+    /// `parse_config_list_z`). When a key has multiple values, the last value
+    /// wins, matching the other config readers.
+    pub fn config_regexp_entries(&self, pattern: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let args = ["config", "--null", "--get-regexp", pattern];
         let output = self.run_command_output(&args)?;
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            Ok(super::parse_config_list_z(&output.stdout)
+                .into_iter()
+                .filter_map(|(key, values)| values.into_iter().last().map(|value| (key, value)))
+                .collect())
         } else if output.status.code() == Some(1) {
-            // Exit 1 = no keys matched the pattern
-            Ok(String::new())
+            Ok(Vec::new())
         } else {
             Err(CommandError::from_failed_output("git", &args, &output).into())
         }
@@ -185,15 +225,13 @@ impl Repository {
     pub fn vars_entries(&self, branch: &str) -> std::collections::BTreeMap<String, String> {
         let escaped = regex::escape(branch);
         let pattern = format!(r"^worktrunk\.state\.{escaped}\.vars\.");
-        let output = self.get_config_regexp(&pattern).unwrap_or_default();
-
         let prefix = format!("worktrunk.state.{branch}.vars.");
-        output
-            .lines()
-            .filter_map(|line| {
-                let (config_key, value) = line.split_once(' ')?;
+        self.config_regexp_entries(&pattern)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(config_key, value)| {
                 let key = config_key.strip_prefix(&prefix)?;
-                Some((key.to_string(), value.to_string()))
+                Some((key.to_string(), value))
             })
             .collect()
     }
@@ -206,25 +244,21 @@ impl Repository {
     pub fn all_vars_entries(
         &self,
     ) -> std::collections::HashMap<String, std::collections::BTreeMap<String, String>> {
-        let output = self
-            .get_config_regexp(r"^worktrunk\.state\..+\.vars\.")
+        let entries = self
+            .config_regexp_entries(r"^worktrunk\.state\..+\.vars\.")
             .unwrap_or_default();
 
         let mut result: std::collections::HashMap<
             String,
             std::collections::BTreeMap<String, String>,
         > = std::collections::HashMap::new();
-        for line in output.lines() {
-            let Some((config_key, value)) = line.split_once(' ') else {
-                continue;
-            };
-            let Some((branch, key)) = parse_vars_config_key(config_key) else {
-                continue;
-            };
+        for (config_key, value) in entries {
+            let (branch, key) =
+                parse_vars_config_key(&config_key).expect("config key matched vars pattern");
             result
                 .entry(branch.to_string())
                 .or_default()
-                .insert(key.to_string(), value.to_string());
+                .insert(key.to_string(), value);
         }
         result
     }
@@ -403,7 +437,7 @@ impl Repository {
     /// call per repo may run `git ls-remote` (100 ms–2 s); the result is
     /// then persisted to `worktrunk.default-branch` and every subsequent
     /// call is a local cache hit. No other detection helper may add a
-    /// similar fallback. See `CLAUDE.md` → "Network Access" for the policy.
+    /// similar fallback. See `AGENTS.md` → "Network Access" for the policy.
     ///
     /// Detection strategy:
     /// 1. Check worktrunk cache (`git config worktrunk.default-branch`)
@@ -497,46 +531,61 @@ impl Repository {
 
     /// Resolve a target branch from an optional override
     ///
-    /// If target is Some, expands special symbols ("@", "-", "^") via `resolve_worktree_name`.
+    /// If target is Some, expands special symbols ("@", "-", "^") via `expand_selector`.
     /// Otherwise, queries the default branch.
     /// This is a common pattern used throughout commands that accept an optional --target flag.
     ///
     /// Note: This does not validate that the target exists. Use `require_target_branch` or
     /// `require_target_ref` for validation before approval prompts.
     pub fn resolve_target_branch(&self, target: Option<&str>) -> anyhow::Result<String> {
+        Ok(self.resolve_target_selector(target)?.token().to_string())
+    }
+
+    /// [`resolve_target_branch`](Self::resolve_target_branch), keeping the
+    /// [`Selector`] rather than flattening it to the name.
+    ///
+    /// The `require_target_*` pair needs what the selector carries: whether the
+    /// token is still one the user typed, which is what decides the path arm
+    /// below. A default branch read from the cache is nobody's path, so the
+    /// `None` target is a rewrite like any other.
+    pub fn resolve_target_selector(&self, target: Option<&str>) -> anyhow::Result<Selector> {
         match target {
-            Some(b) => self.resolve_worktree_name(b),
-            None => self.default_branch().ok_or_else(|| {
-                GitError::Other {
-                    message: cformat!(
-                        "Cannot determine default branch. Specify target explicitly or run <bold>wt config state default-branch set BRANCH</>"
-                    ),
-                }
-                .into()
-            }),
+            Some(b) => self.expand_selector(b),
+            None => self
+                .default_branch()
+                .map(Selector::rewritten_to)
+                .ok_or_else(|| {
+                    GitError::Other {
+                        message: cformat!(
+                            "Cannot determine default branch; specify the target explicitly, or to configure one, run <bold>wt config state default-branch set BRANCH</>"
+                        ),
+                    }
+                    .into()
+                }),
         }
     }
 
-    /// The branch checked out at `target`, when `target` is a worktree path.
+    /// The worktree a target names by path, when the target is one.
     ///
     /// The path arm of a merge or rebase target: `wt merge ../repo.main` names
     /// the same branch as `wt merge main`. Refs win, so this runs only once the
     /// caller's own ref lookup has failed, and only for a target the user typed
-    /// — a default branch that resolved from the cache is not a path.
+    /// — which [`Selector::names_a_path`] answers outright, where this used to
+    /// infer it by checking whether expansion had changed the string.
     ///
-    /// `resolved` is `target` after shortcut expansion; an expansion means the
-    /// literal token was a symbol rather than a path.
-    fn target_branch_at_path(
+    /// The worktree is returned whole rather than just its branch, so `None`
+    /// means "nothing registered here" alone. A detached worktree — `Some` with
+    /// no branch — is the case that makes the distinction load-bearing: it is
+    /// reachable by path and by nothing else, so folding it into `None` would
+    /// let a caller report a worktree `wt list` shows as absent.
+    fn target_worktree_at_path(
         &self,
-        target: Option<&str>,
-        resolved: &str,
-    ) -> anyhow::Result<Option<String>> {
-        let Some(target) = target.filter(|t| *t == resolved) else {
+        selector: &Selector,
+    ) -> anyhow::Result<Option<(PathBuf, Option<String>)>> {
+        if !selector.names_a_path() {
             return Ok(None);
-        };
-        Ok(self
-            .worktree_at_input_path(target)?
-            .and_then(|(_, branch)| branch))
+        }
+        self.worktree_at_input_path(selector.token())
     }
 
     /// Resolve and validate a target that must be a branch.
@@ -550,20 +599,41 @@ impl Repository {
     /// the generic "branch not found" — the user didn't type that name,
     /// the persisted cache did.
     pub fn require_target_branch(&self, target: Option<&str>) -> anyhow::Result<String> {
-        let branch = self.resolve_target_branch(target)?;
+        let selector = self.resolve_target_selector(target)?;
+        let branch = selector.token().to_string();
         if !self.branch(&branch).exists()? {
-            if let Some(from_path) = self.target_branch_at_path(target, &branch)? {
-                return Ok(from_path);
+            match self.target_worktree_at_path(&selector)? {
+                Some((_, Some(from_path))) => return Ok(from_path),
+                // A worktree is there, so the path resolved — it just has no
+                // branch to be the target of a merge or a push.
+                Some((path, None)) => {
+                    return Err(GitError::DetachedHead {
+                        action: Some(cformat!(
+                            "use <bold>{}</> as a target",
+                            format_path_for_display(&path)
+                        )),
+                        worktree: Some(path),
+                    }
+                    .into());
+                }
+                None => {}
             }
             if target.is_none() {
-                if self.is_unborn_branch(&branch) {
-                    return Err(GitError::UnbornDefaultBranch { branch }.into());
-                }
-                return Err(GitError::StaleDefaultBranch { branch }.into());
+                return Err(self.uncached_default_branch_error(branch));
+            }
+            // Nothing is registered at the path, which is what this error
+            // asserts; the arms above consumed both worktree cases. A target
+            // is spelled in a wider vocabulary than a worktree selector, so
+            // this stays here rather than routing through `resolve_selector`.
+            if let Some(path) = self.path_selector_directory(&branch) {
+                return Err(GitError::WorktreeNotFoundAtPath { path }.into());
             }
             return Err(GitError::BranchNotFound {
+                // Offering `--create` for a name git rejects sends the user to
+                // a command that fails; the argument was a path spelling,
+                // whether or not a directory happens to sit at it.
+                show_create_hint: super::is_valid_branch_name(&branch),
                 branch,
-                show_create_hint: true,
                 last_fetch_ago: None,
                 pr_mr_platform: self.detect_ref_type(),
             }
@@ -582,20 +652,41 @@ impl Repository {
     /// [`GitError::StaleDefaultBranch`] with cache-reset hints rather than
     /// the generic "reference not found".
     pub fn require_target_ref(&self, target: Option<&str>) -> anyhow::Result<String> {
-        let reference = self.resolve_target_branch(target)?;
+        let selector = self.resolve_target_selector(target)?;
+        let reference = selector.token().to_string();
         if !self.ref_exists(&reference)? {
-            if let Some(from_path) = self.target_branch_at_path(target, &reference)? {
+            if let Some((_, Some(from_path))) = self.target_worktree_at_path(&selector)? {
                 return Ok(from_path);
             }
+            // No path claim here: a commit-ish is spelled in a wider vocabulary
+            // than a worktree selector, and `ReferenceNotFound` names all of it.
             if target.is_none() {
-                if self.is_unborn_branch(&reference) {
-                    return Err(GitError::UnbornDefaultBranch { branch: reference }.into());
-                }
-                return Err(GitError::StaleDefaultBranch { branch: reference }.into());
+                return Err(self.uncached_default_branch_error(reference));
             }
-            return Err(GitError::ReferenceNotFound { reference }.into());
+            return Err(GitError::ReferenceNotFound {
+                reference,
+                flag: None,
+            }
+            .into());
         }
         Ok(reference)
+    }
+
+    /// The error for a default branch that came from the cache rather than the
+    /// user, and then didn't resolve.
+    ///
+    /// The one part of `require_target_branch` and `require_target_ref` that is
+    /// identical rather than merely parallel: the rest of those two differ in
+    /// their existence predicate, their extra arms, and their final error, and
+    /// forcing them together would cost more in parameters than the duplication
+    /// does.
+    fn uncached_default_branch_error(&self, branch: String) -> anyhow::Error {
+        if self.is_unborn_branch(&branch) {
+            // No cache-reset hint: the cached name is right, the branch just
+            // has no commits yet.
+            return GitError::UnbornDefaultBranch { branch }.into();
+        }
+        GitError::StaleDefaultBranch { branch }.into()
     }
 
     /// True when `branch` is checked out as an unborn HEAD (no commits yet)
@@ -670,14 +761,18 @@ impl Repository {
     // Private helpers for default_branch detection
 
     fn local_default_branch(&self, remote: &str) -> anyhow::Result<String> {
-        let stdout =
-            self.run_command(&["rev-parse", "--abbrev-ref", &format!("{}/HEAD", remote)])?;
+        let stdout = self.run_command(&[
+            "rev-parse",
+            "--abbrev-ref",
+            "--verify",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ])?;
         DefaultBranchName::from_local(remote, &stdout).map(DefaultBranchName::into_string)
     }
 
     pub(super) fn query_remote_default_branch(&self, remote: &str) -> anyhow::Result<String> {
         let stdout = self.run_command_bounded(
-            &["ls-remote", "--symref", remote, "HEAD"],
+            &["ls-remote", "--symref", "--", remote, "HEAD"],
             Some(REMOTE_DETECTION_TIMEOUT),
         )?;
         DefaultBranchName::from_remote(&stdout).map(DefaultBranchName::into_string)
@@ -897,7 +992,7 @@ impl Repository {
         }
 
         let spec = format!("{}:.config/wt.toml", self.default_branch()?);
-        match self.run_command_output(&["show", &spec]) {
+        match self.run_command_output(&["show", "--end-of-options", &spec]) {
             Ok(output) if output.status.success() => Some((
                 String::from_utf8_lossy(&output.stdout).into_owned(),
                 PathBuf::from(&spec),
@@ -945,6 +1040,37 @@ impl Repository {
             })
             .map(Option::as_ref)
     }
+
+    /// Report an unloadable project config as a warning instead of an error.
+    ///
+    /// Every command that *runs* project config — `wt switch`, `wt merge`,
+    /// `wt hook` — fails hard on a `.config/wt.toml` that doesn't parse:
+    /// acting on a half-read hook list is worse than stopping. `wt list` only
+    /// decorates with it (`[list] url`, `[forge] platform`, both reached
+    /// through accessors that already degrade to `None`), so the file would
+    /// otherwise leave no trace at all on the command people run most, and a
+    /// broken config could sit there indefinitely.
+    ///
+    /// The warning is the one the user-config layer already emits for the
+    /// same condition (`▲ User config @ … failed to parse, skipping`), through
+    /// the shared `emit_config_load_warning`. A failure with no file/parse
+    /// split to render — an unreadable file, a path that can't be resolved —
+    /// warns with its own message instead.
+    pub fn warn_if_project_config_unloadable(&self) {
+        let Err(err) = self.project_config() else {
+            return;
+        };
+        match err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<LoadError>())
+        {
+            Some(load_error) => super::emit_config_load_warning(load_error),
+            None => crate::styling::eprintln!(
+                "{}",
+                crate::styling::warning_message(format!("{}, skipping", err.root_cause()))
+            ),
+        }
+    }
 }
 
 /// Split a `worktrunk.state.<branch>.vars.<key>` config key into `(branch, key)`.
@@ -976,29 +1102,29 @@ mod tests {
     use crate::testing::TestRepo;
 
     #[test]
-    fn test_get_config_regexp_no_match_returns_empty() {
+    fn test_config_regexp_entries_no_match_returns_empty() {
         // Exit 1 from git config --get-regexp means "no keys matched" — must
-        // surface as Ok("") rather than an error so callers don't conflate
+        // surface as an empty list rather than an error so callers don't conflate
         // no-matches with real config failures.
         let test = TestRepo::with_initial_commit();
         let repo = Repository::at(test.root_path()).unwrap();
 
-        let output = repo
-            .get_config_regexp(r"^worktrunk\.state\..+\.marker$")
+        let entries = repo
+            .config_regexp_entries(r"^worktrunk\.state\..+\.marker$")
             .unwrap();
-        assert_eq!(output, "");
+        assert!(entries.is_empty());
     }
 
     #[test]
-    fn test_get_config_regexp_failure_is_command_error() {
+    fn test_config_regexp_entries_failure_is_command_error() {
         // A real failure (invalid pattern, exit 6) must surface as a typed
         // `CommandError` — unlike exit 1, which means "no keys matched".
         let test = TestRepo::with_initial_commit();
         let repo = Repository::at(test.root_path()).unwrap();
 
-        let err = repo.get_config_regexp("(").unwrap_err();
+        let err = repo.config_regexp_entries("(").unwrap_err();
         let cmd_err = CommandError::find_in(&err).expect("error should carry a CommandError");
-        assert_eq!(cmd_err.command_string(), "git config --get-regexp (");
+        assert_eq!(cmd_err.command_string(), "git config --null --get-regexp (");
     }
 
     #[test]
@@ -1011,6 +1137,37 @@ mod tests {
         let err = repo.unset_config("inva lid.key").unwrap_err();
         let cmd_err = CommandError::find_in(&err).expect("error should carry a CommandError");
         assert_eq!(cmd_err.command_string(), "git config --unset inva lid.key");
+    }
+
+    #[test]
+    fn test_worktrunk_config_pairs_honor_conditional_include() {
+        // Keys reachable only through an `includeIf.gitdir:` condition must
+        // resolve like any other git config — git evaluates the condition
+        // before the bulk `--list` read this accessor scans.
+        let test = TestRepo::with_initial_commit();
+        let fragment = test.root_path().join("private-worktrunk.gitconfig");
+        std::fs::write(
+            &fragment,
+            "[worktrunk \"config.list\"]\n\turl = http://from-includeif:1234\n",
+        )
+        .unwrap();
+
+        use path_slash::PathExt as _;
+        let condition = format!(
+            "includeIf.gitdir:{}/.git/.path",
+            test.root_path().to_slash_lossy()
+        );
+        test.run_git(&["config", &condition, fragment.to_str().unwrap()]);
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let pairs = repo.worktrunk_config_git_pairs().unwrap();
+        assert_eq!(
+            pairs,
+            vec![(
+                "list.url".to_string(),
+                "http://from-includeif:1234".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -1028,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_config_regexp_returns_matches() {
+    fn test_config_regexp_entries_returns_matches() {
         let test = TestRepo::with_initial_commit();
         let repo = Repository::at(test.root_path()).unwrap();
 
@@ -1037,11 +1194,17 @@ mod tests {
         repo.set_config("worktrunk.state.bugfix.marker", r#"{"marker":"fix"}"#)
             .unwrap();
 
-        let output = repo
-            .get_config_regexp(r"^worktrunk\.state\..+\.marker$")
+        let entries = repo
+            .config_regexp_entries(r"^worktrunk\.state\..+\.marker$")
             .unwrap();
-        assert!(output.contains("worktrunk.state.feature.marker"));
-        assert!(output.contains("worktrunk.state.bugfix.marker"));
+        assert!(entries.contains(&(
+            "worktrunk.state.feature.marker".to_string(),
+            r#"{"marker":"wip"}"#.to_string()
+        )));
+        assert!(entries.contains(&(
+            "worktrunk.state.bugfix.marker".to_string(),
+            r#"{"marker":"fix"}"#.to_string()
+        )));
     }
 
     /// `mark_hint_shown` writes 1 on first call and increments on each
@@ -1098,7 +1261,7 @@ mod tests {
     }
 
     /// The snapshot read must parse the same entries as the subprocess read,
-    /// including branch names that themselves contain `.vars.`.
+    /// including multiline values and branch names containing `.vars.`.
     #[test]
     fn test_all_vars_from_snapshot_matches_subprocess_read() {
         let test = TestRepo::with_initial_commit();
@@ -1106,7 +1269,7 @@ mod tests {
 
         repo.set_config("worktrunk.state.feature.vars.ticket", "JIRA-1")
             .unwrap();
-        repo.set_config("worktrunk.state.feature.vars.note", "a note")
+        repo.set_config("worktrunk.state.feature.vars.note", "a note\ncontinued")
             .unwrap();
         repo.set_config("worktrunk.state.weird.vars.branch.vars.key", "v")
             .unwrap();
@@ -1114,7 +1277,7 @@ mod tests {
         let snapshot = repo.all_vars_from_snapshot().unwrap();
         assert_eq!(snapshot, repo.all_vars_entries());
         assert_eq!(snapshot["feature"]["ticket"], "JIRA-1");
-        assert_eq!(snapshot["feature"]["note"], "a note");
+        assert_eq!(snapshot["feature"]["note"], "a note\ncontinued");
         assert_eq!(snapshot["weird.vars.branch"]["key"], "v");
     }
 

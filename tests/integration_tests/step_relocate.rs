@@ -1,9 +1,8 @@
 //! Integration tests for `wt step relocate`
 
-use crate::common::{
-    TestRepo, configure_directive_files, directive_files, make_snapshot_cmd, repo,
-};
+use crate::common::{TestRepo, configure_directive_file, directive_file, make_snapshot_cmd, repo};
 use insta_cmd::assert_cmd_snapshot;
+use path_slash::PathExt as _;
 use rstest::rstest;
 use std::fs;
 use std::path::Path;
@@ -306,11 +305,18 @@ fn test_relocate_dirty_with_commit(repo: TestRepo) {
     // Make uncommitted changes
     fs::write(wrong_path.join("dirty.txt"), "uncommitted changes").unwrap();
 
-    // Configure mock LLM command via config file
-    let worktrunk_config = r#"
+    // Configure mock LLM command via config file. It saves the prompt so the
+    // assertion below can check which worktree the diff came from: `relocate`
+    // commits worktrees other than the invoking one, and reading the diff from
+    // the cwd (clean here) would describe nothing.
+    let captured = repo.home_path().join("captured-prompt.txt");
+    let worktrunk_config = format!(
+        r#"
 [commit.generation]
-command = "cat >/dev/null && echo 'chore: auto-commit before relocate'"
-"#;
+command = "cat > {} && echo 'chore: auto-commit before relocate'"
+"#,
+        captured.to_slash_lossy()
+    );
     fs::write(repo.test_config_path(), worktrunk_config).unwrap();
 
     // Relocate with --commit should commit then move
@@ -332,6 +338,13 @@ command = "cat >/dev/null && echo 'chore: auto-commit before relocate'"
         !wrong_path.exists(),
         "Old worktree path should no longer exist: {}",
         wrong_path.display()
+    );
+
+    // The generator described the committed worktree, not the invoking one.
+    let prompt = fs::read_to_string(&captured).expect("generator received no prompt");
+    assert!(
+        prompt.contains("dirty.txt") && prompt.contains("+uncommitted changes"),
+        "the prompt must carry the committed worktree's diff; got:\n{prompt}"
     );
 }
 
@@ -770,6 +783,87 @@ fn test_relocate_swap(repo: TestRepo) {
     assert!(path_for_beta.exists(), "beta should be at repo.beta");
 }
 
+/// Two independent relocation cycles must not share a temporary worktree path.
+///
+/// These branch names produce the same filename under the current 3-character
+/// hash. The first cycle keeps its worktree in staging until all cycles have
+/// been broken, so the second cycle used to fail when it tried to reuse that
+/// live path.
+#[rstest]
+fn test_relocate_disjoint_swaps_with_colliding_temp_names(repo: TestRepo) {
+    const FIRST: &str = "a/a-a-a/a-a/a/a-a/a";
+    const SECOND: &str = "a-a-a-a/a/a-a/a/a-a";
+    assert_eq!(
+        worktrunk::path::sanitize_for_filename(FIRST),
+        worktrunk::path::sanitize_for_filename(SECOND),
+        "test premise: both branches must sanitize to the same filename"
+    );
+
+    let parent = worktree_parent(&repo);
+    let first_source = parent.join("aaa-first");
+    let first_target = parent.join("bbb-first-partner");
+    let second_source = parent.join("ccc-second");
+    let second_target = parent.join("ddd-second-partner");
+
+    for (branch, path) in [
+        (FIRST, &first_source),
+        ("first-partner", &first_target),
+        (SECOND, &second_source),
+        ("second-partner", &second_target),
+    ] {
+        repo.run_git(&["worktree", "add", "-b", branch, path.to_str().unwrap()]);
+    }
+
+    let worktrunk_config = format!(
+        r#"
+worktree-path = "{{% if branch == '{FIRST}' %}}{}{{% elif branch == 'first-partner' %}}{}{{% elif branch == '{SECOND}' %}}{}{{% elif branch == 'second-partner' %}}{}{{% else %}}../{{{{ repo }}}}.{{{{ branch | sanitize }}}}{{% endif %}}"
+"#,
+        first_target.to_slash_lossy(),
+        first_source.to_slash_lossy(),
+        second_target.to_slash_lossy(),
+        second_source.to_slash_lossy(),
+    );
+    fs::write(repo.test_config_path(), worktrunk_config).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args([
+            "step",
+            "relocate",
+            FIRST,
+            "first-partner",
+            SECOND,
+            "second-partner",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "both swaps should relocate; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for (path, branch) in [
+        (&first_target, FIRST),
+        (&first_source, "first-partner"),
+        (&second_target, SECOND),
+        (&second_source, "second-partner"),
+    ] {
+        let output = repo
+            .git_command()
+            .current_dir(path)
+            .args(["branch", "--show-current"])
+            .run()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            branch,
+            "{} should contain {branch}",
+            path.display()
+        );
+    }
+}
+
 /// A worktree whose target is occupied by a *blocked* worktree must itself be
 /// skipped, not temp-moved.
 ///
@@ -1057,6 +1151,59 @@ worktree-path = "{{ nonexistent_variable }}"
     );
 }
 
+/// Regression test: the human-readable summary count must include
+/// template-error branches, matching the `--format=json` skip set.
+///
+/// When a valid candidate and a template-error branch coexist, the JSON path
+/// folds template errors into `all_skipped` but the human summary previously
+/// counted only validation/executor skips, undercounting by the number of
+/// template errors. The template here fails only for branch `bad` (via a
+/// branch-gated undefined variable) while `good` expands cleanly, so relocate
+/// moves `good` and skips `bad`.
+#[rstest]
+fn test_relocate_template_error_counted_in_summary(repo: TestRepo) {
+    let parent = worktree_parent(&repo);
+
+    // `good`: a mismatched worktree that will relocate successfully.
+    let good_wrong = parent.join("good-wrong");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "good",
+        good_wrong.to_str().unwrap(),
+    ]);
+    // `bad`: a worktree whose template expansion fails.
+    let bad_path = parent.join("bad-loc");
+    repo.run_git(&["worktree", "add", "-b", "bad", bad_path.to_str().unwrap()]);
+
+    // Template errors only for branch `bad`; `good` renders the standard path.
+    let worktrunk_config = "worktree-path = \"{% if branch == 'bad' %}{{ undefined_var }}{% endif %}{{ repo_path }}/../{{ repo }}.{{ branch }}\"\n";
+    fs::write(repo.test_config_path(), worktrunk_config).unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["step", "relocate"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "relocate should succeed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Relocated 1 worktree, skipped 1 worktree"),
+        "summary must count the template-error branch as skipped; stderr was:\n{stderr}"
+    );
+
+    // `good` relocated to its expected sibling path; `bad` untouched.
+    assert!(
+        parent.join("repo.good").exists(),
+        "good should have relocated"
+    );
+    assert!(
+        bad_path.exists(),
+        "bad should be untouched (template error)"
+    );
+}
+
 /// Regression test: main worktree relocation must surface a failed
 /// `git checkout <default_branch>` rather than silently claiming success.
 ///
@@ -1335,7 +1482,7 @@ worktree-path = "../{{ undefined_var }}.{{ branch }}"
 #[cfg_attr(windows, ignore)]
 fn test_relocate_preserves_subdir(repo: TestRepo) {
     let parent = worktree_parent(&repo);
-    let (cd_path, exec_path, _guard) = directive_files();
+    let (cd_path, _guard) = directive_file();
 
     // Create a worktree at a non-standard location, with a subdirectory the
     // user is working in.
@@ -1351,7 +1498,7 @@ fn test_relocate_preserves_subdir(repo: TestRepo) {
     fs::create_dir_all(wrong_path.join(&subdir)).unwrap();
 
     let mut cmd = repo.wt_command();
-    configure_directive_files(&mut cmd, &cd_path, &exec_path);
+    configure_directive_file(&mut cmd, &cd_path);
     cmd.args(["step", "relocate"])
         .current_dir(wrong_path.join(&subdir));
 
@@ -1369,6 +1516,66 @@ fn test_relocate_preserves_subdir(repo: TestRepo) {
     assert!(
         cd_content.contains(&*expected_str),
         "CD file should contain relocated subdirectory path {expected_str}, got: {cd_content}"
+    );
+}
+
+/// A shell using the retired single-file protocol cannot follow a
+/// relocated current worktree. The relocation still succeeds, but it must
+/// explain that the wrapper is stale and how to repair it rather than silently
+/// leaving the shell in the renamed-away directory.
+///
+/// Ignored on Windows for the same reason as the adjacent subdirectory test:
+/// relocating a worktree while this process holds its cwd there fails with a
+/// sharing violation before the directive-warning path is reachable.
+#[rstest]
+#[cfg_attr(windows, ignore)]
+fn test_relocate_current_with_retired_wrapper_warns(repo: TestRepo) {
+    let parent = worktree_parent(&repo);
+    let wrong_path = parent.join("wrong-location");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "feature",
+        wrong_path.to_str().unwrap(),
+    ]);
+
+    let directive_dir = tempfile::TempDir::new().unwrap();
+    let retired_path = directive_dir.path().join("directive");
+    fs::write(&retired_path, "").unwrap();
+
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_DIRECTIVE_FILE", &retired_path)
+        .args(["step", "relocate"])
+        .current_dir(&wrong_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "relocation should still succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!wrong_path.exists(), "the old worktree path should be gone");
+    assert!(
+        parent.join("repo.feature").exists(),
+        "the worktree should reach its expected path"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shell wrapper is out of date"),
+        "the stale wrapper must not fail silently:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("wt config shell install"),
+        "the warning must include the repair action:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&retired_path).unwrap(),
+        "",
+        "wt must never write to the retired directive file"
     );
 }
 
@@ -1430,7 +1637,107 @@ fn step_relocate_rejects_prunable_worktree(mut repo: TestRepo) {
     assert!(!output.status.success(), "a prunable worktree should fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("directory is gone"),
+        stderr.contains("it is stale"),
         "expected a prunable-worktree error, got: {stderr}"
+    );
+}
+
+/// A swap moves one worktree through a temporary location. The shell of a user
+/// standing in either worktree must follow its branch to the new path, whichever
+/// of the two takes the temporary route.
+///
+/// Ignored on Windows for the same reason as `test_relocate_preserves_subdir`.
+#[rstest]
+#[case::in_alpha("alpha")]
+#[case::in_beta("beta")]
+#[cfg_attr(windows, ignore)]
+fn test_relocate_swap_moves_shell_with_its_branch(repo: TestRepo, #[case] standing_in: &str) {
+    let parent = worktree_parent(&repo);
+    let (cd_path, _guard) = directive_file();
+
+    // alpha sits at beta's expected path and beta at alpha's.
+    let path_for_beta = parent.join("repo.beta");
+    let path_for_alpha = parent.join("repo.alpha");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "alpha",
+        path_for_beta.to_str().unwrap(),
+    ]);
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "beta",
+        path_for_alpha.to_str().unwrap(),
+    ]);
+
+    let (cwd, expected) = if standing_in == "alpha" {
+        (&path_for_beta, &path_for_alpha)
+    } else {
+        (&path_for_alpha, &path_for_beta)
+    };
+
+    let mut cmd = repo.wt_command();
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["step", "relocate"]).current_dir(cwd);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt step relocate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let cd_content = fs::read_to_string(&cd_path).unwrap_or_default();
+    assert_eq!(
+        cd_content.trim(),
+        expected.to_string_lossy(),
+        "the shell should follow {standing_in} to its new path"
+    );
+}
+
+/// Relocating the main worktree's branch must not move a shell that stands in a
+/// different worktree nested inside the main one, as the
+/// `.worktrees/{{ branch | sanitize }}` layout produces.
+#[rstest]
+fn test_relocate_main_leaves_shell_in_nested_worktree(repo: TestRepo) {
+    let root = repo.root_path().to_path_buf();
+    let (cd_path, _guard) = directive_file();
+    fs::write(
+        repo.test_config_path(),
+        "worktree-path = \".worktrees/{{ branch | sanitize }}\"\n",
+    )
+    .unwrap();
+    fs::write(root.join(".git/info/exclude"), ".worktrees\n").unwrap();
+
+    // `other` is already at its expected nested path; the main worktree is on
+    // `feature`, so relocate moves `feature` out to `.worktrees/feature`.
+    let other_path = root.join(".worktrees").join("other");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "other",
+        other_path.to_str().unwrap(),
+    ]);
+    repo.run_git(&["checkout", "-b", "feature"]);
+
+    let mut cmd = repo.wt_command();
+    configure_directive_file(&mut cmd, &cd_path);
+    cmd.args(["step", "relocate"]).current_dir(&other_path);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt step relocate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join(".worktrees").join("feature").exists());
+
+    let cd_content = fs::read_to_string(&cd_path).unwrap_or_default();
+    assert_eq!(
+        cd_content.trim(),
+        "",
+        "the shell in `other` should stay put, not follow `feature`"
     );
 }

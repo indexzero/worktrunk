@@ -3,6 +3,7 @@
 //! Evaluates a template expression in the current worktree context and prints
 //! the result to stdout.
 
+use anyhow::Context;
 use color_print::cformat;
 use worktrunk::config::{UserConfig, VarScope, format_base_variables};
 use worktrunk::git::Repository;
@@ -11,6 +12,7 @@ use worktrunk::styling::{eprintln, format_with_gutter, info_message, println, ve
 
 use crate::cli::SwitchFormat;
 use crate::commands::command_executor::{CommandContext, build_hook_context};
+use crate::output::print_json;
 
 /// Template name reported in errors, the `-v` expansion view, and JSON output.
 const EVAL_NAME: &str = "eval";
@@ -28,7 +30,7 @@ const EVAL_NAME: &str = "eval";
 /// composes with either output format.
 pub fn step_eval(template: &str, format: SwitchFormat) -> anyhow::Result<()> {
     let repo = Repository::current()?;
-    let config = UserConfig::load()?;
+    let config = UserConfig::load().context("Failed to load config")?;
 
     let wt = repo.current_worktree();
     let branch = wt.branch()?;
@@ -63,7 +65,7 @@ pub fn step_eval(template: &str, format: SwitchFormat) -> anyhow::Result<()> {
                 "template": template,
                 "result": result,
             });
-            println!("{}", serde_json::to_string_pretty(&payload)?);
+            print_json(&payload)?;
         }
     }
     Ok(())

@@ -288,6 +288,27 @@ fn test_error_with_context_formatting(temp_home: TempDir) {
     });
 }
 
+/// A project config that doesn't parse stops `wt hook show` — showing a
+/// half-read hook list is worse than stopping — and the failure renders as one
+/// header over the parser's own output.
+///
+/// The typed parser diagnosis owns the title despite the loader's outer context.
+#[rstest]
+fn test_hook_show_invalid_project_config(repo: TestRepo, temp_home: TempDir) {
+    // Unclosed table header — the file cannot be parsed at all.
+    repo.write_project_config("[pre-merge\ntest = \"echo hi\"\n");
+
+    let settings = setup_snapshot_settings_with_home(&repo, &temp_home);
+    settings.bind(|| {
+        let mut cmd = wt_command();
+        repo.configure_wt_cmd(&mut cmd);
+        cmd.arg("hook").arg("show").current_dir(repo.root_path());
+        set_temp_home_env(&mut cmd, temp_home.path());
+
+        assert_cmd_snapshot!(cmd);
+    });
+}
+
 #[rstest]
 fn test_hook_show_project_config_no_hooks(repo: TestRepo, temp_home: TempDir) {
     // Create user config without hooks
@@ -321,7 +342,7 @@ url = "http://localhost:8080"
 }
 
 /// A hook type declared with an empty command list contributes no commands, so
-/// both sections read as `(none configured)` rather than a bare heading.
+/// both sections read as `No hooks configured` rather than a bare heading.
 #[rstest]
 fn test_hook_show_empty_command_lists(repo: TestRepo, temp_home: TempDir) {
     repo.write_test_config(

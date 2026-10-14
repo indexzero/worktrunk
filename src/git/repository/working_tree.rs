@@ -1,16 +1,115 @@
 //! WorkingTree - a borrowed handle for worktree-specific git operations.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use dashmap::mapref::entry::Entry;
+use path_slash::PathExt;
 
+use crate::path::canonicalize_with_parents;
 use crate::shell_exec::Cmd;
 use dunce::canonicalize;
 
 use super::{GitError, LineDiff, Repository};
-use crate::git::CommandError;
-use crate::git::parse_numstat_line;
+use crate::git::{CommandError, PlumbingDiff};
+
+const TEMP_INDEX_PREFIX: &str = "worktrunk-temp-index-";
+
+/// A squash safety backup: an immutable snapshot of the index and the ref
+/// whose reflog retains it. The backup commit's parent is the pre-squash HEAD.
+#[derive(Debug)]
+pub struct SafetyBackup {
+    pub sha: String,
+    pub ref_name: String,
+}
+
+#[derive(Debug)]
+struct NumstatEntry {
+    diff: LineDiff,
+    paths: NumstatPaths,
+}
+
+#[derive(Debug)]
+enum NumstatPaths {
+    Single(Vec<u8>),
+    Rename { old: Vec<u8>, new: Vec<u8> },
+}
+
+impl NumstatEntry {
+    fn paths(&self) -> impl Iterator<Item = &[u8]> {
+        let (first, second) = match &self.paths {
+            NumstatPaths::Single(path) => (path.as_slice(), None),
+            NumstatPaths::Rename { old, new } => (old.as_slice(), Some(new.as_slice())),
+        };
+        [Some(first), second].into_iter().flatten()
+    }
+}
+
+fn take_numstat_field<'a>(input: &mut &'a [u8], separator: u8) -> anyhow::Result<&'a [u8]> {
+    let Some(index) = input.iter().position(|&byte| byte == separator) else {
+        bail!("Malformed git diff --numstat -z output")
+    };
+    let (field, remainder) = input.split_at(index);
+    *input = &remainder[1..];
+    Ok(field)
+}
+
+fn parse_numstat_count(field: &[u8]) -> anyhow::Result<usize> {
+    if field == b"-" {
+        return Ok(0);
+    }
+    std::str::from_utf8(field)
+        .context("Malformed git diff --numstat count")?
+        .parse()
+        .context("Malformed git diff --numstat count")
+}
+
+fn parse_numstat_entries(mut output: &[u8]) -> anyhow::Result<Vec<NumstatEntry>> {
+    let mut entries = Vec::new();
+    while !output.is_empty() {
+        let added = parse_numstat_count(take_numstat_field(&mut output, b'\t')?)?;
+        let deleted = parse_numstat_count(take_numstat_field(&mut output, b'\t')?)?;
+        let first_path = take_numstat_field(&mut output, 0)?;
+        let paths = if first_path.is_empty() {
+            NumstatPaths::Rename {
+                old: take_numstat_field(&mut output, 0)?.to_vec(),
+                new: take_numstat_field(&mut output, 0)?.to_vec(),
+            }
+        } else {
+            NumstatPaths::Single(first_path.to_vec())
+        };
+        entries.push(NumstatEntry {
+            diff: LineDiff { added, deleted },
+            paths,
+        });
+    }
+    Ok(entries)
+}
+
+/// Quote a path component for Git's `glob` pathspec magic. The caller adds
+/// the one intentional wildcard after the escaped literal.
+fn escape_pathspec_glob_literal(path: &str) -> String {
+    path.chars().fold(String::new(), |mut escaped, ch| {
+        if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+        escaped
+    })
+}
+
+/// Exclude one Worktrunk-owned temporary directory inside a worktree.
+fn temporary_path_exclusion(worktree_root: &Path, temporary_path: &Path) -> Option<String> {
+    let temporary_path = canonicalize_with_parents(temporary_path);
+    let worktree_root = canonicalize_with_parents(worktree_root);
+    temporary_path
+        .strip_prefix(worktree_root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| format!(":(top,exclude,literal){}", relative.to_slash_lossy()))
+}
 
 /// Parse `git submodule status` output and detect whether any submodule is initialized.
 ///
@@ -71,6 +170,82 @@ fn sequencer_operation(git_dir: &Path) -> Option<InProgressOperation> {
     }
 }
 
+/// The working tree a `gitdir` file records, read from the directory holding it.
+///
+/// The file holds the path of that working tree's `.git`, absolute or relative to
+/// the directory it sits in — git writes the relative form under
+/// `worktree.useRelativePaths` and resolves either, so both are ordinary. Its
+/// parent is the working tree, which is the half of git's `validate_worktree`
+/// that reads from the registration side.
+///
+/// Two directories hold one: a `<common>/worktrees/<id>` registration, and the
+/// common dir itself when `git worktree repair` has written the main worktree's
+/// backlink there (`Repository::separate_git_dir_work_tree`). The format is the
+/// same, so one reader answers for both.
+///
+/// Resolved through [`canonicalize_with_parents`], which normalizes the `..`
+/// chain a relative entry leaves behind even though the directory it names may
+/// no longer exist — the case the caller is usually asking about, and the path it
+/// then shows the user. Normalizing rewrites spellings only, so it cannot make
+/// two directories compare equal.
+pub(super) fn registration_worktree_path(registration: &Path) -> std::io::Result<PathBuf> {
+    let content = std::fs::read(registration.join("gitdir"))?;
+    let recorded = super::super::git_path_from_file(&content)?;
+    let mut absolute = if recorded.is_relative() {
+        registration.join(recorded)
+    } else {
+        recorded
+    };
+    // Git accepts a checkout path directly or its `.git` entry.
+    if absolute.file_name() == Some(std::ffi::OsStr::new(".git")) {
+        absolute.pop();
+    }
+    Ok(canonicalize_with_parents(&absolute))
+}
+
+/// The git operation the worktree whose git dir is `git_dir` is partway
+/// through, if any.
+///
+/// Reads the state files git writes under that git dir, in the order
+/// [`git status`](https://git-scm.com/docs/git-status) consults them, so the
+/// answer tracks what git itself calls "in progress". Takes the git dir rather
+/// than a worktree because a stale worktree's registration is still asked,
+/// after its `.git` file — the usual route to that dir — has gone.
+pub(super) fn operation_in_progress_at(git_dir: &Path) -> Option<InProgressOperation> {
+    if git_dir.join("MERGE_HEAD").exists() {
+        return Some(InProgressOperation::Merge);
+    }
+
+    // `rebase-merge` (interactive/merge backend) and `rebase-apply` (am
+    // backend, also used by `git am`) are mutually exclusive; either one
+    // means commits are mid-replay.
+    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        return Some(InProgressOperation::Rebase);
+    }
+
+    if git_dir.join("CHERRY_PICK_HEAD").exists() {
+        return Some(InProgressOperation::CherryPick);
+    }
+
+    if git_dir.join("REVERT_HEAD").exists() {
+        return Some(InProgressOperation::Revert);
+    }
+
+    // The two `_HEAD` files above exist only while a single pick is
+    // stopped: resolving one with `git commit` instead of `--continue`
+    // removes it and leaves the rest of the sequence queued, which git
+    // still reports as in progress.
+    if let Some(operation) = sequencer_operation(git_dir) {
+        return Some(operation);
+    }
+
+    if git_dir.join("BISECT_LOG").exists() {
+        return Some(InProgressOperation::Bisect);
+    }
+
+    None
+}
+
 /// Typed snapshot returned by [`WorkingTree::prewarm_info`].
 ///
 /// Mirrors what the batched `git rev-parse` actually resolved so callers can
@@ -85,7 +260,8 @@ fn sequencer_operation(git_dir: &Path) -> Option<InProgressOperation> {
 ///
 /// When `is_inside` is false every other field is `None` — nothing else ran.
 /// When `is_inside` is true, `root` lands unconditionally and `git_dir` lands
-/// unless canonicalization failed. `current_branch` is only populated when
+/// unless canonicalization failed or the batch framing was ambiguous.
+/// `current_branch` is only populated when
 /// the whole batch succeeded; on unborn HEAD it stays `None` and the
 /// per-accessor fallback paths handle the symbolic-ref lookup.
 #[derive(Debug, Clone, Default)]
@@ -96,11 +272,11 @@ pub struct WorkingTreeGitInfo {
     /// Canonicalized top-level directory. Always `Some` when `is_inside`.
     pub root: Option<PathBuf>,
     /// Canonicalized git directory (may differ from common dir in linked
-    /// worktrees). `Some` when `is_inside` and canonicalization succeeded.
+    /// worktrees). `None` when canonicalization or batch framing failed.
     pub git_dir: Option<PathBuf>,
     /// Current branch: outer `Some(Some(name))` on a branch, `Some(None)`
     /// detached. `None` when HEAD was unresolvable (unborn branch) or outside
-    /// a work tree.
+    /// a work tree, or the batch framing was ambiguous.
     pub current_branch: Option<Option<String>>,
 }
 
@@ -167,30 +343,51 @@ impl<'a> WorkingTree<'a> {
 
     /// Run a git command in this worktree and return stdout.
     pub fn run_command(&self, args: &[&str]) -> anyhow::Result<String> {
+        Ok(String::from_utf8_lossy(&self.run_command_bytes(args)?).into_owned())
+    }
+
+    /// Run a git command in this worktree and return stdout without decoding paths.
+    pub fn run_command_bytes(&self, args: &[&str]) -> anyhow::Result<Vec<u8>> {
         let output = self.run_command_output(args)?;
 
         if !output.status.success() {
             return Err(CommandError::from_failed_output("git", args, &output).into());
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        Ok(stdout)
+        Ok(output.stdout)
     }
 
     /// Run a git command in this worktree and return the raw Output.
     ///
     /// Use this when you need to check exit codes directly (e.g., for commands
     /// where non-zero exit is not an error condition).
+    ///
+    /// Scrubs the inherited git-discovery vars
+    /// ([`INHERITED_GIT_PATH_VARS`](crate::shell_exec::INHERITED_GIT_PATH_VARS)).
+    /// This call relocates git into `self.path`; those vars are pinned to
+    /// the *invoking* worktree when `wt` runs with an inherited `GIT_DIR`
+    /// (a `!wt` git alias from a linked worktree is one source, and git
+    /// exports discovery vars to the hooks it spawns), so forwarding them
+    /// makes `status`, `rev-parse --git-dir`, and `read-tree` operate on the
+    /// wrong tree. A redirected repository's own `GIT_OBJECT_DIRECTORY` is
+    /// unaffected: `with_object_store_env` sets it after the scrub, and `Cmd`
+    /// applies env mutations in call order. Repo-level
+    /// [`Repository::run_command`] keeps the inherited context on purpose.
     pub fn run_command_output(&self, args: &[&str]) -> anyhow::Result<std::process::Output> {
-        self.repo
-            .with_object_store_env(
-                Cmd::new("git")
-                    .args(args.iter().copied())
-                    .current_dir(&self.path)
-                    .context(path_to_logging_context(&self.path)),
-            )
+        self.git_command(args)
             .run()
             .with_context(|| format!("Failed to execute: git {}", args.join(" ")))
+    }
+
+    /// The `git` command [`Self::run_command_output`] runs, unexecuted.
+    fn git_command(&self, args: &[&str]) -> Cmd {
+        self.repo.with_object_store_env(
+            Cmd::new("git")
+                .args(args.iter().copied())
+                .current_dir(&self.path)
+                .context(path_to_logging_context(&self.path))
+                .scrub_git_discovery_env(),
+        )
     }
 
     // =========================================================================
@@ -210,7 +407,7 @@ impl<'a> WorkingTree<'a> {
     ///
     /// `--show-toplevel` and `--git-dir` succeed even on unborn branches —
     /// rev-parse prints them before HEAD errors — so `root`/`git_dir` are
-    /// cached whenever we're inside a work tree. `current_branch` is only
+    /// cached unless a newline makes the batch framing ambiguous. `current_branch` is only
     /// populated when the whole batch succeeded, so [`Self::branch`]'s
     /// `symbolic-ref` fallback still handles genuine unborn HEADs. On unborn
     /// the symbolic-full-name line lands as a fallback literal "HEAD", which
@@ -252,60 +449,60 @@ impl<'a> WorkingTree<'a> {
             "--symbolic-full-name",
             "HEAD",
         ])?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut lines = stdout.lines();
-
-        let is_inside = lines.next().is_some_and(|s| s.trim() == "true");
+        let is_inside = output.stdout.starts_with(b"true\n");
         if !is_inside {
             return Ok(WorkingTreeGitInfo::default());
         }
-
-        // `root` and `git_dir` are safe to cache whenever their lines landed,
-        // because any failure in the batch is from HEAD — which comes after.
-        // `--show-toplevel` always emits a line when `is_inside=true`; if
-        // canonicalize of that line fails (e.g., pathological filesystem
-        // state), fall back to `self.path` which is already canonicalized by
-        // `worktree_at` and guaranteed inside the work tree.
-        let raw_toplevel = lines.next().unwrap_or("").trim();
-        let canonical = canonicalize(PathBuf::from(raw_toplevel)).unwrap_or(self.path.clone());
-        super::WORKTREE_ROOTS
-            .entry(self.path.clone())
-            .or_insert_with(|| canonical.clone());
-        let root = Some(canonical);
-
-        let git_dir = lines.next().and_then(|raw| {
-            let path = PathBuf::from(raw.trim());
+        let Some(fields) = super::rev_parse_fields(&output, 4) else {
+            return Ok(WorkingTreeGitInfo {
+                is_inside,
+                root: Some(self.root()?),
+                ..WorkingTreeGitInfo::default()
+            });
+        };
+        let mut fields = fields.into_iter().skip(1);
+        let root = if let Some(root) = fields
+            .next()
+            .and_then(|raw| canonicalize(super::git_path_from_bytes(raw).ok()?).ok())
+        {
+            super::WORKTREE_ROOTS
+                .entry(self.path.clone())
+                .or_insert_with(|| root.clone());
+            root
+        } else {
+            self.root()?
+        };
+        let git_dir = fields.next().and_then(|raw| {
+            let path = super::git_path_from_bytes(raw).ok()?;
             let absolute = if path.is_relative() {
-                self.path.join(&path)
+                self.path.join(path)
             } else {
                 path
             };
-            let resolved = canonicalize(&absolute).ok()?;
+            let resolved = canonicalize(absolute).ok()?;
             super::GIT_DIRS
                 .entry(self.path.clone())
                 .or_insert_with(|| resolved.clone());
             Some(resolved)
         });
-
-        // The `--symbolic-full-name HEAD` line is only trustworthy when the
-        // batch succeeded. On unborn HEAD the line lands but is the literal
-        // "HEAD" fallback — we can't tell that from detached HEAD without the
-        // exit status.
         let current_branch = if output.status.success() {
-            lines.next().map(|raw| {
-                let branch = raw.trim().strip_prefix("refs/heads/").map(str::to_owned);
-                super::CURRENT_BRANCHES
-                    .entry(self.path.clone())
-                    .or_insert_with(|| branch.clone());
-                branch
-            })
+            fields
+                .next()
+                .and_then(|raw| std::str::from_utf8(raw).ok())
+                .map(|raw| {
+                    let branch = raw.strip_prefix("refs/heads/").map(str::to_owned);
+                    super::CURRENT_BRANCHES
+                        .entry(self.path.clone())
+                        .or_insert_with(|| branch.clone());
+                    branch
+                })
         } else {
             None
         };
 
         Ok(WorkingTreeGitInfo {
             is_inside: true,
-            root,
+            root: Some(root),
             git_dir,
             current_branch,
         })
@@ -354,21 +551,49 @@ impl<'a> WorkingTree<'a> {
             .filter(|s| !s.is_empty()))
     }
 
+    /// The tree-ish the index is compared against for staged changes: HEAD,
+    /// or the empty tree on an unborn branch. Plumbing (`diff-index --cached`)
+    /// needs this spelled out; porcelain `git diff --cached` picks it itself.
+    pub fn index_base(&self) -> anyhow::Result<String> {
+        self.repo.index_base_for(self.head_sha()?)
+    }
+
     /// Return cached `git status --porcelain` output for this worktree.
     ///
     /// Keyed by worktree path in the shared `RepoCache`, so parallel tasks that
     /// each want porcelain (e.g., working-tree diff + conflict detection during
     /// `wt list`) share a single subprocess. Uses `--no-optional-locks` to avoid
     /// index-lock contention with the `git write-tree` run by
-    /// `WorkingTreeConflictsTask` in parallel.
+    /// the working-tree conflict task in parallel. Explicitly requests normal
+    /// untracked-file reporting so `status.showUntrackedFiles=no` cannot make
+    /// an untracked-only worktree look clean to callers.
     pub fn status_porcelain_cached(&self) -> anyhow::Result<String> {
         match self.repo.cache.status_porcelain.entry(self.path.clone()) {
             Entry::Occupied(e) => Ok(e.get().clone()),
             Entry::Vacant(e) => {
-                let stdout = self.run_command(&["--no-optional-locks", "status", "--porcelain"])?;
+                let exclusions = self.observation_path_exclusions()?;
+                let mut args = vec![
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                ];
+                args.extend(exclusions.iter().map(String::as_str));
+                let stdout = self.run_command(&args)?;
                 Ok(e.insert(stdout).clone())
             }
         }
+    }
+
+    fn observation_path_exclusions(&self) -> anyhow::Result<Vec<String>> {
+        let worktree_root = self.root()?;
+        Ok(self
+            .repo
+            .cache
+            .observation_object_directories
+            .iter()
+            .filter_map(|entry| temporary_path_exclusion(&worktree_root, entry.key()))
+            .collect())
     }
 
     /// Check if the working tree has uncommitted changes.
@@ -379,8 +604,17 @@ impl<'a> WorkingTree<'a> {
     /// 2. On large repos (70k+ files), this adds noticeable latency to every clean check
     /// 3. Users who use skip-worktree are power users who understand the implications
     /// 4. A warning wouldn't prevent data loss anyway — it's informational only
+    ///
+    /// Untracked files and dirty submodules are always included, regardless of
+    /// the user's `status.showUntrackedFiles` or `submodule.<name>.ignore`
+    /// display preferences.
     pub fn is_dirty(&self) -> anyhow::Result<bool> {
-        let stdout = self.run_command(&["status", "--porcelain"])?;
+        let stdout = self.run_command(&[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ])?;
         Ok(!stdout.trim().is_empty())
     }
 
@@ -391,7 +625,12 @@ impl<'a> WorkingTree<'a> {
     /// [`GitError::UncommittedChanges`] in [`Self::ensure_clean`]. The same
     /// caveats as [`Self::is_dirty`] apply (skip-worktree files are invisible).
     pub fn dirty_files(&self) -> anyhow::Result<Vec<String>> {
-        let stdout = self.run_command(&["status", "--porcelain"])?;
+        let stdout = self.run_command(&[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ])?;
         Ok(stdout.lines().map(str::to_owned).collect())
     }
 
@@ -411,9 +650,9 @@ impl<'a> WorkingTree<'a> {
         match super::WORKTREE_ROOTS.entry(self.path.clone()) {
             Entry::Occupied(e) => Ok(e.get().clone()),
             Entry::Vacant(e) => match self
-                .run_command(&["rev-parse", "--show-toplevel"])
+                .run_command_bytes(&["rev-parse", "--show-toplevel"])
                 .ok()
-                .map(|s| PathBuf::from(s.trim()))
+                .and_then(|bytes| super::super::git_path_from_output(&bytes).ok())
                 .and_then(|p| canonicalize(&p).ok())
             {
                 Some(root) => Ok(e.insert(root).clone()),
@@ -431,63 +670,93 @@ impl<'a> WorkingTree<'a> {
         match super::GIT_DIRS.entry(self.path.clone()) {
             Entry::Occupied(e) => Ok(e.get().clone()),
             Entry::Vacant(e) => {
-                let stdout = self.run_command(&["rev-parse", "--git-dir"])?;
-                let path = PathBuf::from(stdout.trim());
-
-                // Always canonicalize to resolve symlinks (e.g., /var -> /private/var on macOS)
-                let absolute_path = if path.is_relative() {
-                    self.path.join(&path)
-                } else {
-                    path
-                };
-                let resolved =
-                    canonicalize(&absolute_path).context("Failed to resolve git directory")?;
-
-                Ok(e.insert(resolved).clone())
+                let stdout = self.run_command_bytes(&["rev-parse", "--git-dir"])?;
+                Ok(e.insert(self.resolve_git_dir(&stdout)?).clone())
             }
         }
     }
 
-    /// The git operation this worktree is partway through, if any.
+    /// [`Self::git_dir`] for several worktrees, forking the uncached
+    /// `git rev-parse --git-dir` lookups concurrently through
+    /// [`Cmd::run_concurrently`]. Results are in input order.
+    pub fn git_dirs(worktrees: &[WorkingTree<'_>]) -> Vec<anyhow::Result<PathBuf>> {
+        const ARGS: [&str; 2] = ["rev-parse", "--git-dir"];
+        let cached: Vec<Option<PathBuf>> = worktrees
+            .iter()
+            .map(|wt| super::GIT_DIRS.get(&wt.path).map(|e| e.value().clone()))
+            .collect();
+        let cmds: Vec<Cmd> = worktrees
+            .iter()
+            .zip(&cached)
+            .filter(|(_, cached)| cached.is_none())
+            .map(|(wt, _)| wt.git_command(&ARGS))
+            .collect();
+        let mut fetched = Cmd::run_concurrently(&cmds).into_iter();
+        worktrees
+            .iter()
+            .zip(cached)
+            .map(|(wt, cached)| {
+                if let Some(git_dir) = cached {
+                    return Ok(git_dir);
+                }
+                let output = fetched
+                    .next()
+                    .context("run_concurrently returned fewer results than commands")??;
+                if !output.status.success() {
+                    return Err(CommandError::from_failed_output("git", &ARGS, &output).into());
+                }
+                let git_dir = wt.resolve_git_dir(&output.stdout)?;
+                Ok(super::GIT_DIRS
+                    .entry(wt.path.clone())
+                    .or_insert(git_dir)
+                    .clone())
+            })
+            .collect()
+    }
+
+    /// Canonicalize `git rev-parse --git-dir` output run in this worktree.
+    fn resolve_git_dir(&self, stdout: &[u8]) -> anyhow::Result<PathBuf> {
+        let path = super::super::git_path_from_output(stdout)?;
+
+        // Always canonicalize to resolve symlinks (e.g., /var -> /private/var on macOS)
+        let absolute_path = if path.is_relative() {
+            self.path.join(&path)
+        } else {
+            path
+        };
+        canonicalize(&absolute_path).context("Failed to resolve git directory")
+    }
+
+    /// Reason recorded by `git worktree lock`, if this worktree is locked.
     ///
-    /// Reads the state files git writes under the worktree's git dir, in the
-    /// order [`git status`](https://git-scm.com/docs/git-status) consults them,
-    /// so the answer tracks what git itself calls "in progress".
+    /// Reads the `locked` file in the worktree's git dir — the same file git
+    /// writes and `git worktree list --porcelain` reports. Goes to the file
+    /// rather than `list_worktrees()`, whose `RepoCache` entry planning may
+    /// already have warmed with a stale lock state.
+    ///
+    /// `Ok(None)` — not locked. `Ok(Some(None))` — locked with no reason.
+    /// `Ok(Some(Some(reason)))` — locked with a reason.
+    pub fn lock_reason(&self) -> anyhow::Result<Option<Option<String>>> {
+        let lock_path = self.git_dir()?.join("locked");
+        match std::fs::read_to_string(&lock_path) {
+            Ok(contents) => {
+                let trimmed = contents.trim();
+                Ok(Some(if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("Failed to read worktree lock"),
+        }
+    }
+
+    /// The git operation this worktree is partway through, if any, read from
+    /// the state files git writes under its git dir in the order
+    /// [`git status`](https://git-scm.com/docs/git-status) consults them.
     pub fn operation_in_progress(&self) -> anyhow::Result<Option<InProgressOperation>> {
-        let git_dir = self.git_dir()?;
-
-        if git_dir.join("MERGE_HEAD").exists() {
-            return Ok(Some(InProgressOperation::Merge));
-        }
-
-        // `rebase-merge` (interactive/merge backend) and `rebase-apply` (am
-        // backend, also used by `git am`) are mutually exclusive; either one
-        // means commits are mid-replay.
-        if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
-            return Ok(Some(InProgressOperation::Rebase));
-        }
-
-        if git_dir.join("CHERRY_PICK_HEAD").exists() {
-            return Ok(Some(InProgressOperation::CherryPick));
-        }
-
-        if git_dir.join("REVERT_HEAD").exists() {
-            return Ok(Some(InProgressOperation::Revert));
-        }
-
-        // The two `_HEAD` files above exist only while a single pick is
-        // stopped: resolving one with `git commit` instead of `--continue`
-        // removes it and leaves the rest of the sequence queued, which git
-        // still reports as in progress.
-        if let Some(operation) = sequencer_operation(&git_dir) {
-            return Ok(Some(operation));
-        }
-
-        if git_dir.join("BISECT_LOG").exists() {
-            return Ok(Some(InProgressOperation::Bisect));
-        }
-
-        Ok(None)
+        Ok(operation_in_progress_at(&self.git_dir()?))
     }
 
     /// Paths the index still records as unmerged.
@@ -500,7 +769,7 @@ impl<'a> WorkingTree<'a> {
     /// all.
     pub fn unmerged_paths(&self) -> anyhow::Result<Vec<String>> {
         let output = self
-            .run_command(&["diff", "--name-only", "--diff-filter=U", "-z"])
+            .run_command(&PlumbingDiff::Files.args(&["--name-only", "--diff-filter=U", "-z"]))
             .context("Failed to list unmerged paths")?;
         Ok(output
             .split('\0')
@@ -597,6 +866,81 @@ impl<'a> WorkingTree<'a> {
         Ok(git_dir != common_dir)
     }
 
+    /// Refuse when the directory at this worktree's path does not hold this
+    /// worktree.
+    ///
+    /// Git makes this check itself before `git worktree remove` and refuses
+    /// with `validation failed … does not point back to
+    /// '.git/worktrees/<id>'`, `--force` included. Worktrunk's removal fast
+    /// path renames the directory into trash rather than asking git to (see
+    /// [`stage_worktree_removal`](crate::git::remove::stage_worktree_removal)),
+    /// so git's validation never runs and the guarantee has to be made here.
+    /// Removing the wrong directory is unrecoverable, whether it holds a full
+    /// clone that came to sit at a stale registration's path (uncommitted work
+    /// and, for a repo never pushed, the only copy of its objects) or a sibling
+    /// worktree of this repository, moved onto the path after this one was
+    /// deleted.
+    ///
+    /// So the test is git's own: the directory's `.git` must name *this
+    /// registration*, and that registration's `gitdir` file must name this
+    /// directory back (`registration_worktree_path`). Repository-level
+    /// ownership is the weaker half: a sibling worktree's git dir sits under
+    /// `<common>/worktrees/` too, so asking only which repository the occupant
+    /// answers to accepts one moved onto this path. The main worktree is the
+    /// same test where there is no registration to point back at: its git dir
+    /// *is* the common dir, and that equality is the whole of it.
+    ///
+    /// Resolution reads the `.git` entry in this directory on every call
+    /// (`Repository::git_dir_at`) instead of going through the `GIT_DIRS`-cached
+    /// [`git_dir`](Self::git_dir), which would answer from whenever an earlier
+    /// caller asked. That is what makes the second call worth making: removal
+    /// gates at planning and again at the rename, with the approval prompt and
+    /// the `pre-remove` hook running in between.
+    ///
+    /// Deliberately not a `prunable` check — git leaves the registration alone
+    /// precisely because the occupant's own `.git` resolves, so
+    /// [`Repository::usable_worktree_for_branch`] sees nothing wrong here. The
+    /// two cover different halves of "the directory no longer holds this
+    /// worktree": prunable is the half git notices, this is the half it does
+    /// not.
+    ///
+    /// Returns the git dir that answers for this worktree: the common dir for
+    /// the main worktree, its registration under `<common>/worktrees/`
+    /// otherwise.
+    pub fn ensure_holds_this_worktree(&self) -> anyhow::Result<PathBuf> {
+        let common_dir = self.repo.git_common_dir();
+        // A git dir that can't be resolved at all is the strongest form of "not
+        // this worktree": nothing there answers for it. Treating that as a
+        // refusal keeps the failure closed.
+        let git_dir = Repository::git_dir_at(&self.path);
+        if git_dir.as_deref() == Some(common_dir) {
+            return Ok(common_dir.to_path_buf());
+        }
+
+        // Where the occupant's own registration says it lives. `None` when there
+        // is no registration of ours to ask — the occupant answers to a
+        // different repository, or its registration here has lost its `gitdir`
+        // file.
+        let registrations = common_dir.join("worktrees");
+        let registration = git_dir.filter(|dir| dir.parent() == Some(registrations.as_path()));
+        let occupant_registered_at = registration
+            .as_deref()
+            .and_then(|entry| registration_worktree_path(entry).ok());
+        if let Some(registration) = registration
+            && occupant_registered_at
+                .as_deref()
+                .is_some_and(|recorded| crate::path::paths_match(recorded, &self.path))
+        {
+            return Ok(registration);
+        }
+
+        Err(GitError::WorktreePathNotOurs {
+            path: self.path.clone(),
+            occupant_registered_at,
+        }
+        .into())
+    }
+
     /// Ensure this worktree is clean (no uncommitted changes).
     ///
     /// Returns an error if there are uncommitted changes.
@@ -625,83 +969,73 @@ impl<'a> WorkingTree<'a> {
 
     /// Get line diff statistics for working tree changes (unstaged + staged).
     pub fn working_tree_diff_stats(&self) -> anyhow::Result<LineDiff> {
-        let stdout = self.run_command(&["diff", "--shortstat", "HEAD"])?;
+        let stdout = self.run_command(&PlumbingDiff::Index.args(&[
+            "--shortstat",
+            "--find-renames",
+            "HEAD",
+            "--",
+        ]))?;
         Ok(LineDiff::from_shortstat(&stdout))
     }
 
-    /// Working-tree diff stats vs HEAD that also count untracked files,
-    /// matching the diff `wt step diff` shows.
+    /// Working-tree diff stats vs HEAD that also count untracked files.
+    /// The scope matches `wt step diff`. Plumbing ignores the user's diff
+    /// configuration, and explicit rename detection pairs moves.
     ///
-    /// Tracked changes come from the normal `git diff HEAD` path. Untracked
-    /// files are staged separately in a [`TempIndex`] and diffed by path, so
-    /// the real index is untouched and Git does not need to rediscover tracked
-    /// modifications from a copied index.
+    /// Untracked paths enter a temporary index as intent-to-add entries, which
+    /// lets one diff pair them with tracked deletions as renames without writing
+    /// their contents as blobs. The real-index diff fills any tracked entry the
+    /// copied index misses because of racy stat data.
     pub fn working_tree_diff_stats_with_untracked(&self) -> anyhow::Result<LineDiff> {
-        let mut stats = self.working_tree_diff_stats()?;
-        let untracked = self.untracked_diff_stats()?;
-        stats.added += untracked.added;
-        stats.deleted += untracked.deleted;
-        Ok(stats)
-    }
-
-    fn untracked_diff_stats(&self) -> anyhow::Result<LineDiff> {
-        let output =
-            self.run_command_output(&["ls-files", "--others", "--exclude-standard", "-z"])?;
-        if !output.status.success() {
-            return Err(CommandError::from_failed_output(
-                "git",
-                &["ls-files", "--others", "--exclude-standard", "-z"],
-                &output,
-            )
-            .into());
+        let exclusions = self.observation_path_exclusions()?;
+        let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
+        args.extend(exclusions.iter().map(String::as_str));
+        let untracked_output = self.run_command_output(&args)?;
+        if !untracked_output.status.success() {
+            return Err(CommandError::from_failed_output("git", &args, &untracked_output).into());
+        }
+        if untracked_output.stdout.is_empty() {
+            return self.working_tree_diff_stats();
         }
 
-        let paths: Vec<String> = output
-            .stdout
-            .split(|&b| b == 0)
-            .filter(|path| !path.is_empty())
-            .map(|path| String::from_utf8_lossy(path).into_owned())
-            .collect();
-        if paths.is_empty() {
-            return Ok(LineDiff::default());
+        let numstat_args = PlumbingDiff::Index.args(&[
+            "--numstat",
+            "-z",
+            "--find-renames",
+            "--end-of-options",
+            "HEAD",
+            "--",
+        ]);
+        let tracked_output = self.run_command_output(&numstat_args)?;
+        if !tracked_output.status.success() {
+            return Err(
+                CommandError::from_failed_output("git", &numstat_args, &tracked_output).into(),
+            );
         }
+        let tracked_entries = parse_numstat_entries(&tracked_output.stdout)?;
 
         let idx = self.temp_index()?;
-        let add_output = idx
-            .git(["add", "--pathspec-from-file=-", "--pathspec-file-nul"])
-            .stdin_bytes(output.stdout)
-            .run()
-            .context("Failed to stage untracked files")?;
-        if !add_output.status.success() {
-            return Err(CommandError::from_failed_output(
-                "git",
-                &["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
-                &add_output,
-            )
-            .into());
-        }
-
-        let mut args = vec![
-            "diff".to_string(),
-            "--cached".to_string(),
-            "--numstat".to_string(),
-            "HEAD".to_string(),
-            "--".to_string(),
-        ];
-        args.extend(paths);
-        let output = idx
-            .git(&args)
-            .run()
-            .context("Failed to compute untracked diff stats")?;
-        if !output.status.success() {
-            return Err(CommandError::from_failed_output("git", &args, &output).into());
-        }
+        idx.register_untracked_paths(untracked_output.stdout)?;
+        let combined_output = idx.run_command_output(numstat_args)?;
+        let combined_entries = parse_numstat_entries(&combined_output.stdout)?;
 
         let mut stats = LineDiff::default();
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if let Some((added, deleted)) = parse_numstat_line(line) {
-                stats.added += added;
-                stats.deleted += deleted;
+        for entry in &combined_entries {
+            stats.added += entry.diff.added;
+            stats.deleted += entry.diff.deleted;
+        }
+
+        // A copied index can trust stale stat data that the real index treats
+        // as racily clean. The combined diff owns rename pairing, while the
+        // real-index diff supplies tracked records absent from it.
+        let covered_paths: HashSet<&[u8]> = combined_entries
+            .iter()
+            .flat_map(NumstatEntry::paths)
+            .collect();
+        for entry in tracked_entries {
+            if entry.paths().all(|path| !covered_paths.contains(path)) {
+                stats.added += entry.diff.added;
+                stats.deleted += entry.diff.deleted;
             }
         }
         Ok(stats)
@@ -716,23 +1050,34 @@ impl<'a> WorkingTree<'a> {
         let real_index = git_dir.join("index");
         let log_ctx = path_to_logging_context(self.path());
 
-        // A missing `<gitdir>/index` is semantically an empty index (nothing
-        // staged), so mirror git's own behaviour. Close the
-        // freshly-created 0-byte tempfile's handle (Windows leaves the name
-        // delete-pending if it's still open) and remove the file; if a real
-        // index exists, copy it back, otherwise leave the path empty and
-        // let the first `git` call against `GIT_INDEX_FILE` create a fresh
-        // valid index there.
-        let temp = tempfile::NamedTempFile::new()
-            .context("Failed to create temporary index")?
-            .into_temp_path();
-        std::fs::remove_file(&temp).context("Failed to clear temporary index")?;
-        if real_index.exists() {
-            std::fs::copy(&real_index, &temp).context("Failed to copy index file")?;
+        // Keep the exclusively-created file open while copying a real index;
+        // removing it first would expose its random name to a symlink race in
+        // a shared system temp directory. A missing `<gitdir>/index` is
+        // semantically an empty index (nothing staged), so only that case
+        // closes and removes the 0-byte file before Git creates a valid index.
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(TEMP_INDEX_PREFIX);
+        let mut temp_file = match builder.tempfile() {
+            Ok(file) => file,
+            Err(temp_error) => builder.tempfile_in(&git_dir).context(format!(
+                "Failed to create temporary index in the system temp directory or Git directory; system temp error: {temp_error}"
+            ))?,
+        };
+        let mut real_index_file = match std::fs::File::open(&real_index) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("Failed to open index file"),
+        };
+        if let Some(real_index_file) = &mut real_index_file {
+            std::io::copy(real_index_file, temp_file.as_file_mut())
+                .context("Failed to copy index file")?;
         }
-        // Validate UTF-8 once so `TempIndex::path` is infallible.
-        temp.to_str()
-            .context("Temporary index path is not valid UTF-8")?;
+        let temp = temp_file.into_temp_path();
+        if real_index_file.is_none() {
+            // `into_temp_path` closes the handle first, which matters on
+            // Windows: deleting a still-open file leaves the name pending.
+            std::fs::remove_file(&temp).context("Failed to clear temporary index")?;
+        }
 
         Ok(TempIndex {
             temp,
@@ -741,7 +1086,28 @@ impl<'a> WorkingTree<'a> {
             object_store_environment: self.repo.object_store_environment().map(
                 |(directory, alternates)| (directory.to_path_buf(), alternates.to_os_string()),
             ),
+            observation_path_exclusions: self.observation_path_exclusions()?,
         })
+    }
+
+    /// Write a tree containing the index plus tracked working-tree changes.
+    ///
+    /// A temporary index keeps the user's staging state unchanged. The conflict
+    /// probe is advisory and leaves untracked paths out of its synthetic tree.
+    pub fn write_tracked_worktree_tree(&self) -> anyhow::Result<String> {
+        let index = self.temp_index()?;
+        // With no pathspec, `add -u` also accepts an empty index (a staged
+        // deletion of every tracked file, or a missing real index). The command
+        // still covers the whole worktree because TempIndex runs at its root.
+        index.run_command(["add".to_string(), "-u".to_string(), "--sparse".to_string()])?;
+        index.write_tree()
+    }
+
+    /// Write a tree containing the current index state without changing the
+    /// real index. Copying the index keeps a missing real index absent while
+    /// avoiding a working-tree scan for staged-only changes.
+    pub fn write_index_tree(&self) -> anyhow::Result<String> {
+        self.temp_index()?.write_tree()
     }
 
     /// Determine whether there are staged changes in the index.
@@ -750,13 +1116,41 @@ impl<'a> WorkingTree<'a> {
     ///
     /// Note: The index is per-worktree in git, so this checks this specific
     /// worktree's staging area.
+    ///
+    /// Plumbing ignores user diff display configuration. Intent-to-add entries
+    /// remain invisible here, matching porcelain `git diff --cached`.
     pub fn has_staged_changes(&self) -> anyhow::Result<bool> {
-        // Exit code 0 = no diff (no staged changes), exit code 1 = diff exists (has staged changes)
-        // run_command returns Ok on exit 0, Err on non-zero
-        // So: Err means has changes
-        Ok(self
-            .run_command(&["diff", "--cached", "--quiet", "--exit-code"])
-            .is_err())
+        let base = self.index_base()?;
+        let args = PlumbingDiff::Index.args(&[
+            "--cached",
+            "--ita-invisible-in-index",
+            "--quiet",
+            "--end-of-options",
+            &base,
+        ]);
+        let output = self.run_command_output(&args)?;
+        match output.status.code() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => Err(CommandError::from_failed_output("git", &args, &output).into()),
+        }
+    }
+
+    /// Determine whether staging with `mode` would leave content to commit.
+    ///
+    /// Staging modes are evaluated against a temporary index so staged and
+    /// unstaged changes combine exactly as `git add` would, without modifying
+    /// the user's index.
+    pub fn has_committable_changes(&self, mode: crate::config::StageMode) -> anyhow::Result<bool> {
+        match mode {
+            crate::config::StageMode::None => self.has_staged_changes(),
+            crate::config::StageMode::All | crate::config::StageMode::Tracked => {
+                let base = self.index_base()?;
+                let index = self.temp_index()?;
+                index.stage(mode)?;
+                index.has_staged_changes(&base)
+            }
+        }
     }
 
     /// Check whether this worktree has initialized submodules.
@@ -768,15 +1162,23 @@ impl<'a> WorkingTree<'a> {
         Ok(has_initialized_submodules_from_status(&output))
     }
 
-    /// Create a safety backup of current working tree state without affecting the working tree.
+    /// Back up the index, as a squash is about to commit it, to `refs/wt-backup/<branch>`.
     ///
-    /// This creates a backup commit containing all changes (staged, unstaged, and untracked files)
-    /// and stores it in a custom ref (`refs/wt-backup/<branch>`). This creates a reflog entry
-    /// for recovery without polluting the stash list. The working tree remains unchanged.
+    /// Writes the index as a commit whose parent is `HEAD`, so one commit holds
+    /// both the branch tip being rewritten and the changes the squash sweeps in,
+    /// and records it in the ref's reflog. Unstaged and untracked files are not
+    /// captured; the squash leaves them in place. The index, the working tree and
+    /// the stash list are untouched.
     ///
-    /// Users can find safety backups with: `git reflog show refs/wt-backup/<branch>`
+    /// Plumbing throughout, so no config hides part of the index: `git stash
+    /// create` honors `submodule.<name>.ignore=all` and sees nothing in a staged
+    /// gitlink bump. The backup commit is never signed.
     ///
-    /// Returns the short SHA of the backup commit.
+    /// To recover, `git reflog show refs/wt-backup/<branch>` lists the backups;
+    /// `git read-tree <sha>` restores that index, `git checkout <sha> -- .` also
+    /// restores the files, and `<sha>^` is the branch tip before the squash.
+    ///
+    /// Returns the backup commit's SHA and the ref retaining it.
     ///
     /// # Example
     /// ```no_run
@@ -784,24 +1186,25 @@ impl<'a> WorkingTree<'a> {
     ///
     /// let repo = Repository::current()?;
     /// let wt = repo.current_worktree();
-    /// let sha = wt.create_safety_backup("feature → main (squash)")?;
-    /// println!("Backup created: {}", sha);
+    /// let backup = wt.create_safety_backup("feature → main (squash)")?;
+    /// println!("Backup created: {}", backup.sha);
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn create_safety_backup(&self, message: &str) -> anyhow::Result<String> {
-        // Create a backup commit using git stash create (without storing it in the stash list)
+    pub fn create_safety_backup(&self, message: &str) -> anyhow::Result<SafetyBackup> {
+        let tree = self.run_command(&["write-tree"])?;
         let backup_sha = self
-            .run_command(&["stash", "create", "--include-untracked"])?
+            .run_command(&[
+                "commit-tree",
+                "--no-gpg-sign",
+                tree.trim(),
+                "-p",
+                "HEAD",
+                "-m",
+                message,
+            ])
+            .context("Failed to create backup commit")?
             .trim()
             .to_string();
-
-        // Validate that we got a SHA back
-        if backup_sha.is_empty() {
-            return Err(GitError::Other {
-                message: "git stash create returned empty SHA - no changes to backup".into(),
-            }
-            .into());
-        }
 
         // Get current branch name to use in the ref name
         let stdout = self.run_command(&["rev-parse", "--symbolic-full-name", "HEAD"])?;
@@ -825,7 +1228,10 @@ impl<'a> WorkingTree<'a> {
         ])
         .context("Failed to create backup ref")?;
 
-        self.repo().short_sha(&backup_sha)
+        Ok(SafetyBackup {
+            sha: backup_sha,
+            ref_name,
+        })
     }
 }
 
@@ -841,24 +1247,159 @@ impl<'a> WorkingTree<'a> {
 /// real index, point `GIT_INDEX_FILE` at the copy, and run those
 /// operations there. Today the callers are
 /// [`WorkingTree::working_tree_diff_stats_with_untracked`] (HEAD± with
-/// untracked, used by `wt list --full` / `wt statusline`),
-/// `WorkingTreeConflictsTask` (write-tree of dirty + untracked, for
-/// merge-conflict probing), and `wt step diff` (diff vs target merge-base
-/// with untracked).
+/// untracked, used by list and statusline),
+/// the working-tree conflict task (write-tree of tracked changes, for
+/// merge-conflict probing), `wt step diff` (diff vs target merge-base with
+/// untracked), `wt step commit --dry-run` (mirror its `--stage` mode without
+/// changing the user's index), `wt merge` (check whether its `--stage` mode
+/// would produce a commit), and the `wt switch` unified/working preview tabs.
 pub struct TempIndex {
     temp: tempfile::TempPath,
     worktree_root: PathBuf,
     log_ctx: String,
     /// Copied from the [`Repository`] so a redirected `wt list` writes the temp
     /// index's `write-tree` objects into the temporary store. `None` on the
-    /// normal persistent path. See [`Repository::redirect_objects_if_read_only`].
-    object_store_environment: Option<(PathBuf, std::ffi::OsString)>,
+    /// normal persistent path. See [`Repository::redirect_objects_for_observation`].
+    object_store_environment: Option<(PathBuf, OsString)>,
+    /// Exact Worktrunk-owned temporary directories to hide from untracked
+    /// previews when the configured temp directory is inside this worktree.
+    observation_path_exclusions: Vec<String>,
 }
 
 impl TempIndex {
-    /// UTF-8 path to the temp index file. Validated at construction.
-    pub fn path(&self) -> &str {
-        self.temp.to_str().expect("validated in temp_index()")
+    /// Path to the temporary index file.
+    pub fn path(&self) -> &Path {
+        &self.temp
+    }
+
+    /// Stage the paths selected by `mode` into this temporary index.
+    ///
+    /// Uses the same `git add` mode as [`WorkingTree::stage`], minus its
+    /// unmerged-paths gate. All-files mode also scopes the add to the worktree
+    /// root (`-- .`) and, when the system temp directory sits inside the
+    /// worktree, excludes Worktrunk's own temporary indexes.
+    ///
+    /// [`StageMode`]: crate::config::StageMode
+    pub fn stage(&self, mode: crate::config::StageMode) -> anyhow::Result<()> {
+        let Some(add_args) = mode.add_args() else {
+            return Ok(());
+        };
+        let mut args: Vec<String> = add_args.iter().map(|arg| (*arg).to_string()).collect();
+        if mode == crate::config::StageMode::All {
+            args.extend(["--".to_string(), ".".to_string()]);
+            self.append_temp_index_exclusion(&mut args)?;
+        }
+        self.run_command(args)?;
+        Ok(())
+    }
+
+    /// Write the temporary index as a tree and return its object id.
+    fn write_tree(&self) -> anyhow::Result<String> {
+        self.run_command(["write-tree"])
+            .map(|output| output.trim().to_string())
+    }
+
+    fn has_staged_changes(&self, base: &str) -> anyhow::Result<bool> {
+        let args = PlumbingDiff::Index.args(&[
+            "--cached",
+            "--ita-invisible-in-index",
+            "--quiet",
+            "--end-of-options",
+            base,
+        ]);
+        let output = self
+            .command(args.iter().copied())
+            .run()
+            .with_context(|| format!("Failed to execute: git {}", args.join(" ")))?;
+        match output.status.code() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => Err(CommandError::from_failed_output("git", &args, &output).into()),
+        }
+    }
+
+    /// Register untracked files in the temporary index without adding their
+    /// contents. A following `git diff <base>` can then include those files as
+    /// new while preserving the user's real index and staging state. If the
+    /// system temp directory is inside the worktree, the pathspec excludes all
+    /// files in that directory with Worktrunk's dedicated prefix so concurrent
+    /// temporary indexes cannot enter each other's diffs. Keeping the random
+    /// files directly in the OS temp directory avoids a predictable shared
+    /// parent on multi-user systems.
+    pub(super) fn register_untracked(&self) -> anyhow::Result<()> {
+        let mut args = vec![
+            "add".to_string(),
+            "--intent-to-add".to_string(),
+            // An untracked file may sit outside a sparse-checkout definition.
+            // Without --sparse git refuses the entire add, hiding both that
+            // file and otherwise-valid worktree changes from the preview.
+            "--sparse".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ];
+        self.append_temp_index_exclusion(&mut args)?;
+        self.run_command(args)?;
+        Ok(())
+    }
+
+    /// Register an exact NUL-separated set of untracked paths as intent-to-add.
+    ///
+    /// The paths are file names from `ls-files`, not pathspecs, so
+    /// `GIT_LITERAL_PATHSPECS` keeps a name like `:x` from parsing as magic and
+    /// `b[1].txt` from matching as a glob. Git refuses the literal setting
+    /// alongside the glob and icase ones, so a user's exported
+    /// `GIT_GLOB_PATHSPECS` or `GIT_ICASE_PATHSPECS` is dropped for this call.
+    fn register_untracked_paths(&self, paths: Vec<u8>) -> anyhow::Result<()> {
+        let args = [
+            "add",
+            "--intent-to-add",
+            "--sparse",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ]
+        .map(String::from);
+        let command = self
+            .command(args.iter().cloned())
+            .env_remove("GIT_GLOB_PATHSPECS")
+            .env_remove("GIT_ICASE_PATHSPECS")
+            .env("GIT_LITERAL_PATHSPECS", "1")
+            .stdin_bytes(paths);
+        run_checked(command, &args)?;
+        Ok(())
+    }
+
+    fn append_temp_index_exclusion(&self, args: &mut Vec<String>) -> anyhow::Result<()> {
+        let temp_dir = canonicalize_with_parents(
+            self.temp
+                .parent()
+                .context("Temporary index has no parent directory")?,
+        );
+        let worktree_root = canonicalize_with_parents(&self.worktree_root);
+        if let Ok(relative) = temp_dir.strip_prefix(&worktree_root) {
+            let relative = escape_pathspec_glob_literal(&relative.to_slash_lossy());
+            let separator = if relative.is_empty() { "" } else { "/" };
+            args.push(format!(
+                ":(top,exclude,glob){relative}{separator}{TEMP_INDEX_PREFIX}*"
+            ));
+        }
+        args.extend(self.observation_path_exclusions.iter().cloned());
+        Ok(())
+    }
+
+    fn run_command(
+        &self,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> anyhow::Result<String> {
+        let output = self.run_command_output(args)?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn run_command_output(
+        &self,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> anyhow::Result<std::process::Output> {
+        let args: Vec<String> = args.into_iter().map(Into::into).collect();
+        run_checked(self.command(args.iter().cloned()), &args)
     }
 
     /// Build a `git` command pointed at this temp index.
@@ -866,15 +1407,22 @@ impl TempIndex {
     /// Wires `current_dir` to the worktree root, the worktree's logging
     /// context, and `GIT_INDEX_FILE`. The caller adds the subcommand and
     /// chooses `.run()` / `.stream()`.
-    pub fn git<I, S>(&self, args: I) -> Cmd
+    ///
+    /// Scrubs the inherited git-discovery vars for the same reason
+    /// [`WorkingTree::run_command_output`] does, then sets its own
+    /// `GIT_INDEX_FILE` (and, for a redirected repository, its own object-store
+    /// vars) after the scrub — `Cmd` applies env mutations in call order, so
+    /// those sets survive it.
+    pub(super) fn command<I, S>(&self, args: I) -> Cmd
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: AsRef<std::ffi::OsStr>,
     {
         let command = Cmd::new("git")
             .args(args)
             .current_dir(&self.worktree_root)
             .context(self.log_ctx.clone())
+            .scrub_git_discovery_env()
             .env("GIT_INDEX_FILE", self.path());
         match &self.object_store_environment {
             Some((directory, alternates)) => command
@@ -885,12 +1433,174 @@ impl TempIndex {
     }
 }
 
+/// Run a `git` command built from `args`, turning a non-zero exit into an error.
+fn run_checked(command: Cmd, args: &[String]) -> anyhow::Result<std::process::Output> {
+    let output = command
+        .run()
+        .with_context(|| format!("Failed to execute: git {}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(CommandError::from_failed_output("git", args, &output).into());
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::has_initialized_submodules_from_status;
-    use crate::git::Repository;
+    use crate::git::{LineDiff, Repository};
     use crate::shell_exec::Cmd;
     use crate::testing::TestRepo;
+
+    #[test]
+    fn lock_reason_errors_when_locked_is_unreadable() {
+        let mut test = TestRepo::with_initial_commit();
+        let worktree_path = test.add_worktree("feature");
+        let repo = Repository::at(test.root_path()).unwrap();
+        let worktree = repo.worktree_at(&worktree_path);
+        let lock_path = worktree.git_dir().unwrap().join("locked");
+        std::fs::create_dir(&lock_path).unwrap();
+        let err = worktree.lock_reason().unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to read worktree lock"),
+            "expected a lock-file IO error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn has_staged_changes_surfaces_git_errors() {
+        let test = TestRepo::with_initial_commit();
+        let repo = Repository::at(test.root_path()).unwrap();
+        let worktree = repo.current_worktree();
+        std::fs::write(worktree.git_dir().unwrap().join("index"), "not an index").unwrap();
+
+        let error = worktree.has_staged_changes().unwrap_err();
+        assert!(
+            error.to_string().contains("git diff"),
+            "expected the failed git command, got {error:#}"
+        );
+    }
+
+    #[test]
+    fn has_staged_changes_checks_whole_worktree_from_nested_discovery_path() {
+        let test = TestRepo::with_initial_commit();
+        let nested = test.root_path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(test.root_path().join("staged.txt"), "staged\n").unwrap();
+        test.run_git(&["add", "staged.txt"]);
+        test.run_git(&["config", "diff.relative", "true"]);
+
+        let repo = Repository::at(&nested).unwrap();
+        assert!(
+            repo.current_worktree().has_staged_changes().unwrap(),
+            "staged paths outside the discovery directory must remain visible"
+        );
+    }
+
+    #[test]
+    fn has_staged_changes_ignores_intent_to_add_entries() {
+        let test = TestRepo::with_initial_commit();
+        std::fs::write(test.root_path().join("intent.txt"), "unstaged\n").unwrap();
+        test.run_git(&["add", "--intent-to-add", "intent.txt"]);
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        assert!(
+            !repo.current_worktree().has_staged_changes().unwrap(),
+            "an intent-to-add entry has no staged content"
+        );
+    }
+
+    #[test]
+    fn has_staged_changes_sees_staged_gitlink_behind_submodule_ignore() {
+        let test = TestRepo::with_initial_commit();
+        std::fs::write(
+            test.root_path().join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+        )
+        .unwrap();
+        test.run_git(&["add", ".gitmodules"]);
+        test.run_git(&["commit", "-m", "register submodule"]);
+        test.run_git(&["config", "submodule.sub.ignore", "all"]);
+        let head = test.git_output(&["rev-parse", "HEAD"]);
+        test.run_git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},sub"),
+        ]);
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        assert!(
+            repo.current_worktree().has_staged_changes().unwrap(),
+            "a staged gitlink must stay visible through submodule.<name>.ignore"
+        );
+    }
+
+    #[test]
+    fn has_committable_changes_matches_stage_modes_without_mutating_index() {
+        let test = TestRepo::with_initial_commit();
+        std::fs::write(test.root_path().join("tracked.txt"), "base\n").unwrap();
+        test.run_git(&["add", "tracked.txt"]);
+        test.run_git(&["commit", "-m", "add tracked file"]);
+        std::fs::write(test.root_path().join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(test.root_path().join("untracked.txt"), "new\n").unwrap();
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let worktree = repo.current_worktree();
+        assert!(
+            worktree
+                .has_committable_changes(crate::config::StageMode::Tracked)
+                .unwrap()
+        );
+        assert!(
+            worktree
+                .has_committable_changes(crate::config::StageMode::All)
+                .unwrap()
+        );
+        assert!(
+            !worktree
+                .has_committable_changes(crate::config::StageMode::None)
+                .unwrap(),
+            "temporary staging must not modify the real index"
+        );
+
+        test.run_git(&["add", "tracked.txt"]);
+        assert!(
+            worktree
+                .has_committable_changes(crate::config::StageMode::None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn has_committable_changes_all_ignores_dirty_submodule_contents() {
+        let test = TestRepo::with_initial_commit();
+        let sub_source = test.root_path().parent().unwrap().join("sub-source");
+        std::fs::create_dir_all(&sub_source).unwrap();
+        test.run_git_in(&sub_source, &["init", "-b", "main"]);
+        std::fs::write(sub_source.join("sub.txt"), "base\n").unwrap();
+        test.run_git_in(&sub_source, &["add", "sub.txt"]);
+        test.run_git_in(&sub_source, &["commit", "-m", "sub init"]);
+        test.run_git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub_source.to_str().unwrap(),
+            "submod",
+        ]);
+        test.run_git(&["commit", "-m", "add submodule"]);
+        std::fs::write(test.root_path().join("submod/sub.txt"), "dirty\n").unwrap();
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let worktree = repo.current_worktree();
+        assert!(worktree.is_dirty().unwrap());
+        assert!(
+            !worktree
+                .has_committable_changes(crate::config::StageMode::All)
+                .unwrap(),
+            "dirty submodule contents cannot be staged in the parent repository"
+        );
+    }
 
     #[test]
     fn submodule_status_empty_is_not_initialized() {
@@ -957,6 +1667,46 @@ mod tests {
     }
 
     #[test]
+    fn cached_porcelain_reports_untracked_files_hidden_by_user_config() {
+        let test = TestRepo::with_initial_commit();
+        test.run_git(&["config", "status.showUntrackedFiles", "no"]);
+        std::fs::write(test.root_path().join("hidden-by-config.txt"), "loose\n").unwrap();
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let status = repo.current_worktree().status_porcelain_cached().unwrap();
+
+        assert!(
+            status.contains("?? hidden-by-config.txt"),
+            "the shared status snapshot must override status.showUntrackedFiles=no: {status:?}"
+        );
+    }
+
+    #[test]
+    fn clean_checks_report_untracked_files_hidden_by_user_config() {
+        let test = TestRepo::with_initial_commit();
+        test.run_git(&["config", "status.showUntrackedFiles", "no"]);
+        std::fs::write(test.root_path().join("hidden-by-config.txt"), "loose\n").unwrap();
+
+        assert!(
+            test.git_output(&["status", "--porcelain"]).is_empty(),
+            "the fixture must demonstrate that the user setting hides the file"
+        );
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let wt = repo.current_worktree();
+
+        assert!(
+            wt.is_dirty().unwrap(),
+            "clean checks must not inherit status.showUntrackedFiles"
+        );
+        assert_eq!(
+            wt.dirty_files().unwrap(),
+            vec!["?? hidden-by-config.txt"],
+            "the destructive guard must name the hidden untracked file"
+        );
+    }
+
+    #[test]
     fn prewarm_info_second_call_returns_cached_snapshot() {
         // Once `worktree_roots` is primed, subsequent `prewarm_info` calls
         // must reconstruct from the caches rather than spawning a second
@@ -1012,11 +1762,8 @@ mod tests {
 
         for branch in ["a/b", "a-b"] {
             test.run_git(&["switch", "-c", branch]);
-            // Modify the tracked file so `git stash create` picks up changes.
-            std::fs::write(test.root_path().join("file.txt"), branch).unwrap();
             wt.create_safety_backup(&format!("{branch} (squash)"))
                 .unwrap();
-            test.run_git(&["checkout", "--", "file.txt"]);
             test.run_git(&["switch", "main"]);
         }
 
@@ -1115,21 +1862,237 @@ mod tests {
     }
 
     #[test]
-    fn untracked_diff_stats_unborn_head_is_command_error() {
-        // With an unborn HEAD the untracked files stage fine into the temp
-        // index, but `git diff --cached --numstat HEAD` cannot resolve HEAD —
-        // the failure must surface as a typed `CommandError`.
+    fn working_tree_diff_stats_without_untracked_files_still_finds_renames() {
+        let test = TestRepo::with_initial_commit();
+        let source = (1..=100)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(test.root_path().join("source.txt"), format!("{source}\n")).unwrap();
+        test.run_git(&["add", "source.txt"]);
+        test.run_git(&["commit", "-m", "add source"]);
+        test.run_git(&["config", "diff.renames", "false"]);
+
+        std::fs::create_dir(test.root_path().join("moved")).unwrap();
+        test.run_git(&["mv", "source.txt", "moved/source.txt"]);
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        assert_eq!(
+            repo.current_worktree()
+                .working_tree_diff_stats_with_untracked()
+                .unwrap(),
+            LineDiff::default(),
+            "HEAD± uses one rename policy whether or not untracked files exist"
+        );
+    }
+
+    #[test]
+    fn working_tree_diff_stats_with_untracked_reports_only_a_moves_line_delta() {
+        let test = TestRepo::with_initial_commit();
+        let source = (1..=100)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(test.root_path().join("source.txt"), format!("{source}\n")).unwrap();
+        test.run_git(&["add", "source.txt"]);
+        test.run_git(&["commit", "-m", "add source"]);
+
+        std::fs::create_dir(test.root_path().join("moved")).unwrap();
+        std::fs::rename(
+            test.root_path().join("source.txt"),
+            test.root_path().join("moved/source.txt"),
+        )
+        .unwrap();
+
+        let repo = Repository::at(test.root_path())
+            .unwrap()
+            .redirect_objects_for_observation()
+            .unwrap();
+        let wt = repo.current_worktree();
+        let real_index = wt.git_dir().unwrap().join("index");
+        let index_before = std::fs::read(&real_index).unwrap();
+        let objects_before = test.git_output(&["count-objects", "-v"]);
+
+        assert_eq!(
+            wt.working_tree_diff_stats_with_untracked().unwrap(),
+            LineDiff::default(),
+            "an exact move changes paths but no lines"
+        );
+
+        let mut moved = source.lines().map(str::to_string).collect::<Vec<_>>();
+        moved[49] = "changed line".to_string();
+        moved.push("added line".to_string());
+        std::fs::write(
+            test.root_path().join("moved/source.txt"),
+            format!("{}\n", moved.join("\n")),
+        )
+        .unwrap();
+        assert_eq!(
+            wt.working_tree_diff_stats_with_untracked().unwrap(),
+            LineDiff {
+                added: 2,
+                deleted: 1,
+            },
+            "an edited move reports only the edits"
+        );
+
+        assert_eq!(std::fs::read(&real_index).unwrap(), index_before);
+        assert_eq!(test.git_output(&["count-objects", "-v"]), objects_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_diff_stats_with_untracked_preserves_rename_path_bytes() {
+        let test = TestRepo::with_initial_commit();
+        let source = "source\tname\n.txt";
+        let destination = "moved\tname\n.txt";
+        std::fs::write(test.root_path().join(source), "one\ntwo\nthree\n").unwrap();
+        test.run_git(&["add", source]);
+        test.run_git(&["commit", "-m", "add unusual path"]);
+        std::fs::rename(
+            test.root_path().join(source),
+            test.root_path().join(destination),
+        )
+        .unwrap();
+
+        let repo = Repository::at(test.root_path())
+            .unwrap()
+            .redirect_objects_for_observation()
+            .unwrap();
+        assert_eq!(
+            repo.current_worktree()
+                .working_tree_diff_stats_with_untracked()
+                .unwrap(),
+            LineDiff::default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_diff_stats_with_untracked_counts_pathspec_magic_names() {
+        // `ls-files` reports names verbatim; registering them must not read
+        // `:x` as pathspec magic or `[1]` as a glob.
+        let test = TestRepo::with_initial_commit();
+        for name in [":x", "b[1].txt", "*"] {
+            std::fs::write(test.root_path().join(name), "one\ntwo\n").unwrap();
+        }
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        assert_eq!(
+            repo.current_worktree()
+                .working_tree_diff_stats_with_untracked()
+                .unwrap(),
+            LineDiff {
+                added: 6,
+                deleted: 0
+            }
+        );
+    }
+
+    #[test]
+    fn observation_object_directory_is_excluded_from_status_and_diff() {
+        let test = TestRepo::with_initial_commit();
+        let observation_directory = test
+            .root_path()
+            .join("local-tmp/worktrunk-list-objects-test");
+        std::fs::create_dir_all(observation_directory.join("info")).unwrap();
+        std::fs::write(observation_directory.join("info/alternates"), "temporary\n").unwrap();
+        std::fs::write(test.root_path().join("untracked.txt"), "user\n").unwrap();
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        repo.cache
+            .observation_object_directories
+            .insert(observation_directory.clone(), ());
+        let wt = repo.current_worktree();
+
+        let status = wt.status_porcelain_cached().unwrap();
+        assert!(status.contains("?? untracked.txt"));
+        assert!(!status.contains("worktrunk-list-objects-test"));
+
+        let stats = wt.working_tree_diff_stats_with_untracked().unwrap();
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.deleted, 0);
+    }
+
+    fn sparse_checkout_with_untracked_file() -> TestRepo {
+        let test = TestRepo::with_initial_commit();
+        std::fs::create_dir_all(test.root_path().join("visible")).unwrap();
+        std::fs::create_dir_all(test.root_path().join("hidden")).unwrap();
+        std::fs::write(test.root_path().join("visible/tracked.txt"), "base\n").unwrap();
+        std::fs::write(test.root_path().join("hidden/tracked.txt"), "base\n").unwrap();
+        test.run_git(&["add", "visible/tracked.txt", "hidden/tracked.txt"]);
+        test.run_git(&["commit", "-m", "add sparse fixture"]);
+        test.run_git(&["sparse-checkout", "init", "--cone"]);
+        test.run_git(&["sparse-checkout", "set", "visible"]);
+
+        std::fs::create_dir_all(test.root_path().join("hidden")).unwrap();
+        std::fs::write(test.root_path().join("hidden/loose.txt"), "loose\n").unwrap();
+
+        test
+    }
+
+    #[test]
+    fn working_tree_diff_stats_with_untracked_crosses_sparse_checkout_boundary() {
+        let test = sparse_checkout_with_untracked_file();
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let stats = repo
+            .current_worktree()
+            .working_tree_diff_stats_with_untracked()
+            .unwrap();
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.deleted, 0);
+    }
+
+    #[test]
+    fn temp_index_stage_all_preserves_sparse_checkout_boundary() {
+        let test = sparse_checkout_with_untracked_file();
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let idx = repo.current_worktree().temp_index().unwrap();
+        let err = idx
+            .stage(crate::config::StageMode::All)
+            .expect_err("temporary staging must mirror real git add -A");
+        let cmd_err = crate::git::CommandError::find_in(&err)
+            .expect("sparse-boundary refusal should remain a CommandError");
+        assert_eq!(cmd_err.command_string(), "git add -A -- .");
+    }
+
+    #[test]
+    fn tracked_worktree_tree_crosses_sparse_checkout_boundary() {
+        let test = sparse_checkout_with_untracked_file();
+        std::fs::write(test.root_path().join("hidden/tracked.txt"), "changed\n").unwrap();
+
+        let repo = Repository::at(test.root_path()).unwrap();
+        let tree = repo
+            .current_worktree()
+            .write_tracked_worktree_tree()
+            .unwrap();
+        let files = test.git_output(&["ls-tree", "-r", "--name-only", &tree]);
+        assert_eq!(
+            files.lines().collect::<Vec<_>>(),
+            ["file.txt", "hidden/tracked.txt", "visible/tracked.txt"]
+        );
+    }
+
+    #[test]
+    fn working_tree_diff_stats_with_untracked_unborn_head_is_command_error() {
+        // With an unborn HEAD the tracked diff cannot resolve its comparison
+        // revision. The failure must surface as a typed `CommandError`.
         let test = TestRepo::new();
         std::fs::write(test.root_path().join("new.txt"), "hello\n").unwrap();
         let repo = Repository::at(test.root_path()).unwrap();
 
-        let err = repo.current_worktree().untracked_diff_stats().unwrap_err();
+        let err = repo
+            .current_worktree()
+            .working_tree_diff_stats_with_untracked()
+            .unwrap_err();
         let cmd_err =
             crate::git::CommandError::find_in(&err).expect("error should carry a CommandError");
         assert!(
             cmd_err
                 .command_string()
-                .starts_with("git diff --cached --numstat HEAD")
+                .starts_with("git diff-index --ignore-submodules=none --numstat -z --find-renames --end-of-options HEAD")
         );
     }
 
@@ -1137,7 +2100,7 @@ mod tests {
     fn temp_index_tolerates_missing_real_index() {
         // A worktree whose `<gitdir>/index` file is absent must not error
         // when callers ask for a temp index — git itself treats a missing
-        // index as empty, and the WorkingTreeConflictsTask used to surface
+        // index as empty, and the working-tree conflict task used to surface
         // this as a misleading `working-tree conflict check (Failed to copy
         // index file)` footer.
         let test = TestRepo::with_initial_commit();
@@ -1157,11 +2120,8 @@ mod tests {
 
         // (b) git add -A against the resulting temp index produces a tree
         // containing the working-tree files.
-        idx.git(["add", "-A"]).run().unwrap();
-        let write_tree = idx.git(["write-tree"]).run().unwrap();
-        let tree_sha = String::from_utf8_lossy(&write_tree.stdout)
-            .trim()
-            .to_string();
+        idx.stage(crate::config::StageMode::All).unwrap();
+        let tree_sha = idx.write_tree().unwrap();
         let ls_tree = Cmd::new("git")
             .args(["ls-tree", "-r", "--name-only", &tree_sha])
             .current_dir(test.root_path())

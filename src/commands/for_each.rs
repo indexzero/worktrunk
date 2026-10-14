@@ -7,10 +7,10 @@
 //!
 //! # Design Notes
 //!
-//! The `step` subcommand grouping is not fully satisfying. Current state:
-//!
-//! - `commit`, `squash`, `rebase`, `push` — merge workflow steps (single-worktree)
-//! - `for-each` — utility to run commands across all worktrees (multi-worktree)
+//! The `step` subcommand grouping is not fully satisfying. It holds the merge
+//! workflow's single-worktree steps (`commit`, `squash`, `rebase`, `push`)
+//! alongside unrelated utilities, including `for-each`, the one that runs a
+//! command across all worktrees.
 //!
 //! These don't naturally belong together. Options considered:
 //!
@@ -24,19 +24,22 @@
 //!
 //! For now, we keep `for-each` under `step` as a pragmatic choice.
 
-use std::io::{Write as _, stderr};
+use std::io::Write as _;
 use std::process::Stdio;
 
+use anyhow::Context;
 use color_print::cformat;
 use worktrunk::config::{UserConfig, VarScope};
 use worktrunk::git::{ErrorExt, Repository, WorktreeInfo, WorktrunkError};
 use worktrunk::shell_exec::{Cmd, ShellEscapeMode};
 use worktrunk::styling::{
-    eprintln, error_message, format_with_gutter, progress_message, success_message, warning_message,
+    eprint, eprintln, error_message, format_with_gutter, progress_message, stderr, success_message,
+    warning_message,
 };
 
 use crate::commands::command_executor::{CommandContext, build_hook_context};
 use crate::commands::worktree_display_name;
+use crate::output::print_json;
 
 /// Run a command in each worktree sequentially.
 ///
@@ -44,17 +47,17 @@ use crate::commands::worktree_display_name;
 /// real-time. Continues on errors and reports a summary at the end.
 ///
 /// All template variables from hooks are available; values are substituted
-/// into argv elements without shell escaping. Context JSON is piped to stdin.
+/// into argv elements without shell escaping. Context JSON is provided on stdin.
 pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> anyhow::Result<()> {
     let json_mode = format == crate::cli::SwitchFormat::Json;
     let repo = Repository::current()?;
-    // Filter out prunable worktrees (directory deleted) - can't run commands there
+    // Filter out prunable worktrees (directory or its `.git` gone) - can't run commands there
     let worktrees: Vec<&WorktreeInfo> = repo
         .list_worktrees()?
         .iter()
         .filter(|wt| !wt.is_prunable())
         .collect();
-    let config = UserConfig::load()?;
+    let config = UserConfig::load().context("Failed to load config")?;
 
     let mut failed: Vec<String> = Vec::new();
     let mut json_results: Vec<serde_json::Value> = Vec::new();
@@ -72,7 +75,8 @@ pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> any
         );
 
         // Build full hook context for this worktree
-        // Pass wt.branch directly (not the display string) so detached HEAD maps to None -> "HEAD"
+        // Pass wt.branch directly (not the display string) so a detached
+        // worktree maps to None and leaves `{{ branch }}` unset
         let ctx = CommandContext::new(&repo, &config, wt.branch.as_deref(), &wt.path, false);
         let context_map = build_hook_context(&ctx, &[], VarScope::All)?;
 
@@ -105,22 +109,23 @@ pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> any
                 // hints from typed diagnostics) and a plain string for
                 // JSON (consumers shouldn't see ANSI codes or symbols).
                 let (exit_info, exit_code, stderr_detail, json_detail) =
-                    if let Some(WorktrunkError::ChildProcessExited { code, message, .. }) =
+                    if let Some(WorktrunkError::ChildProcessExited { code, .. }) =
                         err.downcast_ref::<WorktrunkError>()
                     {
                         (
-                            format!(" (exit code {code})"),
+                            format!(" ({err})"),
                             serde_json::json!(code),
                             None,
-                            message.clone(),
+                            err.to_string(),
                         )
                     } else {
-                        let styled = err.render_diagnostic().unwrap_or_else(|| err.to_string());
+                        let detail = err.display_message();
+                        let styled = err.render_diagnostic().unwrap_or_else(|| detail.clone());
                         (
                             " (spawn failed)".to_string(),
                             serde_json::json!(null),
                             Some(styled),
-                            err.to_string(),
+                            detail,
                         )
                     };
                 eprintln!(
@@ -150,7 +155,7 @@ pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> any
 
     if let Some(signal) = interrupted {
         if json_mode {
-            println!("{}", serde_json::to_string_pretty(&json_results)?);
+            print_json(&json_results)?;
         } else {
             eprintln!();
             eprintln!(
@@ -162,7 +167,7 @@ pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> any
     }
 
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(&json_results)?);
+        print_json(&json_results)?;
         if failed.is_empty() {
             return Ok(());
         } else {
@@ -198,7 +203,7 @@ pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> any
 }
 
 /// Run argv directly (no shell) with streaming output, signal forwarding,
-/// stdout→stderr redirect, and JSON context piped on stdin.
+/// stdout→stderr redirect, and JSON context on stdin.
 ///
 /// Mirrors the bookkeeping in `output::execute_shell_command` (flush, ANSI
 /// reset, signal forwarding) but builds the command via `Cmd::new` so the
@@ -219,6 +224,12 @@ fn run_argv(
     argv: Vec<String>,
     stdin_json: &str,
 ) -> anyhow::Result<()> {
+    // Reset ANSI codes on stderr so our color doesn't bleed into the child's
+    // output, the same three lines `execute_shell_command` runs before its own
+    // spawn. Both `eprint!` and `stderr` are anstream's: the flushes have to
+    // name the stream the reset was written to, and on a redirected stderr
+    // anstream drops the reset rather than writing a literal `ESC[0m` into the
+    // file.
     stderr().flush()?;
     eprint!("{}", anstyle::Reset);
     stderr().flush().ok();

@@ -5,6 +5,26 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Return candidates similar to `query`, sorted by descending Jaro–Winkler
+/// similarity, filtered by `score > 0.7`, and deduplicated while preserving
+/// order. The 0.7 threshold matches clap's internal `did_you_mean` so
+/// wt-synthesized "unrecognized subcommand" tips read identically to clap's
+/// native output — keep them aligned if clap ever changes it.
+pub fn did_you_mean(query: &str, candidates: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut scored: Vec<(f64, String)> = candidates
+        .into_iter()
+        .map(|candidate| (strsim::jaro_winkler(query, &candidate), candidate))
+        .filter(|(score, _)| *score > 0.7)
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen = std::collections::HashSet::new();
+    scored
+        .into_iter()
+        .filter(|(_, n)| seen.insert(n.clone()))
+        .map(|(_, n)| n)
+        .collect()
+}
+
 /// Replace C0/C1 control characters — other than tab and newline — with a
 /// visible escape so the text stays valid for plain-text and markdown sinks.
 ///
@@ -138,6 +158,20 @@ pub fn epoch_now() -> u64 {
 /// did not, so a read-only directory holding a writable file now fails with the
 /// file left as it was — the trade Data Safety asks for.
 pub fn write_atomically(path: &Path, content: &str) -> io::Result<()> {
+    write_atomically_with(path, content, true)
+}
+
+/// Create `path` atomically, failing if another writer creates it first.
+///
+/// Use this when the caller observed that the path was absent and must not
+/// overwrite content that appears before the temp file is persisted. A
+/// dangling symlink already occupies the path, so this returns `AlreadyExists`
+/// instead of replacing the link as [`write_atomically`] does.
+pub fn write_new_atomically(path: &Path, content: &str) -> io::Result<()> {
+    write_atomically_with(path, content, false)
+}
+
+fn write_atomically_with(path: &Path, content: &str, overwrite: bool) -> io::Result<()> {
     let target = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     // A bare filename's parent is `Some("")`, which no directory call accepts.
     let dir = target
@@ -162,7 +196,11 @@ pub fn write_atomically(path: &Path, content: &str) -> io::Result<()> {
     }
 
     temp.as_file().sync_all()?;
-    temp.persist(&target).map_err(|e| e.error)?;
+    if overwrite {
+        temp.persist(&target).map_err(|e| e.error)?;
+    } else {
+        temp.persist_noclobber(&target).map_err(|e| e.error)?;
+    }
 
     Ok(())
 }
@@ -183,6 +221,21 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second\n");
 
         // The rename leaves no temp file behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn test_write_new_atomically_creates_but_never_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        write_new_atomically(&path, "first\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+
+        assert!(write_new_atomically(&path, "second\n").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+
+        // A failed persist removes its temp file.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
